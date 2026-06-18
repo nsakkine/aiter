@@ -206,6 +206,7 @@ def make_asm_sparse_fp8_runner(
     k_bshd: torch.Tensor,
     v_bshd: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    lut_freeze: Optional[torch.Tensor] = None,
 ) -> Any:
     """Runner factory for the hand-written ASM block-sparse all-fp8 Sage kernel.
 
@@ -253,6 +254,8 @@ def make_asm_sparse_fp8_runner(
     kv_block_indices = kv_block_indices.to(torch.int32).contiguous()
     lut_start = lut_start.to(torch.int32).contiguous()
     lut_count = lut_count.to(torch.int32).contiguous()
+    if lut_freeze is not None:
+        lut_freeze = lut_freeze.to(torch.int32).contiguous()
 
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 
@@ -268,6 +271,7 @@ def make_asm_sparse_fp8_runner(
             lut_start,
             lut_count,
             softmax_scale=softmax_scale,
+            lut_freeze=lut_freeze,
         )
 
     return _run
@@ -715,6 +719,50 @@ def sparse_flops_from_lut(
     return sparse_flops, total_dense_flops
 
 
+def build_freeze_array(lut_count: torch.Tensor, freeze_frac: float) -> torch.Tensor:
+    """VSA microbench freeze array: per-work-item count of leading blocks to
+    process with a LIVE running max before m is frozen for the tail.
+
+    ``freeze_frac`` is the fraction of each work item's blocks kept live:
+        n_freeze[i] = clamp(round(freeze_frac * count[i]), 1, count[i])
+    so 1.0 freezes nothing (n_freeze == count, the reference) and 0.0 freezes
+    every block past the first (the kernel forces n_freeze >= 1 so block 0
+    always establishes m). The LUT order is left untouched, so this isolates
+    the kernel's freeze effect from any block re-ordering, and sparse-FLOPS
+    accounting is unchanged. Work items with no blocks get 0.
+    """
+    counts = lut_count.to(torch.int64)
+    n_freeze = torch.round(freeze_frac * counts.to(torch.float32)).to(torch.int64)
+    n_freeze = torch.clamp(n_freeze, min=1)
+    n_freeze = torch.minimum(n_freeze, counts.clamp(min=1))
+    n_freeze = torch.where(counts == 0, torch.zeros_like(n_freeze), n_freeze)
+    return n_freeze.to(torch.int32).contiguous()
+
+
+def maybe_build_vsa_lut(
+    args: argparse.Namespace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_attn_mask: Optional[torch.Tensor],
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> Tuple[
+    Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], Optional[torch.Tensor]
+]:
+    """When VSA is enabled (fp8 ASM sparse + --vsa-freeze-frac), build a
+    per-work-item freeze array from a constant fraction of each work item's
+    block count, holding the (ascending) LUT fixed so only the freeze depth
+    varies. This isolates the kernel's freeze effect for microbenchmarking.
+    Otherwise pass the LUT through unchanged with lut_freeze=None."""
+    if (
+        block_lut is not None
+        and args.kernel == "aiter_asm_sparse_fp8"
+        and getattr(args, "vsa_freeze_frac", None) is not None
+    ):
+        lut_freeze = build_freeze_array(block_lut[2], args.vsa_freeze_frac)
+        return block_lut, lut_freeze
+    return block_lut, None
+
+
 def fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -898,6 +946,7 @@ def make_kernel_runner(
     k: torch.Tensor,
     v: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    lut_freeze: Optional[torch.Tensor] = None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -1122,7 +1171,9 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_asm_sparse_fp8":
-        return make_asm_sparse_fp8_runner(args, q_bshd, k_bshd, v_bshd, block_lut)
+        return make_asm_sparse_fp8_runner(
+            args, q_bshd, k_bshd, v_bshd, block_lut, lut_freeze
+        )
 
     raise ValueError(f"Unsupported kernel: {args.kernel}")
 
@@ -1270,8 +1321,11 @@ def benchmark_single_case(
         if block_attn_mask is not None
         else None
     )
+    # VSA: build the per-work-item freeze array from --vsa-freeze-frac
+    # (no-op unless --kernel=aiter_asm_sparse_fp8 and --vsa-freeze-frac are set).
+    block_lut, lut_freeze = maybe_build_vsa_lut(args, q, k, block_attn_mask, block_lut)
 
-    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
+    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut, lut_freeze=lut_freeze)
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
@@ -1502,6 +1556,16 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
+
+    if args.vsa_freeze_frac is not None:
+        if not (0.0 <= args.vsa_freeze_frac <= 1.0):
+            raise ValueError("--vsa-freeze-frac must be in [0, 1]")
+        if args.kernel != "aiter_asm_sparse_fp8":
+            logger.warning(
+                "--vsa-freeze-frac only affects aiter_asm_sparse_fp8; "
+                "ignored for kernel %s",
+                args.kernel,
+            )
 
     if args.kernel == "all":
         if args.block_sparsity is not None or args.block_mask_file:
@@ -1740,7 +1804,12 @@ def run_block_sparse_repetitions(
     warmup_lut = block_attn_mask_to_ragged_lut(
         warmup_mask, return_none_if_dense=_return_none_if_dense
     )
-    fn_warmup = make_kernel_runner(args, q, k, v, block_lut=warmup_lut)
+    warmup_lut, warmup_freeze = maybe_build_vsa_lut(
+        args, q, k, warmup_mask, warmup_lut
+    )
+    fn_warmup = make_kernel_runner(
+        args, q, k, v, block_lut=warmup_lut, lut_freeze=warmup_freeze
+    )
     triton.testing.do_bench(fn_warmup, warmup=args.warmup, rep=args.rep)
 
     total_flops = (
@@ -1766,8 +1835,9 @@ def run_block_sparse_repetitions(
         lut = block_attn_mask_to_ragged_lut(
             mask, return_none_if_dense=_return_none_if_dense
         )
+        lut, lut_freeze = maybe_build_vsa_lut(args, q, k, mask, lut)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut)
+        fn = make_kernel_runner(args, q, k, v, block_lut=lut, lut_freeze=lut_freeze)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         latencies_ms.append(ms)
 
@@ -2022,6 +2092,18 @@ def parse_args() -> argparse.Namespace:
         "--qsmooth",
         action="store_true",
         help="(MXFP4 only) Enable Q smoothing",
+    )
+
+    parser.add_argument(
+        "--vsa-freeze-frac",
+        type=float,
+        default=None,
+        help="(aiter_asm_sparse_fp8 VSA microbench) fraction in [0,1] of each "
+        "work item's blocks to process with a LIVE running max before freezing m "
+        "for the rest. 1.0 freezes nothing (reference), 0.0 freezes every block "
+        "past the first. The LUT order is held fixed so this isolates the "
+        "kernel's freeze effect. None (default) disables VSA freezing (plain "
+        "block-sparse).",
     )
 
     parser.add_argument(

@@ -963,6 +963,7 @@ namespace py = pybind11;
           py::arg("lut_start"),                                                   \
           py::arg("lut_count"),                                                   \
           py::arg("softmax_scale"),                                               \
+          py::arg("lut_freeze") = std::nullopt,                                   \
           py::arg("out") = std::nullopt);
 
 #define MHA_FWD_PYBIND                             \

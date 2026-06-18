@@ -236,6 +236,7 @@ fmha_v3_fwd_fp8_sparse(at::Tensor& q,
                        const at::Tensor& lut_start,
                        const at::Tensor& lut_count,
                        float softmax_scale,
+                       std::optional<at::Tensor> lut_freeze,
                        std::optional<at::Tensor> out_)
 {
     // ---- dtype + device checks --------------------------------------------
@@ -300,6 +301,20 @@ fmha_v3_fwd_fp8_sparse(at::Tensor& q,
     TORCH_CHECK(lut_count.numel() == expected_lut_meta,
                 "fmha_v3_fwd_fp8_sparse: lut_count.numel() = ", lut_count.numel(),
                 ", expected ", expected_lut_meta, ".");
+
+    // ---- VSA freeze LUT (optional) -----------------------------------------
+    // Same int32 [B*HQ*num_q_blocks] layout as lut_count. When absent the
+    // kernel sees a null ptr and disables freezing (== plain sparse path).
+    if (lut_freeze.has_value())
+    {
+        TORCH_CHECK(lut_freeze->dtype() == torch::kInt32,
+                    "fmha_v3_fwd_fp8_sparse: lut_freeze must be int32.");
+        CHECK_DEVICE((*lut_freeze));
+        TORCH_CHECK(lut_freeze->numel() == expected_lut_meta,
+                    "fmha_v3_fwd_fp8_sparse: lut_freeze.numel() = ",
+                    lut_freeze->numel(), ", expected ", expected_lut_meta,
+                    " (= batch*HQ*num_q_blocks, same as lut_count).");
+    }
 
     // ---- output tensor -----------------------------------------------------
     auto opts = q.options();
@@ -409,6 +424,8 @@ fmha_v3_fwd_fp8_sparse(at::Tensor& q,
     a.kv_block_indices_ptr = kv_block_indices.data_ptr();
     a.lut_start_ptr        = lut_start.data_ptr();
     a.lut_count_ptr        = lut_count.data_ptr();
+    a.lut_freeze_ptr       = lut_freeze.has_value() ? lut_freeze->data_ptr()
+                                                    : nullptr;
 
     ck_tile::stream_config stream_config{stream};
     float t = aiter::fmha_fwd_v3_fp8_sparse(a, stream_config);

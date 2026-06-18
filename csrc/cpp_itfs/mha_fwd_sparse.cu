@@ -4,10 +4,11 @@
 // Block-sparse FMHA forward (Sage i8fp8, hd=128, gfx950) C++ dispatcher.
 //
 // Mirrors aiter::fmha_fwd_v3 in mha_fwd.cu but routes to the hand-written
-// sparse ASM kernel (fwd_hd128_i8fp8_sparse.co). The 704-byte kernarg blob is
-// the dense 656-byte fmha_fwd_v3_args layout plus 3 trailing pointers
-// (kv_block_indices, lut_start, lut_count) -- see
-// /workspace/mi350_fmha_hd128_i8fp8_sparse.py docstring.
+// sparse ASM kernel (fwd_hd128_i8fp8_sparse.co). The 720-byte kernarg blob is
+// the dense 656-byte fmha_fwd_v3_args layout plus 4 trailing pointers
+// (kv_block_indices, lut_start, lut_count, lut_freeze) -- see
+// /workspace/mi350_fmha_hd128_i8fp8_sparse.py docstring. lut_freeze (VSA) is
+// only consumed by the fp8 .co today; the i8fp8/mxfp4 .co ignore the slot.
 
 #include "mha_fwd_sparse.h"
 #include "aiter_hip_common.h"
@@ -18,7 +19,7 @@ namespace aiter {
 
 // Hardcoded for the single shape this kernel currently supports.
 // (BLOCK_M, BLOCK_N) = (256, 128); hd_q = hd_v = 128; non-causal.
-// The mxfp4 sibling shares the SAME 704-byte kernarg layout (sparse args
+// The mxfp4 sibling shares the SAME 720-byte kernarg layout (sparse args
 // are only the trailing 48-byte LUT pointer block, identical for both).
 static constexpr int      kSparseTileQ = 256;
 static constexpr int      kSparseTileN = 128;
@@ -31,7 +32,7 @@ static constexpr const char* kSparseMxfp4KernelName =
     "_ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E";
 static constexpr const char* kSparseMxfp4CoName =
     "fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co";
-// fp8-quantized sibling (E4M3 Q/K/V). Same 704-byte kernarg layout and
+// fp8-quantized sibling (E4M3 Q/K/V). Same 720-byte kernarg layout and
 // same in_bpe=1 byte stride as the i8fp8 path, so init_sparse_v3_args is
 // reused unchanged; only the kernel symbol + .co name differ.
 static constexpr const char* kSparseFp8KernelName =
@@ -39,8 +40,8 @@ static constexpr const char* kSparseFp8KernelName =
 static constexpr const char* kSparseFp8CoName =
     "fmha_v3_fwd/fwd_hd128_fp8_sparse.co";
 
-// Pack the 704-byte blob. The first 656 bytes mirror init_fmha_fwd_v3_args
-// (see mha_fwd.cu); the trailing 48 bytes hold the 3 LUT pointers (each 16
+// Pack the 720-byte blob. The first 656 bytes mirror init_fmha_fwd_v3_args
+// (see mha_fwd.cu); the trailing 64 bytes hold the 4 LUT pointers (each 16
 // bytes with p2 padding, matching the host struct in mha_fwd.h).
 //
 // We pack manually instead of calling init_fmha_fwd_v3_args to keep the
@@ -104,6 +105,8 @@ static void init_sparse_v3_args(fmha_fwd_v3_sparse_args& args,
     args.ptr_kv_block_indices = a.kv_block_indices_ptr;
     args.ptr_lut_start        = a.lut_start_ptr;
     args.ptr_lut_count        = a.lut_count_ptr;
+    // VSA freeze LUT (nullptr => kernel disables freezing == plain sparse).
+    args.ptr_lut_freeze       = a.lut_freeze_ptr;
 }
 
 float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
@@ -162,7 +165,7 @@ float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
     });
 }
 
-// Block-sparse mxfp4 fmha sibling. Same 704-byte kernarg blob as the
+// Block-sparse mxfp4 fmha sibling. Same 720-byte kernarg blob as the
 // i8fp8 sparse path; the only on-device difference is the kernel symbol
 // + .co name. The mxfp4 kernel re-computes its own Q/K E8M0 per-block
 // scale offsets from _s_KV_cur / _s_seq_len / _s_q_head_num so the
@@ -224,7 +227,7 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
 
 // Block-sparse fp8 fmha sibling (E4M3 Q/K and fp8 V, per-tensor fp32
 // descales -- same descale contract as the i8fp8 path). Shares the
-// identical 704-byte kernarg blob and in_bpe=1 byte stride as the i8fp8
+// identical 720-byte kernarg blob and in_bpe=1 byte stride as the i8fp8
 // path, so init_sparse_v3_args is reused unchanged. The only on-device
 // difference is the kernel symbol + .co name.
 float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)

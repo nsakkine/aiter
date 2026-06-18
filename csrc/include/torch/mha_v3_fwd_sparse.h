@@ -45,6 +45,9 @@ fmha_v3_fwd_fp8_sparse(at::Tensor& q,                  // [b, sq, hq, d], fp8
                        const at::Tensor& lut_start,        // int32 [b*hq*num_q_blocks]
                        const at::Tensor& lut_count,        // int32 [b*hq*num_q_blocks]
                        float softmax_scale,
+                       // VSA freeze LUT: int32 [b*hq*num_q_blocks] or nullopt
+                       // (nullopt => freezing disabled, plain block-sparse).
+                       std::optional<at::Tensor> lut_freeze = std::nullopt,
                        std::optional<at::Tensor> out_ = std::nullopt); // bf16
 
 // Block-sparse mxfp4 sibling. Q/K are fp4-packed bytes (logical hd=128

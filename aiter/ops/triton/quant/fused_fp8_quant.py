@@ -20,8 +20,9 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
+from aiter.utility import dtypes
 
-fp8_dtype = aiter.dtypes.fp8
+fp8_dtype = dtypes.get_dtype_fp8()
 
 
 def fused_rms_fp8_per_tensor_static_quant(

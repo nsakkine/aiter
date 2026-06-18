@@ -368,6 +368,7 @@ def _gen_fmha_v3_fwd_fp8_sparse_fake_tensors(
     lut_start: Tensor,
     lut_count: Tensor,
     softmax_scale: float,
+    lut_freeze: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]:
     if out is not None:
@@ -395,6 +396,7 @@ def fmha_v3_fwd_fp8_sparse(
     lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
     lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
     softmax_scale: float,
+    lut_freeze: Optional[Tensor] = None,  # VSA: int32 [b*hq*num_q_blocks]
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]: ...
 
@@ -3372,6 +3374,7 @@ def flash_attn_fp8_sparse_pertensor_func(
     lut_start: torch.Tensor,
     lut_count: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    lut_freeze: Optional[torch.Tensor] = None,
 ):
     """Block-sparse Sage fp8 FMHA forward (hd=128, gfx950).
 
@@ -3390,6 +3393,11 @@ def flash_attn_fp8_sparse_pertensor_func(
             aiter.ops.triton.attention.utils.block_attn_mask_to_ragged_lut
             (return_none_if_dense=False; this kernel has no dense path).
         softmax_scale: if None, defaults to head_dim**-0.5
+        lut_freeze: optional VSA freeze LUT, int32 [b*hq*num_q_blocks] with the
+            same layout as lut_count. Entry k = number of leading (highest
+            pooled-QK priority) blocks to process with a live max before
+            freezing m for the rest. None => freezing disabled (plain sparse).
+            Requires kv_block_indices to be ordered by descending priority.
 
     Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
     fmha_v3_fwd_fp8_sparse):
@@ -3419,6 +3427,7 @@ def flash_attn_fp8_sparse_pertensor_func(
         lut_start,
         lut_count,
         float(softmax_scale),
+        lut_freeze,
         None,
     )
     out_padded = outs[0]

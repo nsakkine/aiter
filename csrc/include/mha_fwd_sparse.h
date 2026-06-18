@@ -20,10 +20,16 @@ struct mha_fwd_sparse_args : public mha_fwd_args
     const void* kv_block_indices_ptr; // int32, shape [lut_count.sum()]
     const void* lut_start_ptr;        // int32, shape [B*HQ*num_q_blocks]
     const void* lut_count_ptr;        // int32, same shape
+    // VSA (Vector-relieved Sparse Attention): per-(b,head,q_block) number of
+    // leading (highest-priority) KV blocks to process with a live, max-updating
+    // softmax before freezing m. int32, same shape as lut_count. nullptr =>
+    // freezing disabled (kernel falls back to n_freeze = n_blocks, i.e. plain
+    // block-sparse behaviour, bit-for-bit).
+    const void* lut_freeze_ptr;
 };
 
-// On-device kernarg blob: same 656 bytes as fmha_fwd_v3_args + 48 bytes
-// (3 ptr slots with the same p2 padding convention).
+// On-device kernarg blob: same 656 bytes as fmha_fwd_v3_args + 64 bytes
+// (4 ptr slots with the same p2 padding convention).
 struct __attribute__((packed)) fmha_fwd_v3_sparse_args : public fmha_fwd_v3_args
 {
     const void* ptr_kv_block_indices;
@@ -32,12 +38,14 @@ struct __attribute__((packed)) fmha_fwd_v3_sparse_args : public fmha_fwd_v3_args
     p2 _ppad_ls;
     const void* ptr_lut_count;
     p2 _ppad_lc;
+    const void* ptr_lut_freeze; // VSA: kernarg offset 0x2C0
+    p2 _ppad_lf;
 };
 
-static_assert(sizeof(fmha_fwd_v3_sparse_args) == 704,
-              "fmha_fwd_v3_sparse_args must be exactly 704 bytes "
-              "(matches the @kernel(_kernarg_raw size=704) in "
-              "mi350_fmha_hd128_i8fp8_sparse.py).");
+static_assert(sizeof(fmha_fwd_v3_sparse_args) == 720,
+              "fmha_fwd_v3_sparse_args must be exactly 720 bytes "
+              "(matches the @kernel(_kernarg_raw size=720) in "
+              "mi350_fmha_hd128_fp8_sparse.py: 656 dense + 4*16 LUT ptr slots).");
 
 // Sparse dispatcher. Returns the launch time in ms, -1 on unsupported config.
 float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
