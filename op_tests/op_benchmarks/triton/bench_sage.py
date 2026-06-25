@@ -75,7 +75,17 @@ KernelName = Literal[
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
     "aiter_asm_sparse_fp8",
+    "aiter_asm_sparse_fp8_q128kv64",
 ]
+
+# All hand-written ASM block-sparse backends (share the sparse-only traversal
+# path; enumerated together for LUT/metric/validation handling).
+ASM_SPARSE_KERNELS = (
+    "aiter_asm_sparse",
+    "aiter_asm_sparse_mxfp4",
+    "aiter_asm_sparse_fp8",
+    "aiter_asm_sparse_fp8_q128kv64",
+)
 
 ALL_KERNELS: List[str] = [
     "sage_fp8",
@@ -94,6 +104,7 @@ FP8_CHECK_KERNELS = {
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
     "aiter_asm_sparse_fp8",
+    "aiter_asm_sparse_fp8_q128kv64",
 }
 
 # -----------------------------------------------------------------------------
@@ -109,6 +120,9 @@ FP8_CHECK_KERNELS = {
 ASM_SPARSE_BLOCK_M = 256  # kTileQ in mi350_fmha_hd128_i8fp8_sparse.py
 ASM_SPARSE_BLOCK_N = 128  # kTileKV
 ASM_SPARSE_HEAD_DIM = 128  # kHeadSizeQK / kHeadSizeV
+# Finer-KV fork (mi350_fmha_hd128_fp8_sparse_q128kv64.py): stage 1 keeps Q=256
+# but halves the KV tile to 64, so the LUT must be built with BLOCK_N=64.
+ASM_SPARSE_Q128KV64_BLOCK_N = 64
 
 
 def make_asm_sparse_runner(
@@ -207,6 +221,7 @@ def make_asm_sparse_fp8_runner(
     v_bshd: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     lut_freeze: Optional[torch.Tensor] = None,
+    q128kv64: bool = False,
 ) -> Any:
     """Runner factory for the hand-written ASM block-sparse all-fp8 Sage kernel.
 
@@ -259,6 +274,42 @@ def make_asm_sparse_fp8_runner(
 
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 
+    import os as _os
+    if _os.environ.get("PROBE_DUMP"):
+        print(f"[PROBE] q_bshd={tuple(q_bshd.shape)} k={tuple(k_bshd.shape)} v={tuple(v_bshd.shape)} "
+              f"layout={args.layout} q128kv64={q128kv64}", flush=True)
+        print(f"[PROBE] descales q={q_descale.item():.5f} k={k_descale.item():.5f} v={v_descale.item():.5f} "
+              f"scale={softmax_scale:.6f}", flush=True)
+        print(f"[PROBE] lut kv={kv_block_indices.flatten().tolist()[:16]} start={lut_start.flatten().tolist()[:8]} "
+              f"count={lut_count.flatten().tolist()[:8]} freeze={None if lut_freeze is None else lut_freeze.flatten().tolist()[:8]}", flush=True)
+        print(f"[PROBE] qf stats min={q_fp8.float().min():.3f} max={q_fp8.float().max():.3f} "
+              f"vf min={v_fp8.float().min():.3f} max={v_fp8.float().max():.3f}", flush=True)
+        _o = flash_attn_fp8_sparse_pertensor_func(
+            q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale,
+            kv_block_indices, lut_start, lut_count,
+            softmax_scale=softmax_scale, lut_freeze=lut_freeze,
+            dispatch="default", q128kv64=q128kv64)[0].float()
+        _qd = (q_bshd.float() * q_descale)  # NOTE: q_bshd is already bf16, not fp8; recompute ref from fp8
+        _qf = q_fp8.float() * q_descale
+        _kf = k_fp8.float() * k_descale
+        _vf = v_fp8.float() * v_descale
+        _b, _s, _h, _d = _qf.shape
+        _att = torch.einsum("bshd,bthd->bhst", _qf, _kf) * softmax_scale
+        _p = torch.softmax(_att, dim=-1)
+        _ref = torch.einsum("bhst,bthd->bshd", _p, _vf)
+        _cos = torch.nn.functional.cosine_similarity(_o.flatten(), _ref.flatten(), dim=0).item()
+        print(f"[PROBE] INLINE kernel-out std={_o.std():.4f} ref(fp8-dequant) std={_ref.std():.4f} "
+              f"cos={_cos:.5f} o.min={_o.min():.3f} o.max={_o.max():.3f}", flush=True)
+        print(f"[PROBE] strides q={q_fp8.stride()} k={k_fp8.stride()} v={v_fp8.stride()} "
+              f"contig q={q_fp8.is_contiguous()} k={k_fp8.is_contiguous()} v={v_fp8.is_contiguous()}", flush=True)
+        torch.save({
+            "q": q_fp8.cpu(), "k": k_fp8.cpu(), "v": v_fp8.cpu(),
+            "qd": q_descale.cpu(), "kd": k_descale.cpu(), "vd": v_descale.cpu(),
+            "kv": kv_block_indices.cpu(), "ls": lut_start.cpu(), "lc": lut_count.cpu(),
+            "scale": softmax_scale,
+        }, "/tmp/bench_inputs.pt")
+        print("[PROBE] saved /tmp/bench_inputs.pt", flush=True)
+
     def _run() -> torch.Tensor:
         return flash_attn_fp8_sparse_pertensor_func(
             q_fp8,
@@ -272,6 +323,10 @@ def make_asm_sparse_fp8_runner(
             lut_count,
             softmax_scale=softmax_scale,
             lut_freeze=lut_freeze,
+            # q128kv64 only wired for the default dispatch (no sorted/persistent
+            # q128kv64 .co yet); force it so an env override can't break the route.
+            dispatch="default" if q128kv64 else None,
+            q128kv64=q128kv64,
         )
 
     return _run
@@ -619,11 +674,9 @@ def load_block_mask_from_json(
 def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
-    elif kernel in (
-        "aiter_asm_sparse",
-        "aiter_asm_sparse_mxfp4",
-        "aiter_asm_sparse_fp8",
-    ):
+    elif kernel == "aiter_asm_sparse_fp8_q128kv64":
+        return ASM_SPARSE_BLOCK_M, ASM_SPARSE_Q128KV64_BLOCK_N
+    elif kernel in ASM_SPARSE_KERNELS:
         return ASM_SPARSE_BLOCK_M, ASM_SPARSE_BLOCK_N
     else:
         cfg = get_sage_fwd_configs()
@@ -1175,6 +1228,11 @@ def make_kernel_runner(
             args, q_bshd, k_bshd, v_bshd, block_lut, lut_freeze
         )
 
+    if args.kernel == "aiter_asm_sparse_fp8_q128kv64":
+        return make_asm_sparse_fp8_runner(
+            args, q_bshd, k_bshd, v_bshd, block_lut, lut_freeze, q128kv64=True
+        )
+
     raise ValueError(f"Unsupported kernel: {args.kernel}")
 
 
@@ -1309,11 +1367,7 @@ def benchmark_single_case(
     # materialized LUT (one entry per KV block). Triton kernels prefer
     # return_none_if_dense=True so they can fall back to their fast
     # dense path; keep that for everything else.
-    _return_none_if_dense = args.kernel not in (
-        "aiter_asm_sparse",
-        "aiter_asm_sparse_mxfp4",
-        "aiter_asm_sparse_fp8",
-    )
+    _return_none_if_dense = args.kernel not in ASM_SPARSE_KERNELS
     block_lut = (
         block_attn_mask_to_ragged_lut(
             block_attn_mask, return_none_if_dense=_return_none_if_dense
@@ -1352,6 +1406,7 @@ def benchmark_single_case(
         "aiter_asm_sparse",
         "aiter_asm_sparse_mxfp4",
         "aiter_asm_sparse_fp8",
+        "aiter_asm_sparse_fp8_q128kv64",
     ):
         # Per-element size in BYTES for the GB/s memory-bw estimate. mxfp4
         # is 4 bits/elem = 0.5 B, but element_size in PyTorch is integer.
@@ -1374,6 +1429,7 @@ def benchmark_single_case(
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
             "aiter_asm_sparse_fp8",
+            "aiter_asm_sparse_fp8_q128kv64",
         )
         else v.element_size()
     )
@@ -1589,11 +1645,7 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
 
-    if args.kernel in (
-        "aiter_asm_sparse",
-        "aiter_asm_sparse_mxfp4",
-        "aiter_asm_sparse_fp8",
-    ):
+    if args.kernel in ASM_SPARSE_KERNELS:
         if args.block_sparsity is None and not args.block_mask_file:
             raise ValueError(
                 f"--kernel={args.kernel} requires --block-sparsity or "
@@ -1792,11 +1844,7 @@ def run_block_sparse_repetitions(
     num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
     num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
 
-    _return_none_if_dense = args.kernel not in (
-        "aiter_asm_sparse",
-        "aiter_asm_sparse_mxfp4",
-        "aiter_asm_sparse_fp8",
-    )
+    _return_none_if_dense = args.kernel not in ASM_SPARSE_KERNELS
     warmup_mask = (
         torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
         > args.block_sparsity
@@ -1958,12 +2006,14 @@ def parse_args() -> argparse.Namespace:
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
             "aiter_asm_sparse_fp8",
+            "aiter_asm_sparse_fp8_q128kv64",
             "all",
         ],
         help=(
             "Kernel implementation to benchmark. Use 'all' to compare all "
             "non-sparse backends. 'aiter_asm_sparse' (i8fp8), "
-            "'aiter_asm_sparse_mxfp4', and 'aiter_asm_sparse_fp8' are the "
+            "'aiter_asm_sparse_mxfp4', 'aiter_asm_sparse_fp8', and "
+            "'aiter_asm_sparse_fp8_q128kv64' (fp8, finer KV=64 tile) are the "
             "hand-written PyISA kernels and REQUIRE --block-sparsity "
             "(or --block-mask-file)."
         ),

@@ -48,7 +48,32 @@ fmha_v3_fwd_fp8_sparse(at::Tensor& q,                  // [b, sq, hq, d], fp8
                        // VSA freeze LUT: int32 [b*hq*num_q_blocks] or nullopt
                        // (nullopt => freezing disabled, plain block-sparse).
                        std::optional<at::Tensor> lut_freeze = std::nullopt,
-                       std::optional<at::Tensor> out_ = std::nullopt); // bf16
+                       std::optional<at::Tensor> out_ = std::nullopt, // bf16
+                       // q128kv64=true routes to fwd_hd128_fp8_sparse_q128kv64.co
+                       // (kTileKV=64). Caller must pass a BLOCK_N=64 LUT.
+                       bool q128kv64 = false);
+
+// Persistent (grid-stride) fp8 sparse sibling. Same contract as
+// fmha_v3_fwd_fp8_sparse plus a `work_table` int32[total_tiles] tensor (entry
+// k = packed q | (h<<16) | (b<<24) of the k-th tile, LPT-sorted by lut_count
+// descending). Launches a fixed 1-D persistent grid that grid-strides over the
+// work table to balance the heavy-tile E2E tail. Routes to the separate
+// fwd_hd128_fp8_sparse_persistent.co (built with _PERSISTENT=True).
+std::vector<at::Tensor>
+fmha_v3_fwd_fp8_sparse_persistent(at::Tensor& q,                  // [b, sq, hq, d], fp8
+                                  const at::Tensor& k,            // [b, sk, hk, d], fp8
+                                  const at::Tensor& v,            // [b, sk, hk, d_v], fp8
+                                  const at::Tensor& q_descale,    // [1] or [b, hk], fp32
+                                  const at::Tensor& k_descale,    // [1] or [b, hk], fp32
+                                  const at::Tensor& v_descale,    // [1] or [b, hk], fp32
+                                  const at::Tensor& kv_block_indices, // int32
+                                  const at::Tensor& lut_start,        // int32 [b*hq*nqb]
+                                  const at::Tensor& lut_count,        // int32 [b*hq*nqb]
+                                  const at::Tensor& work_table,       // int32 [b*hq*nqb]
+                                  float softmax_scale,
+                                  bool sorted = false,                // true: sorted 1-WG/tile; false: persistent
+                                  std::optional<at::Tensor> lut_freeze = std::nullopt,
+                                  std::optional<at::Tensor> out_ = std::nullopt); // bf16
 
 // Block-sparse mxfp4 sibling. Q/K are fp4-packed bytes (logical hd=128
 // stored as byte[hd/2]); V is fp8; Q/K scales are E8M0 per-block

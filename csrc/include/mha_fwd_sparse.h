@@ -26,6 +26,15 @@ struct mha_fwd_sparse_args : public mha_fwd_args
     // freezing disabled (kernel falls back to n_freeze = n_blocks, i.e. plain
     // block-sparse behaviour, bit-for-bit).
     const void* lut_freeze_ptr;
+
+    // ---- Persistent kernel (grid-stride over Q-tiles); only consumed by the
+    // fmha_fwd_v3_fp8_sparse_persistent dispatcher + the _PERSISTENT=True .co. ----
+    // work_table: int32[total_tiles], entry k = packed q | (h<<16) | (b<<24) for
+    // the k-th tile to process (typically LPT-sorted by lut_count descending).
+    // nullptr on the non-persistent path.
+    const void* work_table_ptr = nullptr;
+    uint32_t    num_wgs        = 0;   // persistent grid size (== gridDim.x). 0 => dispatcher picks.
+    uint32_t    total_tiles    = 0;   // = batch * nhead_q * num_q_blocks (== work_table.numel()).
 };
 
 // On-device kernarg blob: same 656 bytes as fmha_fwd_v3_args + 64 bytes
@@ -47,6 +56,25 @@ static_assert(sizeof(fmha_fwd_v3_sparse_args) == 720,
               "(matches the @kernel(_kernarg_raw size=720) in "
               "mi350_fmha_hd128_fp8_sparse.py: 656 dense + 4*16 LUT ptr slots).");
 
+// Persistent-kernel kernarg blob: the 720-byte sparse layout + 3 trailing fields
+// at offsets 0x2D0/0x2E0/0x2E4, padded to 752 to match the @kernel(_kernarg_raw
+// size=752) emitted when mi350_fmha_hd128_fp8_sparse.py is built with
+// _PERSISTENT=True. The non-persistent .co never sees these bytes.
+struct __attribute__((packed)) fmha_fwd_v3_sparse_persistent_args
+    : public fmha_fwd_v3_sparse_args
+{
+    const void* ptr_work_table; // kernarg offset 0x2D0 (int32[total_tiles])
+    p2 _ppad_wt;
+    uint32_t s_num_wgs;         // 0x2E0 grid-stride
+    uint32_t s_total_tiles;     // 0x2E4 loop bound
+    uint64_t _tail_pad;         // pad 744 -> 752 (matches the .co kernarg segment)
+};
+
+static_assert(sizeof(fmha_fwd_v3_sparse_persistent_args) == 752,
+              "fmha_fwd_v3_sparse_persistent_args must be exactly 752 bytes "
+              "(matches @kernel(_kernarg_raw size=752) when _PERSISTENT=True: "
+              "720 sparse + work_table(16) + num_wgs(4) + total_tiles(4) + pad(8)).");
+
 // Sparse dispatcher. Returns the launch time in ms, -1 on unsupported config.
 float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
@@ -66,6 +94,25 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
 // /workspace/mi350_fmha_hd128_fp8_sparse.py. Q/K/V are all fp8 (E4M3)
 // and the descales are per-tensor fp32, so the dispatcher reuses the
 // i8fp8 init_sparse_v3_args path verbatim (in_bpe=1 for fp8).
-float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+//
+// q128kv64=true routes to the finer-KV-granularity fork
+// (fwd_hd128_fp8_sparse_q128kv64.co, kTileKV=64). Stage 1 shares the same
+// kernarg/grid/bdx, so only the symbol + .co change; the caller MUST build the
+// LUT with BLOCK_N=64 to match the kernel's 64-row KV stride.
+float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s,
+                             bool q128kv64 = false);
+
+// Work-table variant of the fp8 sparse path. Same data contract plus
+// a.work_table_ptr / a.total_tiles. Two sub-modes:
+//   * sorted_dispatch=true (recommended): one WG per tile, flat grid
+//     gridDim=(total_tiles,1,1); each WG reads work_table[wg_id]. Keeps the
+//     hardware scheduler work-conserving and only fixes dispatch ORDER
+//     (LPT, heavy tiles first). Routes to fwd_hd128_fp8_sparse_sorted.co.
+//   * sorted_dispatch=false: persistent grid-stride; fixed 1-D grid of a.num_wgs
+//     workgroups (auto-sized to occupancy when 0). Routes to
+//     fwd_hd128_fp8_sparse_persistent.co.
+float fmha_fwd_v3_fp8_sparse_persistent(mha_fwd_sparse_args a,
+                                        const ck_tile::stream_config& s,
+                                        bool sorted_dispatch = false);
 
 } // namespace aiter

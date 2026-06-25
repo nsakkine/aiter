@@ -39,6 +39,24 @@ static constexpr const char* kSparseFp8KernelName =
     "_ZN5aiter32fmha_fwd_hd128_fp8_sparse_gfx950E";
 static constexpr const char* kSparseFp8CoName =
     "fmha_v3_fwd/fwd_hd128_fp8_sparse.co";
+// Finer-KV-granularity fork (kTileKV=64; stage 1 keeps kTileQ=256 / 8 waves, so
+// the grid + bdx + 720-byte kernarg are identical -- only the symbol + .co
+// differ). Built from mi350_fmha_hd128_fp8_sparse_q128kv64.py. The caller must
+// build the LUT with BLOCK_N=64 (kv_block_indices in units of 64).
+static constexpr const char* kSparseFp8Q128KV64KernelName =
+    "_ZN5aiter41fmha_fwd_hd128_fp8_sparse_q128kv64_gfx950E";
+static constexpr const char* kSparseFp8Q128KV64CoName =
+    "fmha_v3_fwd/fwd_hd128_fp8_sparse_q128kv64.co";
+// Persistent (grid-stride) fp8 sparse sibling. SAME kernel symbol, but a
+// separate .co built from mi350_fmha_hd128_fp8_sparse.py with _PERSISTENT=True
+// (752-byte kernarg + 1-D grid-stride loop). Kept as a distinct .co so the
+// non-persistent path is byte-for-byte unaffected.
+static constexpr const char* kSparseFp8PersistentCoName =
+    "fmha_v3_fwd/fwd_hd128_fp8_sparse_persistent.co";
+// Sorted-dispatch fp8 sparse sibling: one WG per tile, flat grid indexed through
+// the LPT work table. Separate .co built with _SORTED_DISPATCH=True.
+static constexpr const char* kSparseFp8SortedCoName =
+    "fmha_v3_fwd/fwd_hd128_fp8_sparse_sorted.co";
 
 // Pack the 720-byte blob. The first 656 bytes mirror init_fmha_fwd_v3_args
 // (see mha_fwd.cu); the trailing 64 bytes hold the 4 LUT pointers (each 16
@@ -230,28 +248,31 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
 // identical 720-byte kernarg blob and in_bpe=1 byte stride as the i8fp8
 // path, so init_sparse_v3_args is reused unchanged. The only on-device
 // difference is the kernel symbol + .co name.
-float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
+float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s,
+                             bool q128kv64)
 {
+    const char* tag = q128kv64 ? "fmha_fwd_v3_fp8_sparse[q128kv64]"
+                               : "fmha_fwd_v3_fp8_sparse";
     if(!a.use_asm_v3)
         return -1;
 
     const std::string arch_id = get_gpu_arch();
     if(arch_id != "gfx950")
     {
-        AITER_LOG_WARNING("fmha_fwd_v3_fp8_sparse: only gfx950 is supported "
+        AITER_LOG_WARNING(tag << ": only gfx950 is supported "
                           "(detected arch: " << arch_id << ")");
         return -1;
     }
     if(a.data_type != "fp8bf16")
     {
-        AITER_LOG_WARNING("fmha_fwd_v3_fp8_sparse: only data_type=fp8bf16 is "
+        AITER_LOG_WARNING(tag << ": only data_type=fp8bf16 is "
                           "supported (got " << a.data_type << ")");
         return -1;
     }
     if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
        a.bias_type != 0)
     {
-        AITER_LOG_WARNING("fmha_fwd_v3_fp8_sparse: unsupported feature combination "
+        AITER_LOG_WARNING(tag << ": unsupported feature combination "
                           "(group/mask/lse/dropout/bias must all be off)");
         return -1;
     }
@@ -261,10 +282,15 @@ float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config
         return 1;
     }
 
+    // Stage 1 of the q128kv64 fork shares the 720-byte kernarg, the (256-Q) grid
+    // and bdx=512 (8 waves) with the default kernel; only the symbol + .co differ.
+    const char* kname  = q128kv64 ? kSparseFp8Q128KV64KernelName : kSparseFp8KernelName;
+    const char* coname = q128kv64 ? kSparseFp8Q128KV64CoName     : kSparseFp8CoName;
+
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
-        kSparseFp8KernelName,
-        [&]() { return AiterAsmKernel(kSparseFp8KernelName, kSparseFp8CoName); });
+        kname,
+        [&]() { return AiterAsmKernel(kname, coname); });
 
     fmha_fwd_v3_sparse_args args{};
     size_t arg_size = sizeof(args);
@@ -274,6 +300,102 @@ float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config
     const int gdx = num_q_blocks;
     const int gdy = a.nhead_q;
     const int gdz = a.batch;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Persistent (grid-stride) fp8 sparse dispatcher. Instead of one workgroup per
+// (b, h, q_block) tile, launch a FIXED 1-D grid of num_wgs workgroups; each WG
+// grid-strides over a.work_table (host-built, LPT-sorted) so the few heavy tiles
+// spread across CUs and the E2E tail-block collapses. Requires a.work_table_ptr
+// and a.total_tiles; num_wgs auto-sizes to the CU count when a.num_wgs == 0.
+float fmha_fwd_v3_fp8_sparse_persistent(mha_fwd_sparse_args a,
+                                        const ck_tile::stream_config& s,
+                                        bool sorted_dispatch)
+{
+    const char* tag = sorted_dispatch ? "fmha_fwd_v3_fp8_sparse_sorted"
+                                       : "fmha_fwd_v3_fp8_sparse_persistent";
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING(tag << ": only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.data_type != "fp8bf16")
+    {
+        AITER_LOG_WARNING(tag << ": only data_type=fp8bf16 is supported (got "
+                          << a.data_type << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING(tag << ": unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must be off)");
+        return -1;
+    }
+    if(a.work_table_ptr == nullptr || a.total_tiles == 0)
+    {
+        AITER_LOG_WARNING(tag << ": work_table_ptr/total_tiles must be set");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    const char* co_name =
+        sorted_dispatch ? kSparseFp8SortedCoName : kSparseFp8PersistentCoName;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        co_name,
+        [&]() { return AiterAsmKernel(kSparseFp8KernelName, co_name); });
+
+    fmha_fwd_v3_sparse_persistent_args args{};
+    size_t arg_size = sizeof(args);
+    init_sparse_v3_args(args, a); // fills the shared 720-byte base
+    args.ptr_work_table = a.work_table_ptr;
+    args.s_total_tiles  = a.total_tiles;
+
+    int gdx, gdy = 1, gdz = 1;
+    if(sorted_dispatch)
+    {
+        // One WG per tile; the hardware scheduler stays work-conserving and the
+        // LPT-sorted table only fixes dispatch order. num_wgs unused by this .co.
+        args.s_num_wgs = a.total_tiles;
+        gdx = static_cast<int>(a.total_tiles);
+    }
+    else
+    {
+        // Persistent grid-stride: one WG per CU (full occupancy at 1 WG/CU),
+        // capped so we never launch more WGs than tiles.
+        int num_wgs = static_cast<int>(a.num_wgs);
+        if(num_wgs <= 0)
+        {
+            int dev = 0;
+            hipGetDevice(&dev);
+            hipDeviceProp_t props{};
+            hipGetDeviceProperties(&props, dev);
+            num_wgs = props.multiProcessorCount; // CU count
+        }
+        if(num_wgs > static_cast<int>(a.total_tiles))
+            num_wgs = static_cast<int>(a.total_tiles);
+        if(num_wgs < 1)
+            num_wgs = 1;
+        args.s_num_wgs = static_cast<uint32_t>(num_wgs);
+        gdx = num_wgs;
+    }
     const int bdx = kSparseBdx;
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
