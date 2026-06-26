@@ -89,6 +89,20 @@ float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 // validate shapes (see asm_mha_fwd_sparse.cu::fmha_v3_fwd_mxfp4_sparse).
 float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
+// Sorted-dispatch mxfp4 sparse sibling. Same data + 720-byte base contract plus
+// a.work_table_ptr / a.total_tiles. One WG per tile on a flat grid
+// gridDim=(total_tiles,1,1); each WG reads work_table[wg_id] (LPT, heavy tiles first) and decodes
+// its (q,h,b). Routes to fwd_hd128_mxfp4_sparse_sorted.co (752-byte kernarg). There is NO persistent
+// sub-mode for mxfp4 (SGPR budget), so unlike the fp8 path this is sorted-only.
+float fmha_fwd_v3_mxfp4_sparse_sorted(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
+// DENSE mxfp4 sibling (no LUT / no block sparsity): processes every KV tile.
+// Reuses the same 656-byte fmha_fwd_v3_args prefix (init_sparse_v3_args) and the
+// same mxfp4 numeric contract (fp4-packed Q/K + E8M0 per-block scales via MFMA,
+// fp8 V, bf16 out); only the symbol + .co (fwd_hd128_mxfp4.co) differ. Grid +
+// bdx match the sparse path. See asm_mha_fwd_sparse.cu::fmha_v3_fwd_mxfp4.
+float fmha_fwd_v3_mxfp4(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
 // Sparse fp8 sibling. Same kernarg layout, different .co
 // (fwd_hd128_fp8_sparse.co) generated from
 // /workspace/mi350_fmha_hd128_fp8_sparse.py. Q/K/V are all fp8 (E4M3)

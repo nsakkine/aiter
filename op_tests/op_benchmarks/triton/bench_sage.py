@@ -23,6 +23,7 @@ from aiter.ops.mha import (
     flash_attn_i8fp8_pertensor_func,
     flash_attn_i8fp8_sparse_pertensor_func,
     flash_attn_mxfp4_sparse_pertensor_func,
+    flash_attn_mxfp4_pertensor_func,
     flash_attn_fp8_sparse_pertensor_func,
 )
 
@@ -74,6 +75,7 @@ KernelName = Literal[
     "aiter_bf16",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
+    "aiter_asm_mxfp4",
     "aiter_asm_sparse_fp8",
     "aiter_asm_sparse_fp8_q128kv64",
 ]
@@ -103,6 +105,7 @@ FP8_CHECK_KERNELS = {
     "aiter_i8fp8",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
+    "aiter_asm_mxfp4",
     "aiter_asm_sparse_fp8",
     "aiter_asm_sparse_fp8_q128kv64",
 }
@@ -338,6 +341,7 @@ def make_asm_sparse_mxfp4_runner(
     k_bshd: torch.Tensor,
     v_bshd: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    lut_freeze: Optional[torch.Tensor] = None,
 ) -> Any:
     """Runner factory for the hand-written ASM block-sparse mxfp4 Sage kernel.
 
@@ -430,6 +434,8 @@ def make_asm_sparse_mxfp4_runner(
     kv_block_indices = kv_block_indices.to(torch.int32).contiguous()
     lut_start = lut_start.to(torch.int32).contiguous()
     lut_count = lut_count.to(torch.int32).contiguous()
+    if lut_freeze is not None:
+        lut_freeze = lut_freeze.to(torch.int32).contiguous()
 
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 
@@ -444,6 +450,97 @@ def make_asm_sparse_mxfp4_runner(
             kv_block_indices,
             lut_start,
             lut_count,
+            softmax_scale=softmax_scale,
+            # VSA freeze LUT (None => plain sparse). Built from --vsa-freeze-frac.
+            lut_freeze=lut_freeze,
+            # dispatch=None reads env AITER_MXFP4_SPARSE_DISPATCH (default/sorted).
+            dispatch=None,
+        )
+
+    return _run
+
+
+def make_asm_mxfp4_runner(
+    args: argparse.Namespace,
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+) -> Any:
+    """Runner factory for the hand-written DENSE (non-sparse) ASM mxfp4 kernel.
+
+    Dense sibling of ``make_asm_sparse_mxfp4_runner``: identical mxfp4 quant
+    (``sage_quant_mxfp4``) but NO LUT -- it dispatches through
+    ``flash_attn_mxfp4_pertensor_func`` ->
+    ``aiter.ops.mha.fmha_v3_fwd_mxfp4`` ->
+    ``aiter::torch_itfs::fmha_v3_fwd_mxfp4`` -> ``aiter::fmha_fwd_v3_mxfp4`` ->
+    .co launch (fwd_hd128_mxfp4.co, kernel symbol
+    _ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E). Attends every KV tile.
+    """
+    if args.causal:
+        raise NotImplementedError("aiter_asm_mxfp4 does not support causal masking yet.")
+    if args.layout != "bshd":
+        raise ValueError("aiter_asm_mxfp4 expects --layout=bshd inputs.")
+    if (
+        q_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+        or v_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+    ):
+        raise ValueError(
+            f"aiter_asm_mxfp4 is hard-coded to hd={ASM_SPARSE_HEAD_DIM} "
+            f"(got Qd={q_bshd.shape[-1]}, Vd={v_bshd.shape[-1]})."
+        )
+
+    cfg = get_sage_fwd_configs_mxfp4()
+    fp8_type = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+
+    block_r = args.block_r
+    if block_r > q_bshd.shape[-1]:
+        raise ValueError(
+            f"block_r ({block_r}) must be <= head dim ({q_bshd.shape[-1]})"
+        )
+    r = create_hadamard_matrix(block_r, device=q_bshd.device, dtype=q_bshd.dtype) / (
+        block_r**0.5
+    )
+
+    (
+        q_quant,
+        q_descale,
+        k_quant,
+        k_descale,
+        v_quant,
+        v_descale,
+        _delta_s,  # ignored: ASM kernel has no smoothing-bias slot
+    ) = sage_quant_mxfp4(
+        q_bshd,
+        k_bshd,
+        v_bshd,
+        fp8_type,
+        fp8_max,
+        BLKQ=cfg["BLOCK_M"],
+        BLKK=64,
+        layout=args.layout,
+        R=r,
+        BLOCK_R=block_r,
+        q_smoothing=False,  # ASM path doesn't apply delta_s
+    )
+
+    q_quant = q_quant.contiguous()
+    k_quant = k_quant.contiguous()
+    v_quant = v_quant.contiguous()
+    q_descale = q_descale.contiguous()
+    k_descale = k_descale.contiguous()
+    v_descale = v_descale.to(torch.float32).contiguous()
+
+    softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
+
+    def _run() -> torch.Tensor:
+        return flash_attn_mxfp4_pertensor_func(
+            q_quant,
+            k_quant,
+            v_quant,
+            q_descale,
+            k_descale,
+            v_descale,
             softmax_scale=softmax_scale,
         )
 
@@ -676,7 +773,7 @@ def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
         cfg = get_sage_fwd_configs_mxfp4()
     elif kernel == "aiter_asm_sparse_fp8_q128kv64":
         return ASM_SPARSE_BLOCK_M, ASM_SPARSE_Q128KV64_BLOCK_N
-    elif kernel in ASM_SPARSE_KERNELS:
+    elif kernel == "aiter_asm_mxfp4" or kernel in ASM_SPARSE_KERNELS:
         return ASM_SPARSE_BLOCK_M, ASM_SPARSE_BLOCK_N
     else:
         cfg = get_sage_fwd_configs()
@@ -801,14 +898,14 @@ def maybe_build_vsa_lut(
 ) -> Tuple[
     Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], Optional[torch.Tensor]
 ]:
-    """When VSA is enabled (fp8 ASM sparse + --vsa-freeze-frac), build a
+    """When VSA is enabled (fp8 or mxfp4 ASM sparse + --vsa-freeze-frac), build a
     per-work-item freeze array from a constant fraction of each work item's
     block count, holding the (ascending) LUT fixed so only the freeze depth
     varies. This isolates the kernel's freeze effect for microbenchmarking.
     Otherwise pass the LUT through unchanged with lut_freeze=None."""
     if (
         block_lut is not None
-        and args.kernel == "aiter_asm_sparse_fp8"
+        and args.kernel in ("aiter_asm_sparse_fp8", "aiter_asm_sparse_mxfp4")
         and getattr(args, "vsa_freeze_frac", None) is not None
     ):
         lut_freeze = build_freeze_array(block_lut[2], args.vsa_freeze_frac)
@@ -1220,8 +1317,11 @@ def make_kernel_runner(
 
     if args.kernel == "aiter_asm_sparse_mxfp4":
         return make_asm_sparse_mxfp4_runner(
-            args, q_bshd, k_bshd, v_bshd, block_lut
+            args, q_bshd, k_bshd, v_bshd, block_lut, lut_freeze
         )
+
+    if args.kernel == "aiter_asm_mxfp4":
+        return make_asm_mxfp4_runner(args, q_bshd, k_bshd, v_bshd)
 
     if args.kernel == "aiter_asm_sparse_fp8":
         return make_asm_sparse_fp8_runner(
@@ -1405,6 +1505,7 @@ def benchmark_single_case(
         "sage_mxfp4",
         "aiter_asm_sparse",
         "aiter_asm_sparse_mxfp4",
+        "aiter_asm_mxfp4",
         "aiter_asm_sparse_fp8",
         "aiter_asm_sparse_fp8_q128kv64",
     ):
@@ -1428,6 +1529,7 @@ def benchmark_single_case(
             "aiter_i8fp8",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
+            "aiter_asm_mxfp4",
             "aiter_asm_sparse_fp8",
             "aiter_asm_sparse_fp8_q128kv64",
         )
@@ -2005,6 +2107,7 @@ def parse_args() -> argparse.Namespace:
             "aiter_bf16",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
+            "aiter_asm_mxfp4",
             "aiter_asm_sparse_fp8",
             "aiter_asm_sparse_fp8_q128kv64",
             "all",

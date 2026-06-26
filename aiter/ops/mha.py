@@ -327,6 +327,7 @@ def _gen_fmha_v3_fwd_mxfp4_sparse_fake_tensors(
     lut_start: Tensor,
     lut_count: Tensor,
     softmax_scale: float,
+    lut_freeze: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]:
     if out is not None:
@@ -353,6 +354,87 @@ def fmha_v3_fwd_mxfp4_sparse(
     kv_block_indices: Tensor,     # int32
     lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
     lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
+    softmax_scale: float,
+    lut_freeze: Optional[Tensor] = None,  # VSA: int32 [b*hq*num_q_blocks]
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
+def _gen_fmha_v3_fwd_mxfp4_sparse_sorted_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    work_table: Tensor,
+    softmax_scale: float,
+    lut_freeze: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]:
+    if out is not None:
+        return (out,)
+    b, sq, hq, _ = q.shape
+    head_dim_v = v.shape[-1]
+    return (q.new_empty((b, sq, hq, head_dim_v), dtype=dtypes.bf16),)
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_mxfp4_sparse_sorted",
+    gen_fake=_gen_fmha_v3_fwd_mxfp4_sparse_sorted_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_mxfp4_sparse_sorted(
+    q: Tensor,                    # [b, sq, hq, hd/2 = 64], int8/uint8 (fp4-packed)
+    k: Tensor,                    # [b, sk, hk, 64], int8/uint8
+    v: Tensor,                    # [b, sk, hk, 128], fp8
+    q_descale: Tensor,            # E8M0 per-block bytes
+    k_descale: Tensor,            # E8M0 per-block bytes
+    v_descale: Tensor,            # fp32 per output channel
+    kv_block_indices: Tensor,     # int32
+    lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
+    lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
+    work_table: Tensor,           # int32 [b*hq*num_q_blocks] (packed q|h<<16|b<<24)
+    softmax_scale: float,
+    lut_freeze: Optional[Tensor] = None,  # VSA: int32 [b*hq*num_q_blocks]
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
+def _gen_fmha_v3_fwd_mxfp4_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]:
+    if out is not None:
+        return (out,)
+    b, sq, hq, _ = q.shape
+    head_dim_v = v.shape[-1]
+    return (q.new_empty((b, sq, hq, head_dim_v), dtype=dtypes.bf16),)
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_mxfp4",
+    gen_fake=_gen_fmha_v3_fwd_mxfp4_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_mxfp4(
+    q: Tensor,                    # [b, sq, hq, hd/2 = 64], int8/uint8 (fp4-packed)
+    k: Tensor,                    # [b, sk, hk, 64], int8/uint8
+    v: Tensor,                    # [b, sk, hk, 128], fp8
+    q_descale: Tensor,            # E8M0 per-block bytes, [b, sq, hq, hd/32 = 4]
+    k_descale: Tensor,            # E8M0 per-block bytes
+    v_descale: Tensor,            # fp32 per output channel, [b*hk, 128]
     softmax_scale: float,
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]: ...
@@ -3583,6 +3665,54 @@ def flash_attn_fp8_sparse_pertensor_func(
     return out
 
 
+def flash_attn_mxfp4_pertensor_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+):
+    """Dense (non-sparse) mxfp4 FMHA forward (hd=128, gfx950).
+
+    Dense sibling of ``flash_attn_mxfp4_sparse_pertensor_func``: attends every
+    KV tile (no LUT / no block sparsity) via the hand-written mxfp4-Q,K * fp8-V
+    kernel ``fwd_hd128_mxfp4.co``.
+
+    Args:
+        q: int8/uint8 tensor [b, sq, hq, hd/2 = 64], fp4-packed (bshd).
+        k: int8/uint8 tensor [b, sk, hk, 64], fp4-packed (bshd).
+        v: fp8 tensor       [b, sk, hk, 128] (bshd).
+        q_descale, k_descale: int8/uint8 E8M0 per-block scales.
+        v_descale: fp32 per output channel.
+        softmax_scale: if None, defaults to hd_logical**-0.5 where
+            hd_logical = q.shape[-1] * 2 (fp4-packed).
+
+    Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
+    fmha_v3_fwd_mxfp4): sq % 256 == 0, sk % 128 == 0, hq % hk == 0,
+    (hq/hk) is a power of 2, head_dim (logical) == 128, batch mode,
+    non-causal, gfx950.
+
+    Returns:
+        out: bf16 tensor [b, sq, hq, 128], bshd.
+    """
+    if softmax_scale is None:
+        head_dim_logical = q.shape[-1] * 2
+        softmax_scale = head_dim_logical ** (-0.5)
+    outs = fmha_v3_fwd_mxfp4(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        float(softmax_scale),
+        None,
+    )
+    return outs[0]
+
+
 def flash_attn_mxfp4_sparse_pertensor_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3594,6 +3724,8 @@ def flash_attn_mxfp4_sparse_pertensor_func(
     lut_start: torch.Tensor,
     lut_count: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    lut_freeze: Optional[torch.Tensor] = None,
+    dispatch: Optional[str] = None,
 ):
     """Block-sparse mxfp4 FMHA forward (hd=128, gfx950).
 
@@ -3612,6 +3744,18 @@ def flash_attn_mxfp4_sparse_pertensor_func(
             (return_none_if_dense=False; this kernel has no dense path).
         softmax_scale: if None, defaults to hd_logical**-0.5 where
             hd_logical = q.shape[-1] * 2 (fp4-packed).
+        lut_freeze: optional VSA freeze LUT, int32 [b*hq*num_q_blocks] with the
+            same layout as lut_count. Entry k = number of leading (highest
+            pooled-QK priority) blocks to process with a live max before freezing
+            m for the rest. None => freezing disabled (plain sparse, bit-for-bit).
+            Requires kv_block_indices ordered by descending priority.
+        dispatch: tile-dispatch strategy to balance the heavy-tile E2E tail:
+            "default" (one WG per tile, hardware-scheduled) or "sorted" (one WG
+            per tile launched in LPT order via an internally built work table --
+            recommended; keeps the work-conserving hardware scheduler and only
+            fixes dispatch order). None (default) reads env AITER_MXFP4_SPARSE_DISPATCH
+            (default/sorted), else "default". Unlike fp8 there is no "persistent"
+            mode for mxfp4 (SGPR budget).
 
     Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
     fmha_v3_fwd_mxfp4_sparse):
@@ -3624,19 +3768,51 @@ def flash_attn_mxfp4_sparse_pertensor_func(
     if softmax_scale is None:
         head_dim_logical = q.shape[-1] * 2
         softmax_scale = head_dim_logical ** (-0.5)
-    outs = fmha_v3_fwd_mxfp4_sparse(
-        q,
-        k,
-        v,
-        q_descale,
-        k_descale,
-        v_descale,
-        kv_block_indices,
-        lut_start,
-        lut_count,
-        float(softmax_scale),
-        None,
-    )
+    if dispatch is None:
+        dispatch = os.environ.get("AITER_MXFP4_SPARSE_DISPATCH", "").lower()
+    if not dispatch:
+        dispatch = "default"
+    if dispatch not in ("default", "sorted"):
+        raise ValueError(
+            f"flash_attn_mxfp4_sparse_pertensor_func: unknown dispatch={dispatch!r} "
+            "(expected 'default' or 'sorted'; mxfp4 has no 'persistent' mode)"
+        )
+    if dispatch == "sorted":
+        batch, seqlen_q, num_heads = q.shape[0], q.shape[1], q.shape[2]
+        num_q_blocks = (seqlen_q + 255) // 256  # kTileQ = 256
+        work_table = build_sparse_persistent_work_table(
+            lut_count, batch, num_heads, num_q_blocks
+        )
+        outs = fmha_v3_fwd_mxfp4_sparse_sorted(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            kv_block_indices,
+            lut_start,
+            lut_count,
+            work_table,
+            float(softmax_scale),
+            lut_freeze,
+            None,
+        )
+    else:
+        outs = fmha_v3_fwd_mxfp4_sparse(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            kv_block_indices,
+            lut_start,
+            lut_count,
+            float(softmax_scale),
+            lut_freeze,
+            None,
+        )
     return outs[0]
 
 

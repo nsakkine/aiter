@@ -93,7 +93,45 @@ fmha_v3_fwd_mxfp4_sparse(at::Tensor& q,                  // [b, sq, hq, d/2], in
                         const at::Tensor& lut_start,        // int32 [b*hq*num_q_blocks]
                         const at::Tensor& lut_count,        // int32 [b*hq*num_q_blocks]
                         float softmax_scale,
+                        // VSA freeze LUT: int32 [b*hq*num_q_blocks] or nullopt
+                        // (nullopt => freezing disabled, plain block-sparse).
+                        std::optional<at::Tensor> lut_freeze = std::nullopt,
                         std::optional<at::Tensor> out_ = std::nullopt); // [b, sq, hq, d_v], bf16
+
+// Sorted-dispatch mxfp4 sibling. Same contract as fmha_v3_fwd_mxfp4_sparse plus a `work_table`
+// int32[b*hq*num_q_blocks] (entry k = packed q | (h<<16) | (b<<24), LPT-sorted heaviest-first).
+// Launches gridDim=(total_tiles,1,1); each WG decodes work_table[wg_id]. Routes to the separate
+// fwd_hd128_mxfp4_sparse_sorted.co (built with _SORTED_DISPATCH=True). No persistent sub-mode.
+std::vector<at::Tensor>
+fmha_v3_fwd_mxfp4_sparse_sorted(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
+                                const at::Tensor& k,            // [b, sk, hk, d/2], int8/uint8
+                                const at::Tensor& v,            // [b, sk, hk, d_v], fp8
+                                const at::Tensor& q_descale,    // E8M0 bytes
+                                const at::Tensor& k_descale,    // E8M0 bytes
+                                const at::Tensor& v_descale,    // fp32 per output channel
+                                const at::Tensor& kv_block_indices, // int32
+                                const at::Tensor& lut_start,        // int32 [b*hq*nqb]
+                                const at::Tensor& lut_count,        // int32 [b*hq*nqb]
+                                const at::Tensor& work_table,       // int32 [b*hq*nqb]
+                                float softmax_scale,
+                                std::optional<at::Tensor> lut_freeze = std::nullopt,
+                                std::optional<at::Tensor> out_ = std::nullopt); // bf16
+
+// DENSE mxfp4 sibling (no block sparsity / no LUT): attends every KV tile. Same
+// fp4-packed Q/K + E8M0 per-block scales + fp8 V + bf16 out contract as
+// fmha_v3_fwd_mxfp4_sparse, minus the LUT triple.
+//
+// Kernel: _ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E from
+// aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_mxfp4.co.
+std::vector<at::Tensor>
+fmha_v3_fwd_mxfp4(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
+                  const at::Tensor& k,            // [b, sk, hk, d/2], int8/uint8
+                  const at::Tensor& v,            // [b, sk, hk, d_v], fp8
+                  const at::Tensor& q_descale,    // E8M0 bytes, [b, sq, hq, d/32]
+                  const at::Tensor& k_descale,    // E8M0 bytes, [b, sk, hk, d/32]
+                  const at::Tensor& v_descale,    // fp32 per output channel, [b*hk, d_v]
+                  float softmax_scale,
+                  std::optional<at::Tensor> out_ = std::nullopt); // [b, sq, hq, d_v], bf16
 
 } // namespace torch_itfs
 } // namespace aiter

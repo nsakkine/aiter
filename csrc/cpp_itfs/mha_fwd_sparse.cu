@@ -32,6 +32,23 @@ static constexpr const char* kSparseMxfp4KernelName =
     "_ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E";
 static constexpr const char* kSparseMxfp4CoName =
     "fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co";
+// Sorted-dispatch mxfp4 sparse sibling: one WG per tile, flat grid indexed through the LPT work
+// table. SAME kernel symbol as the default mxfp4 .co, but a separate .co built from
+// mi350_fmha_hd128_mxfp4_sparse.py with _SORTED_DISPATCH=True (752-byte kernarg + work-table decode).
+// Persistent (grid-stride) dispatch is NOT supported for mxfp4 (SGPR budget; see the .py docstring),
+// so only the sorted sub-mode exists.
+static constexpr const char* kSparseMxfp4SortedCoName =
+    "fmha_v3_fwd/fwd_hd128_mxfp4_sparse_sorted.co";
+// DENSE mxfp4 sibling (no LUT / no block sparsity): processes every KV tile.
+// Built from dmip_asm/fmha_sage_fwd/gfx950/mi350_fmha_hd128_mxfp4.py. It reuses
+// the 656-byte fmha_fwd_v3_args layout (init_sparse_v3_args' dense prefix), so
+// the same arg-builder feeds it; only the symbol + .co name + 656-byte kernarg
+// differ from the sparse path. Same mxfp4 numeric contract (fp4-packed Q/K with
+// E8M0 per-block scales applied via MFMA, fp8 V, bf16 out).
+static constexpr const char* kMxfp4DenseKernelName =
+    "_ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E";
+static constexpr const char* kMxfp4DenseCoName =
+    "fmha_v3_fwd/fwd_hd128_mxfp4.co";
 // fp8-quantized sibling (E4M3 Q/K/V). Same 720-byte kernarg layout and
 // same in_bpe=1 byte stride as the i8fp8 path, so init_sparse_v3_args is
 // reused unchanged; only the kernel symbol + .co name differ.
@@ -233,6 +250,125 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
     const int gdx = num_q_blocks;
     const int gdy = a.nhead_q;
     const int gdz = a.batch;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// DENSE mxfp4 dispatcher (no block sparsity). Reuses init_sparse_v3_args to fill
+// the shared 656-byte fmha_fwd_v3_args prefix (the trailing LUT pointers it also
+// writes are simply not sent: arg_size is clamped to the dense kernarg size, and
+// the dense .co only declares a 656-byte kernarg). Grid + bdx match the sparse
+// kernel: (num_q_blocks, nhead_q, batch) with bdx=512. Routes to fwd_hd128_mxfp4.co.
+float fmha_fwd_v3_mxfp4(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
+{
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_mxfp4: only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_mxfp4: unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kMxfp4DenseKernelName,
+        [&]() { return AiterAsmKernel(kMxfp4DenseKernelName, kMxfp4DenseCoName); });
+
+    fmha_fwd_v3_sparse_args args{};
+    init_sparse_v3_args(args, a);
+    // The dense .co declares a 656-byte kernarg (no LUT tail). Send exactly that
+    // many bytes; the (null) LUT pointers init_sparse_v3_args appended are dropped.
+    size_t arg_size = sizeof(fmha_fwd_v3_args);
+
+    const int num_q_blocks = (a.seqlen_q + kSparseTileQ - 1) / kSparseTileQ;
+    const int gdx = num_q_blocks;
+    const int gdy = a.nhead_q;
+    const int gdz = a.batch;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Sorted-dispatch mxfp4 sparse dispatcher. One workgroup per tile on a flat 1-D grid
+// (gridDim=(total_tiles,1,1)); each WG reads work_table[wg_id] (host-built, LPT-sorted heaviest-first)
+// and decodes its (q,h,b) tile. The hardware scheduler stays work-conserving; the table only fixes
+// dispatch ORDER so the few heavy tiles spread across CUs and the E2E tail collapses. Requires
+// a.work_table_ptr + a.total_tiles. Unlike fp8 there is NO persistent (grid-stride) sub-mode -- mxfp4
+// has no free SGPRs for the persistent tile cursor (see mi350_fmha_hd128_mxfp4_sparse.py). Routes to
+// fwd_hd128_mxfp4_sparse_sorted.co (752-byte kernarg).
+float fmha_fwd_v3_mxfp4_sparse_sorted(mha_fwd_sparse_args a,
+                                      const ck_tile::stream_config& s)
+{
+    const char* tag = "fmha_fwd_v3_mxfp4_sparse_sorted";
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING(tag << ": only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING(tag << ": unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+    if(a.work_table_ptr == nullptr || a.total_tiles == 0)
+    {
+        AITER_LOG_WARNING(tag << ": work_table_ptr/total_tiles must be set");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kSparseMxfp4SortedCoName,
+        [&]() { return AiterAsmKernel(kSparseMxfp4KernelName, kSparseMxfp4SortedCoName); });
+
+    fmha_fwd_v3_sparse_persistent_args args{};
+    size_t arg_size = sizeof(args);
+    init_sparse_v3_args(args, a); // fills the shared 720-byte base (incl. lut_freeze)
+    args.ptr_work_table = a.work_table_ptr;
+    args.s_total_tiles  = a.total_tiles;
+    args.s_num_wgs      = a.total_tiles; // unused by the sorted .co, kept for parity
+
+    const int gdx = static_cast<int>(a.total_tiles);
+    const int gdy = 1;
+    const int gdz = 1;
     const int bdx = kSparseBdx;
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
