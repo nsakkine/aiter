@@ -73,7 +73,8 @@ fmha_v3_fwd_fp8_sparse_persistent(at::Tensor& q,                  // [b, sq, hq,
                                   float softmax_scale,
                                   bool sorted = false,                // true: sorted 1-WG/tile; false: persistent
                                   std::optional<at::Tensor> lut_freeze = std::nullopt,
-                                  std::optional<at::Tensor> out_ = std::nullopt); // bf16
+                                  std::optional<at::Tensor> out_ = std::nullopt, // bf16
+                                  bool affine = false);               // true: route to affine .co (sorted->affine_sorted, else affine non-sorted)
 
 // Block-sparse mxfp4 sibling. Q/K are fp4-packed bytes (logical hd=128
 // stored as byte[hd/2]); V is fp8; Q/K scales are E8M0 per-block

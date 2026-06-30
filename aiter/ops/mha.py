@@ -503,6 +503,7 @@ def _gen_fmha_v3_fwd_fp8_sparse_persistent_fake_tensors(
     sorted: bool = False,
     lut_freeze: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
+    affine: bool = False,
 ) -> Tuple[Tensor]:
     if out is not None:
         return (out,)
@@ -532,6 +533,7 @@ def fmha_v3_fwd_fp8_sparse_persistent(
     sorted: bool = False,         # True: sorted 1-WG/tile dispatch; False: persistent grid-stride
     lut_freeze: Optional[Tensor] = None,  # VSA: int32 [b*hq*num_q_blocks]
     out: Optional[Tensor] = None,
+    affine: bool = False,         # True (requires sorted): route to the affine-codegen sorted .co
 ) -> Tuple[Tensor]: ...
 
 
@@ -3573,10 +3575,15 @@ def flash_attn_fp8_sparse_pertensor_func(
             "default" (one WG per tile, hardware-scheduled),
             "sorted"  (one WG per tile but launched in LPT order via an internally
                        built work table -- recommended; keeps the work-conserving
-                       hardware scheduler and only fixes dispatch order), or
+                       hardware scheduler and only fixes dispatch order),
+            "affine" (affine-codegen .co fwd_hd128_fp8_sparse_affine.co with the
+                       standard one-WG-per-tile grid + XCD swizzle; A/B baseline
+                       for affine_sorted),
+            "affine_sorted" (same sorted dispatch, but routed to the faster
+                       affine-codegen .co fwd_hd128_fp8_sparse_affine_sorted.co), or
             "persistent" (grid-stride persistent kernel; usually slower, kept for
                        A/B). None (default) reads env AITER_FP8_SPARSE_DISPATCH
-                       (default/sorted/persistent); falls back to `persistent`.
+                       (default/sorted/persistent/affine/affine_sorted); falls back to `persistent`.
         persistent: deprecated bool alias (True => dispatch="persistent"). None
             (default) reads env AITER_FP8_SPARSE_PERSISTENT. `dispatch` wins if set.
             The work table is built internally from lut_count (LPT-sorted), so
@@ -3605,10 +3612,10 @@ def flash_attn_fp8_sparse_pertensor_func(
                 "AITER_FP8_SPARSE_PERSISTENT", "0"
             ).lower() in ("1", "true", "on", "yes")
         dispatch = "persistent" if persistent else "default"
-    if dispatch not in ("default", "sorted", "persistent"):
+    if dispatch not in ("default", "sorted", "persistent", "affine", "affine_sorted"):
         raise ValueError(
             f"flash_attn_fp8_sparse_pertensor_func: unknown dispatch={dispatch!r} "
-            "(expected 'default', 'sorted', or 'persistent')"
+            "(expected 'default', 'sorted', 'persistent', 'affine', or 'affine_sorted')"
         )
     if q128kv64 and dispatch != "default":
         raise ValueError(
@@ -3622,9 +3629,11 @@ def flash_attn_fp8_sparse_pertensor_func(
         k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
     if head_size_v_og % 8 != 0:
         v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
-    if dispatch in ("sorted", "persistent"):
+    if dispatch in ("sorted", "persistent", "affine", "affine_sorted"):
         batch, seqlen_q, num_heads = q.shape[0], q.shape[1], q.shape[2]
         num_q_blocks = (seqlen_q + 255) // 256  # kTileQ = 256
+        # The non-sorted affine .co ignores the work table, but the persistent
+        # wrapper requires it; build it once (cheap) so the call stays uniform.
         work_table = build_sparse_persistent_work_table(
             lut_count, batch, num_heads, num_q_blocks
         )
@@ -3640,9 +3649,10 @@ def flash_attn_fp8_sparse_pertensor_func(
             lut_count,
             work_table,
             float(softmax_scale),
-            dispatch == "sorted",
+            dispatch in ("sorted", "affine_sorted"),  # sorted (1-WG/tile)
             lut_freeze,
             None,
+            dispatch in ("affine", "affine_sorted"),  # affine: route to affine-codegen .co
         )
     else:
         outs = fmha_v3_fwd_fp8_sparse(
@@ -3726,6 +3736,7 @@ def flash_attn_mxfp4_sparse_pertensor_func(
     softmax_scale: Optional[float] = None,
     lut_freeze: Optional[torch.Tensor] = None,
     dispatch: Optional[str] = None,
+    work_table: Optional[torch.Tensor] = None,
 ):
     """Block-sparse mxfp4 FMHA forward (hd=128, gfx950).
 
@@ -3756,6 +3767,11 @@ def flash_attn_mxfp4_sparse_pertensor_func(
             fixes dispatch order). None (default) reads env AITER_MXFP4_SPARSE_DISPATCH
             (default/sorted), else "default". Unlike fp8 there is no "persistent"
             mode for mxfp4 (SGPR budget).
+        work_table: optional prebuilt LPT work table (int32 [b*hq*num_q_blocks],
+            packed q | (h<<16) | (b<<24), heaviest tile first) for dispatch="sorted".
+            It depends only on the mask (lut_count), so a caller with a static mask can
+            build it once via build_sparse_persistent_work_table and reuse it, avoiding the
+            per-call host argsort. None => built internally each call. Ignored unless sorted.
 
     Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
     fmha_v3_fwd_mxfp4_sparse):
@@ -3778,11 +3794,16 @@ def flash_attn_mxfp4_sparse_pertensor_func(
             "(expected 'default' or 'sorted'; mxfp4 has no 'persistent' mode)"
         )
     if dispatch == "sorted":
-        batch, seqlen_q, num_heads = q.shape[0], q.shape[1], q.shape[2]
-        num_q_blocks = (seqlen_q + 255) // 256  # kTileQ = 256
-        work_table = build_sparse_persistent_work_table(
-            lut_count, batch, num_heads, num_q_blocks
-        )
+        if work_table is None:
+            # Build the LPT work table from lut_count. This is a pure function of the sparsity
+            # pattern (the mask), so for a fixed mask it can be built ONCE by the caller and passed
+            # back in via `work_table=` to keep the per-call host argsort out of the hot path
+            # (e.g. benchmarks measuring kernel-only time, or inference reusing a static mask).
+            batch, seqlen_q, num_heads = q.shape[0], q.shape[1], q.shape[2]
+            num_q_blocks = (seqlen_q + 255) // 256  # kTileQ = 256
+            work_table = build_sparse_persistent_work_table(
+                lut_count, batch, num_heads, num_q_blocks
+            )
         outs = fmha_v3_fwd_mxfp4_sparse_sorted(
             q,
             k,

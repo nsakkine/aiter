@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import hashlib
 import json
 import logging
 import os
+import random
 import re
 import sys
 import tempfile
@@ -439,6 +441,22 @@ def make_asm_sparse_mxfp4_runner(
 
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 
+    # Sorted dispatch needs an LPT work table. It is a pure function of the mask (lut_count), so
+    # build it ONCE here -- OUTSIDE the timed _run closure -- and reuse it. This keeps the host-side
+    # argsort out of the measured region so the benchmark reports sorted KERNEL throughput (matching
+    # production, where a static mask's work table is precomputed once and reused). For default
+    # dispatch the work table is unused (left None).
+    dispatch_mode = os.environ.get("AITER_MXFP4_SPARSE_DISPATCH", "").lower() or "default"
+    work_table = None
+    if dispatch_mode == "sorted":
+        from aiter.ops.mha import build_sparse_persistent_work_table
+
+        batch, seqlen_q, num_heads = q_bshd.shape[0], q_bshd.shape[1], q_bshd.shape[2]
+        num_q_blocks = (seqlen_q + 255) // 256  # kTileQ = 256
+        work_table = build_sparse_persistent_work_table(
+            lut_count, batch, num_heads, num_q_blocks
+        )
+
     def _run() -> torch.Tensor:
         return flash_attn_mxfp4_sparse_pertensor_func(
             q_quant,
@@ -455,6 +473,8 @@ def make_asm_sparse_mxfp4_runner(
             lut_freeze=lut_freeze,
             # dispatch=None reads env AITER_MXFP4_SPARSE_DISPATCH (default/sorted).
             dispatch=None,
+            # Prebuilt LPT work table (sorted only); keeps the host argsort out of the timed region.
+            work_table=work_table,
         )
 
     return _run
@@ -797,6 +817,22 @@ def maybe_expand_mask(
     if out.dim() == 3:
         out = out.unsqueeze(1).expand(batch, hq, mask.num_q_blocks, mask.num_kv_blocks)
     return out.clone()
+
+
+def seed_for_case(base_seed: int, key: Tuple[Any, ...]) -> None:
+    """Reseed the RNG deterministically for a single benchmark case.
+
+    perf_report invokes the benchmark fn once per metric column (provider).
+    Reseeding with a key derived from the case dims (identical across providers
+    of the same case) makes every column share the exact same inputs *and*
+    block mask, so e.g. active_tiles/throughput correspond to one realization
+    instead of drifting as the global RNG advances per provider.
+    """
+    digest = hashlib.sha256(repr((base_seed, key)).encode()).hexdigest()
+    case_seed = int(digest[:8], 16)
+    random.seed(case_seed)
+    torch.manual_seed(case_seed)
+    torch.cuda.manual_seed_all(case_seed)
 
 
 def build_block_mask(
@@ -1543,6 +1579,22 @@ def benchmark_single_case(
 
     if "time(ms)" in provider:
         return ms
+    if "latency(ms)" in provider:
+        return ms
+    if "active_tiles" in provider or "total_tiles" in provider:
+        # active_tiles = sum(lut_count): (q_block, kv_block) tiles actually
+        # processed. total_tiles = B*HQ*nqb*nkb: the dense total. Dense (no LUT)
+        # => every tile is active => active == total.
+        block_m, block_n = kernel_block_sizes(args.kernel)
+        num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
+        num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
+        num_dense_pairs = shape.batch * shape.hq * num_q_blocks * num_kv_blocks
+        if "total_tiles" in provider:
+            return float(num_dense_pairs)
+        if block_lut is None:
+            return float(num_dense_pairs)
+        _, _, _lut_count = block_lut
+        return float(_lut_count.sum().item())
     if "sparse_throughput(TFLOPS)" in provider:
         flops = sparse_flops if sparse_flops is not None else total_flops
         return flops / ms * 1e-9
@@ -1556,8 +1608,14 @@ def benchmark_single_case(
 
 
 def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[str]:
+    # Active/total tile columns: active_tiles = sum(lut_count) (the (q_block,
+    # kv_block) tiles actually processed), total_tiles = B*HQ*nqb*nkb (the dense
+    # total). Reported as two columns so the masked-out count is total - active.
+    TILE_COLS = ["active_tiles", "total_tiles"]
+
     metric_map = {
         "time": "time(ms)",
+        "latency": "latency(ms)",
         "throughput": "throughput(TFLOPS)",
         "bandwidth": "bandwidth(GB/s)",
         "arithint": "arithmetic_intensity(FLOP/byte)",
@@ -1568,16 +1626,21 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[
         return ["time(ms)"]
 
     if args.metric == "all":
-        # By default (when --metric not specified), show only throughput (matching bench_fav3_sage.py)
-        result = [metric_map["throughput"]]
+        # Default view: latency + throughput, plus the sparse-only columns
+        # (sparse throughput + active/total tile counts) when a mask is in play.
+        result = [metric_map["latency"], metric_map["throughput"]]
         if include_sparse_metric:
             result.append(metric_map["sparseput"])
+            result.extend(TILE_COLS)
         return result
 
-    if args.metric == "sparseput" and not include_sparse_metric:
+    if args.metric in ("sparseput", "masked") and not include_sparse_metric:
         raise ValueError(
-            "sparse_throughput requires --block-sparsity or --block-mask-file"
+            f"metric '{args.metric}' requires --block-sparsity or --block-mask-file"
         )
+
+    if args.metric == "masked":
+        return list(TILE_COLS)
 
     if args.metric not in metric_map:
         raise ValueError(f"Unknown metric: {args.metric}")
@@ -1797,6 +1860,23 @@ def run_benchmark_generated(
         provider,
         device="cuda",
     ):
+        if args.seed is not None:
+            seed_for_case(
+                args.seed,
+                (
+                    BATCH,
+                    HQ,
+                    HK,
+                    N_CTX_Q,
+                    N_CTX_K,
+                    D_HEAD,
+                    D_HEAD_V,
+                    str(dtype),
+                    str(layout),
+                    bool(causal),
+                ),
+            )
+
         q, k, v = generate_test_tensors(
             BATCH,
             HQ,
@@ -1841,6 +1921,9 @@ def run_benchmark_captured(
         k = inp["k"].to(device)
         v = inp["v"].to(device)
 
+        if args.seed is not None:
+            seed_for_case(args.seed, (INPUT_IDX,))
+
         return benchmark_single_case(
             args,
             q,
@@ -1876,6 +1959,12 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -
 
         n_ctx_q = loaded.num_q_blocks * block_m
         n_ctx_k = loaded.num_kv_blocks * block_n
+
+        if args.seed is not None:
+            seed_for_case(
+                args.seed,
+                (MASK_IDX, HQ, HK, n_ctx_q, n_ctx_k, D_HEAD, D_HEAD_V, str(dtype)),
+            )
 
         q, k, v = generate_test_tensors(
             loaded.batch,
@@ -2167,12 +2256,23 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "all",
             "time",
+            "latency",
             "throughput",
             "bandwidth",
             "arithint",
             "sparseput",
+            "masked",
         ],
-        help="Metric(s) to report (default: time+throughput only; 'all' does not include bandwidth/arithint)",
+        help="Metric(s) to report. 'all' (default) = latency(ms)+throughput(TFLOPS), "
+        "plus sparse_throughput + active_tiles/total_tiles when a block mask is set. "
+        "'latency' = kernel time in ms; 'masked' = active_tiles + total_tiles "
+        "(processed tiles vs dense total; masked-out = total - active).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Fix the RNG seed for reproducible inputs/masks (default: unseeded)",
     )
 
     parser.add_argument("-o", action="store_true", help="Write Triton output CSV")
@@ -2480,6 +2580,11 @@ def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
 def main() -> int:
     args = parse_args()
     validate_args(args)
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     loaded_masks = load_block_mask_from_json(args.block_mask_file, torch.device("cuda"))
     loaded_single_mask: Optional[LoadedMask] = None

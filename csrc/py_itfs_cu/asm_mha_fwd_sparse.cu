@@ -453,8 +453,13 @@ fmha_v3_fwd_fp8_sparse_persistent(at::Tensor& q,
                                   float softmax_scale,
                                   bool sorted,
                                   std::optional<at::Tensor> lut_freeze,
-                                  std::optional<at::Tensor> out_)
+                                  std::optional<at::Tensor> out_,
+                                  bool affine)
 {
+    // affine has both builds now: sorted=true -> fwd_hd128_fp8_sparse_affine_sorted.co
+    // (LPT work table), sorted=false -> fwd_hd128_fp8_sparse_affine.co (standard grid +
+    // XCD swizzle). The non-sorted affine .co ignores work_table, but it is still passed
+    // (and validated) here so this wrapper's contract stays uniform across modes.
     // ---- dtype + device checks (mirror fmha_v3_fwd_fp8_sparse) -------------
     TORCH_CHECK((q.dtype() == at::ScalarType::Float8_e4m3fnuz ||
                      q.dtype() == at::ScalarType::Float8_e4m3fn) &&
@@ -645,7 +650,12 @@ fmha_v3_fwd_fp8_sparse_persistent(at::Tensor& q,
     a.num_wgs        = 0; // 0 => dispatcher auto-sizes to the CU count
 
     ck_tile::stream_config stream_config{stream};
-    float t = aiter::fmha_fwd_v3_fp8_sparse_persistent(a, stream_config, sorted);
+    float t;
+    if(affine)
+        t = sorted ? aiter::fmha_fwd_v3_fp8_sparse_affine_sorted(a, stream_config)
+                   : aiter::fmha_fwd_v3_fp8_sparse_affine(a, stream_config);
+    else
+        t = aiter::fmha_fwd_v3_fp8_sparse_persistent(a, stream_config, sorted);
     TORCH_CHECK(t >= 0, "fmha_v3_fwd_fp8_sparse_persistent: dispatcher returned an "
                         "error code (unsupported config or .co not found).");
     return {out};

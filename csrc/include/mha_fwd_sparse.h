@@ -129,4 +129,22 @@ float fmha_fwd_v3_fp8_sparse_persistent(mha_fwd_sparse_args a,
                                         const ck_tile::stream_config& s,
                                         bool sorted_dispatch = false);
 
+// Sorted-dispatch fp8 sparse variant built from the affine codegen
+// (mi350_fmha_hd128_fp8_affine.py). Same flat-grid sorted contract as
+// fmha_fwd_v3_fp8_sparse_persistent(sorted=true) + a.work_table_ptr/a.total_tiles,
+// but routes to fwd_hd128_fp8_sparse_affine_sorted.co, which reads its LUT pointers
+// from the dead group-mode arg slots (0x1B0/0x1C0/0x1E0) rather than the 0x290 tail.
+float fmha_fwd_v3_fp8_sparse_affine_sorted(mha_fwd_sparse_args a,
+                                           const ck_tile::stream_config& s);
+
+// Non-sorted (XCD-swizzle) fp8 sparse variant built from the affine codegen
+// (mi350_fmha_hd128_fp8_affine.py, SPARSE=True + _SORTED_DISPATCH=False). Same
+// affine pipeline + group-mode-slot LUT ABI (0x1B0/0x1C0/0x1E0) as the affine
+// sorted variant, but launches the standard (num_q_blocks, nhead_q, batch) grid
+// with the kernel's XCD swizzle (one WG per tile, hardware-ordered) -- no
+// work_table. Routes to fwd_hd128_fp8_sparse_affine.co. A/B baseline for
+// fmha_fwd_v3_fp8_sparse_affine_sorted.
+float fmha_fwd_v3_fp8_sparse_affine(mha_fwd_sparse_args a,
+                                    const ck_tile::stream_config& s);
+
 } // namespace aiter

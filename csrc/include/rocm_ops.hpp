@@ -1007,7 +1007,8 @@ namespace py = pybind11;
           py::arg("softmax_scale"),                                               \
           py::arg("sorted") = false,                                              \
           py::arg("lut_freeze") = std::nullopt,                                   \
-          py::arg("out") = std::nullopt);
+          py::arg("out") = std::nullopt,                                          \
+          py::arg("affine") = false);
 
 #define MHA_FWD_PYBIND                             \
     m.def("mha_fwd",                               \

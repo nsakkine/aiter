@@ -74,6 +74,23 @@ static constexpr const char* kSparseFp8PersistentCoName =
 // the LPT work table. Separate .co built with _SORTED_DISPATCH=True.
 static constexpr const char* kSparseFp8SortedCoName =
     "fmha_v3_fwd/fwd_hd128_fp8_sparse_sorted.co";
+// Sorted-dispatch fp8 sparse sibling built from the AFFINE codegen
+// (mi350_fmha_hd128_fp8_affine.py, SPARSE=True + _SORTED_DISPATCH=True). Faster
+// affine softmax pipeline; SAME kernel symbol as the base fp8 sparse .co. ABI
+// difference vs the base sorted .co: the affine kernel keeps the 656-byte dense
+// arg layout and reads its 3 LUT pointers from the DEAD group-mode slots
+// (ptr_qseq @0x1B0 / ptr_kseq @0x1C0 / ptr_qseq_padding @0x1E0) instead of the
+// 0x290 sparse tail -- see fmha_fwd_v3_fp8_sparse_affine_sorted below.
+static constexpr const char* kSparseFp8AffineSortedCoName =
+    "fmha_v3_fwd/fwd_hd128_fp8_sparse_affine_sorted.co";
+// Non-sorted (XCD-swizzle) fp8 sparse sibling from the AFFINE codegen
+// (mi350_fmha_hd128_fp8_affine.py, SPARSE=True + _SORTED_DISPATCH=False). Same
+// affine softmax pipeline + group-mode-slot LUT ABI as the affine sorted .co,
+// but keeps the standard (num_q_blocks, nhead_q, batch) grid + XCD swizzle (one
+// WG per tile, hardware-ordered) instead of the LPT work table. 656-byte dense
+// kernarg (no work_table tail). Kept as the A/B baseline for affine_sorted.
+static constexpr const char* kSparseFp8AffineCoName =
+    "fmha_v3_fwd/fwd_hd128_fp8_sparse_affine.co";
 
 // Pack the 720-byte blob. The first 656 bytes mirror init_fmha_fwd_v3_args
 // (see mha_fwd.cu); the trailing 64 bytes hold the 4 LUT pointers (each 16
@@ -532,6 +549,157 @@ float fmha_fwd_v3_fp8_sparse_persistent(mha_fwd_sparse_args a,
         args.s_num_wgs = static_cast<uint32_t>(num_wgs);
         gdx = num_wgs;
     }
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Sorted-dispatch fp8 sparse dispatcher for the AFFINE .co. Identical contract to
+// fmha_fwd_v3_fp8_sparse_persistent(sorted=true) -- one WG per tile on a flat grid
+// gridDim=(total_tiles,1,1), each WG reads work_table[wg_id] -- but routes to the
+// affine-codegen .co, which consumes its LUT pointers from the dead group-mode arg
+// slots rather than the 0x290 sparse tail. Requires a.work_table_ptr / a.total_tiles.
+float fmha_fwd_v3_fp8_sparse_affine_sorted(mha_fwd_sparse_args a,
+                                           const ck_tile::stream_config& s)
+{
+    const char* tag = "fmha_fwd_v3_fp8_sparse_affine_sorted";
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING(tag << ": only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.data_type != "fp8bf16")
+    {
+        AITER_LOG_WARNING(tag << ": only data_type=fp8bf16 is supported (got "
+                          << a.data_type << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING(tag << ": unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+    if(a.work_table_ptr == nullptr || a.total_tiles == 0)
+    {
+        AITER_LOG_WARNING(tag << ": work_table_ptr/total_tiles must be set");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kSparseFp8AffineSortedCoName,
+        [&]() { return AiterAsmKernel(kSparseFp8KernelName, kSparseFp8AffineSortedCoName); });
+
+    fmha_fwd_v3_sparse_persistent_args args{};
+    size_t arg_size = sizeof(args);
+    init_sparse_v3_args(args, a); // dense 656-byte base (+ the 0x290 LUT tail the affine .co ignores)
+
+    // AFFINE LUT layout: the kernel reads kv_block_indices / lut_start / lut_count from the dead
+    // group-mode pointer slots, NOT the 0x290 sparse tail. Map them onto the dense fields that live
+    // at those kernarg offsets (16-byte slots, see fmha_fwd_v3_args in mha_fwd.h):
+    //   ptr_qseq         @0x1B0  -> kv_block_indices
+    //   ptr_kseq         @0x1C0  -> lut_start
+    //   ptr_qseq_padding @0x1E0  -> lut_count   (the 0x1D0 slot, s_lse_Hs, is skipped by the kernel)
+    args.ptr_qseq         = a.kv_block_indices_ptr;
+    args.ptr_kseq         = a.lut_start_ptr;
+    args.ptr_qseq_padding = a.lut_count_ptr;
+
+    args.ptr_work_table = a.work_table_ptr; // 0x2D0
+    args.s_total_tiles  = a.total_tiles;
+    args.s_num_wgs      = a.total_tiles; // unused by the sorted .co, kept for parity
+
+    const int gdx = static_cast<int>(a.total_tiles);
+    const int gdy = 1;
+    const int gdz = 1;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Non-sorted (XCD-swizzle) fp8 sparse dispatcher for the AFFINE .co. Same LUT ABI
+// as fmha_fwd_v3_fp8_sparse_affine_sorted (LUT pointers in the dead group-mode arg
+// slots, NOT the 0x290 tail), but uses the standard one-WG-per-tile launch
+// (gridDim=(num_q_blocks, nhead_q, batch)) with the kernel's XCD swizzle instead of
+// the LPT work table. No work_table/total_tiles needed; 656-byte dense kernarg.
+float fmha_fwd_v3_fp8_sparse_affine(mha_fwd_sparse_args a,
+                                    const ck_tile::stream_config& s)
+{
+    const char* tag = "fmha_fwd_v3_fp8_sparse_affine";
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING(tag << ": only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.data_type != "fp8bf16")
+    {
+        AITER_LOG_WARNING(tag << ": only data_type=fp8bf16 is supported (got "
+                          << a.data_type << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING(tag << ": unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kSparseFp8AffineCoName,
+        [&]() { return AiterAsmKernel(kSparseFp8KernelName, kSparseFp8AffineCoName); });
+
+    fmha_fwd_v3_sparse_args args{};
+    init_sparse_v3_args(args, a);
+    // Affine non-sorted .co declares a 656-byte dense kernarg (no work_table
+    // tail). Send exactly that many bytes; the 0x290 LUT tail init_sparse_v3_args
+    // appended is dropped -- the affine kernel reads its LUTs from the group-mode
+    // slots below instead.
+    size_t arg_size = sizeof(fmha_fwd_v3_args);
+
+    // AFFINE LUT layout: LUT pointers live in the dead group-mode pointer slots
+    // (ptr_qseq @0x1B0 / ptr_kseq @0x1C0 / ptr_qseq_padding @0x1E0), same as the
+    // affine sorted dispatcher.
+    args.ptr_qseq         = a.kv_block_indices_ptr;
+    args.ptr_kseq         = a.lut_start_ptr;
+    args.ptr_qseq_padding = a.lut_count_ptr;
+
+    const int num_q_blocks = (a.seqlen_q + kSparseTileQ - 1) / kSparseTileQ;
+    const int gdx = num_q_blocks;
+    const int gdy = a.nhead_q;
+    const int gdz = a.batch;
     const int bdx = kSparseBdx;
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
