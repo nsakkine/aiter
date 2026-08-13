@@ -17,6 +17,11 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_amax_partial_kernel,
     sage_quant_v_kernel,
 )
+from aiter.ops.triton.attention.utils import (
+    SOL_ATTN_TS_KV,
+    SOL_ATTN_TS_QO,
+    sol_attn_prepare,
+)
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     fp6_k_lds_order_views_from_raw,
     fp6_k_raw_buffer_sizes,
@@ -99,6 +104,18 @@ class AttentionScaleMode(IntEnum):
     F32_PER_TOKEN = 3
     F32_PER_CHANNEL = 4
     E8M0_PER_1X32 = 5
+
+
+class AttentionSparseMode(IntEnum):
+    """Sparse selection is an explicit dispatch dimension, never inferred from extra pointers.
+
+    POOLED_CORRECTION is its own mode rather than a flag on BLOCK_LUT because Sol-Attn recovers the
+    skipped blocks' contribution from pooled K/V and so carries three more operands in its ABI.
+    """
+
+    NONE = 0
+    BLOCK_LUT = 1
+    POOLED_CORRECTION = 2
 
 
 _FP8_FORMATS = (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3_FNUZ)
@@ -273,6 +290,159 @@ def _mha_v4_fwd_launch_fake(
     del q, k, v, q_descale, k_descale, v_descale, out
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
+
+
+def _fmha_v4_fwd_sparse_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    block_bitmap: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    mean_format: int,
+    mean_scale_mode: int,
+    sparse_mode: int,
+    softmax_scale: float,
+) -> None:
+    del q, k, v, q_descale, k_descale, v_descale
+    del mean_k, mean_v, kv_block_indices, lut_start, lut_count, block_bitmap
+    del q_format, k_format, v_format
+    del q_scale_mode, k_scale_mode, v_scale_mode
+    del mean_format, mean_scale_mode, sparse_mode, softmax_scale
+    del out
+
+
+@compile_ops(
+    "module_fmha_v4_fwd",
+    fc_name="fmha_v4_fwd_sparse",
+    gen_fake=_fmha_v4_fwd_sparse_fake,
+)
+def _fmha_v4_fwd_sparse(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    block_bitmap: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    mean_format: int,
+    mean_scale_mode: int,
+    sparse_mode: int,
+    softmax_scale: float,
+) -> None: ...
+
+
+@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out",))
+def _mha_v4_fwd_sparse_launch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    block_bitmap: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    mean_format: int,
+    mean_scale_mode: int,
+    sparse_mode: int,
+    softmax_scale: float,
+) -> None:
+    _fmha_v4_fwd_sparse(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        mean_k,
+        mean_v,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        block_bitmap,
+        out,
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        mean_format,
+        mean_scale_mode,
+        sparse_mode,
+        softmax_scale,
+    )
+
+
+@_mha_v4_fwd_sparse_launch.register_fake
+def _mha_v4_fwd_sparse_launch_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    block_bitmap: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    mean_format: int,
+    mean_scale_mode: int,
+    sparse_mode: int,
+    softmax_scale: float,
+) -> None:
+    # The output is an input the launch mutates, so the caller owns its layout and there is no
+    # output shape or stride for this fake to promise.
+    del q, k, v, q_descale, k_descale, v_descale, out
+    del mean_k, mean_v, kv_block_indices, lut_start, lut_count, block_bitmap
+    del q_format, k_format, v_format
+    del q_scale_mode, k_scale_mode, v_scale_mode
+    del mean_format, mean_scale_mode, sparse_mode, softmax_scale
 
 
 def mha_v4_packed(
@@ -902,6 +1072,189 @@ def mha_v4(
         q_scale_mode,
         k_scale_mode,
         v_scale_mode,
+        softmax_scale=softmax_scale,
+        out=out,
+        return_lse=return_lse,
+    )
+
+
+def _validate_sol_attn_contract(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+) -> tuple[AttentionFormat, AttentionScaleMode]:
+    """Check what the launcher cannot, and return the pooled operands' format and scale mode."""
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("Sol-Attn expects BSHD Q, K, and V tensors")
+    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
+        raise ValueError("Sol-Attn supports head dimension 128 only")
+    if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
+        raise ValueError("K and V must share their sequence length and head count")
+    nhead_q, nhead_kv = q.shape[2], k.shape[2]
+    if nhead_q % nhead_kv != 0:
+        raise ValueError("query heads must be a multiple of KV heads")
+    ratio = nhead_q // nhead_kv
+    if ratio & (ratio - 1):
+        # The kernel shifts a query head right by floor(log2(ratio)) to find its KV head instead of
+        # dividing, so a non-power-of-two ratio reads the wrong KV head for most heads.
+        raise ValueError(
+            f"Sol-Attn requires a power-of-two query:KV head ratio, got {nhead_q}:{nhead_kv}"
+        )
+    if q_format not in _FP8_FORMATS or k_format != q_format or v_format != q_format:
+        raise NotImplementedError(
+            "Sol-Attn currently has one kernel row, FP8 Q/K/V with BF16 output; got "
+            f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
+        )
+    # Pooling reuses K's and V's own descale, which is valid only for a per-tensor scale, so the
+    # pooled operands take K's format and scale mode. A future MX row must pool into an explicitly
+    # different format rather than inheriting one it cannot share a descale with.
+    return k_format, AttentionScaleMode.F32_PER_TENSOR
+
+
+def mha_v4_sol_attn_packed(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    block_bitmap: Tensor,
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+    q_scale_mode: AttentionScaleMode,
+    k_scale_mode: AttentionScaleMode,
+    v_scale_mode: AttentionScaleMode,
+    mean_format: AttentionFormat,
+    mean_scale_mode: AttentionScaleMode,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
+    return_lse: bool = False,
+) -> Tensor:
+    """Run Sol-Attn on operands that are already quantized and routed.
+
+    The routing operands come from `aiter.ops.triton.attention.utils.sol_attn_prepare`, which owns
+    the host contracts the kernel cannot check. Callers that re-route across denoising steps, or
+    that overlap preprocessing with communication, use this level; `mha_v4_sol_attn` is the default.
+    """
+    if return_lse:
+        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    if out is None:
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    elif out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
+        raise ValueError("out must match Q's shape/device and have BF16 dtype")
+
+    _mha_v4_fwd_sparse_launch(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        mean_k,
+        mean_v,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        block_bitmap,
+        out,
+        int(q_format),
+        int(k_format),
+        int(v_format),
+        int(q_scale_mode),
+        int(k_scale_mode),
+        int(v_scale_mode),
+        int(mean_format),
+        int(mean_scale_mode),
+        int(AttentionSparseMode.POOLED_CORRECTION),
+        softmax_scale,
+    )
+    return out
+
+
+def mha_v4_sol_attn(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    beta: float,
+    q_format: Optional[AttentionFormat] = None,  # noqa: UP045
+    k_format: Optional[AttentionFormat] = None,  # noqa: UP045
+    v_format: Optional[AttentionFormat] = None,  # noqa: UP045
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
+    return_lse: bool = False,
+) -> Tensor:
+    """Quantize BF16 BSHD operands, route them, and run Sol-Attn (arXiv 2607.24027).
+
+    Sol-Attn computes the KV blocks whose pooled proxy score clears a per-query-tile threshold
+    exactly, and recovers the rest from pooled K/V rather than dropping them. `beta` sets that
+    threshold, `tau = mean(proxy) + beta * std(proxy)` over the KV blocks of a query tile, so higher
+    beta computes fewer blocks exactly and leans harder on the correction. Sparsity is therefore
+    data dependent, but every tensor shape here is not.
+
+    This is a plain Python function on purpose: every branch below is on a format, a shape, or a
+    Python scalar, and the only opaque steps are the quantizers and the launch. A caller can compile
+    an attention layer straight through it without wrapping anything in a custom op of its own.
+    """
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+    ):
+        raise ValueError("mha_v4_sol_attn expects BF16 Q, K, and V inputs")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("mha_v4_sol_attn requires contiguous BSHD inputs")
+    native_fp8 = native_fp8_format()
+    q_format = native_fp8 if q_format is None else q_format
+    k_format = native_fp8 if k_format is None else k_format
+    v_format = native_fp8 if v_format is None else v_format
+    mean_format, mean_scale_mode = _validate_sol_attn_contract(
+        q, k, v, q_format, k_format, v_format
+    )
+    q_scale_mode, k_scale_mode, v_scale_mode = scale_modes_for_formats(
+        q_format, k_format, v_format
+    )
+
+    q_quantized, q_descale = quantize_fp8(q)
+    k_quantized, k_descale = quantize_fp8(k)
+    v_quantized, v_descale = quantize_fp8(v)
+    # Route on the stored values the kernel will load, after fp8 rounding. Routing is scale
+    # invariant, so the descales are deliberately not applied.
+    routing = sol_attn_prepare(
+        q_quantized, k_quantized, v_quantized, beta, SOL_ATTN_TS_QO, SOL_ATTN_TS_KV
+    )
+
+    return mha_v4_sol_attn_packed(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        routing["mean_k"],
+        routing["mean_v"],
+        routing["kv_block_indices"],
+        routing["lut_start"],
+        routing["lut_count"],
+        routing["block_bitmap"],
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        mean_format,
+        mean_scale_mode,
         softmax_scale=softmax_scale,
         out=out,
         return_lse=return_lse,

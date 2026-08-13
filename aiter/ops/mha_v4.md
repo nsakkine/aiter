@@ -324,6 +324,39 @@ The tensors are contiguous device `int32`; start/count have one entry per
 selection is an explicit manifest dimension and ABI, never an inference from extra pointers or a
 silent redirect from a dense request.
 
+### Sol-Attn And Pooled Operands
+
+Sol-Attn (arXiv 2607.24027) computes the selected blocks exactly and additionally recovers the
+skipped blocks' contribution from pooled K/V, so it is a distinct sparse mode from a plain block
+LUT, not a flag on one: its ABI carries `mean_k`, `mean_v`, and a selection bitmap beyond the LUT
+triple. Reserve a separate `sparse_mode` value for it.
+
+Pooled-operand scaling is the constraint that decides how far Sol-Attn generalizes across
+precisions. Pooling reuses K's and V's own descale, which is valid only because
+`mean(x) * descale == mean(x * descale)` for a per-tensor scale. An `E8M0_PER_1X32` image spans
+several scale blocks per pooled row and has no single descale to inherit, so MX K/V cannot reuse
+this contract. Record the pooled operands' format and scale mode as explicit manifest fields
+(`mean_format`, `mean_scale_mode`) rather than implying "same as K/V", so an MX row can pool into
+FP8 or into a freshly scaled image without redefining the sparse ABI.
+
+The sparse path is not bitwise reproducible today, and that is a property of the code object rather
+than of the dispatch above it. The gfx950 FP8 forward kernels carry an open nondeterminism,
+characterised in pyisa's `ASM/fmha_sage_fwd/tools/SPARSE_FLAKE.md`: given bitwise identical inputs,
+an occasional launch corrupts a single 32-row x 32-dim accumulator tile of one work item, always in
+output dims 96-127 of rows 128-255 of one query tile. It is inherited from the shared sparse LUT
+walker, the dense kernel shows a weaker form, and it only reproduces when distinct kernel modules
+are interleaved. `op_tests/test_mha_v4_sol_attn.py` therefore bounds that footprint instead of
+asserting bitwise equality between two launches, which keeps a systematic regression detectable
+while the kernel defect stays open. Do not promise callers a reproducible sparse forward pass, and
+do not write a test whose green depends on one.
+
+Routing is not part of the kernel ABI and must remain traceable. `sol_attn_prepare` in
+`aiter/ops/triton/attention/utils.py` derives every output shape from input shapes alone and reads
+no device data on the host, so callers compile straight through it; see
+`op_tests/triton_tests/attention/test_sol_attn_prepare.py`, which pins that property along with the
+LUT/bitmap agreement the kernel depends on. Partial-tail handling and the non-empty-row guarantee
+are shape-derived and unconditional respectively, for that reason.
+
 ### VSA Compatibility
 
 AITER VSA supplies delta-encoded fixed-capacity rows plus counts at 128-query-token granularity;
