@@ -13,14 +13,28 @@ The reference is evaluated on the mask the kernel was given, never on one it re-
 scale invariant in real arithmetic but not in fp32, so an oracle that re-routed would disagree about
 blocks sitting within rounding distance of the threshold and the comparison would measure that
 instead of the kernel.
+
+Accuracy is asserted against the kernel's own FP8 arithmetic floor rather than a fixed constant. At
+full density the oracle reduces exactly to dense attention over the dequantized FP8 operands, so the
+residual there is what FP8 costs by itself; comparing the sparse residual against it asserts that
+sparsity and the correction add nothing measurable, rather than asserting that some total happens to
+land under a round number. That floor depends on both the shape and the softmax scale, so it is
+measured per case instead of written down.
+
+Everything that can be exact is exact. The kernel is deterministic, and at full density it agrees
+with the already validated dense FP8 row bit for bit, which pins the LUT walker, the GQA head
+mapping, the operand strides and the epilogue with no tolerance at all.
 """
 
+import csv
 import math
+from pathlib import Path
 
 import pytest
 import torch
 import torch._dynamo
 
+import aiter
 from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
@@ -40,6 +54,15 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_mha_common import attention_ref, sol_attn_ref
 
 BETA = 0.5
+
+# A threshold this far below the mean puts every KV block in the exact branch, which is how the FP8
+# arithmetic floor is measured: the correction branch is then entirely masked out on both sides.
+FULL_DENSITY_BETA = -1e9
+
+# How far above that floor the routed cases are allowed to sit. Measured ratios span 0.91 to 1.00
+# across the shapes and betas exercised here, on both MHA and GQA, so sparsity costs nothing beyond
+# FP8 itself and this is headroom rather than budget.
+FLOOR_MARGIN = 1.10
 
 pytestmark = pytest.mark.skipif(
     not arch_info.is_fp8_avail() or arch_info.get_arch() != "gfx950",
@@ -88,7 +111,7 @@ def _inputs(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv, d=128, seed=0):
     )
 
 
-def _reference(q, k, v, beta=BETA, correction=True):
+def _reference(q, k, v, beta=BETA, correction=True, softmax_scale=None):
     """Quantize and route exactly as the entrypoint does, then evaluate the oracle on that mask."""
     q_quant, q_descale = quantize_fp8(q)
     k_quant, k_descale = quantize_fp8(k)
@@ -105,6 +128,7 @@ def _reference(q, k, v, beta=BETA, correction=True):
         routing["mean_v"].float() * v_descale,
         SOL_ATTN_TS_QO,
         SOL_ATTN_TS_KV,
+        softmax_scale=softmax_scale,
         correction=correction,
     )
     return out, routing
@@ -117,41 +141,47 @@ def _rel_error(actual, expected):
     ).item()
 
 
+def _fp8_arithmetic_floor(q, k, v, softmax_scale=None):
+    """What separates the kernel from the oracle when no block is approximated.
+
+    Routing everything into the exact branch masks the correction out of both sides, and the oracle's
+    exact branch is plain dense attention over the dequantized FP8 operands, computed in fp32. So the
+    residual here is entirely the kernel's own arithmetic: FP8 MFMA operands, the softmax, the FP8
+    probability round-trip into the PV product, and the BF16 epilogue.
+
+    Routed cases are compared against this instead of against a constant. It depends on the shape and
+    on the softmax scale -- both change how many columns the FP8 probability noise averages over --
+    so it has to be measured for the case at hand, and callers must pass the same scale they test.
+    """
+    reference, _ = _reference(
+        q, k, v, beta=FULL_DENSITY_BETA, softmax_scale=softmax_scale
+    )
+    actual = mha_v4_sol_attn(q, k, v, FULL_DENSITY_BETA, softmax_scale=softmax_scale)
+    return _rel_error(actual, reference)
+
+
 def assert_launches_agree(actual, expected, what):
-    """Two launches that must produce the same answer, allowing one known kernel defect through.
+    """Two launches of the same computation must agree bitwise.
 
-    The gfx950 FP8 forward kernels have an open nondeterminism, characterised in pyisa's
-    ASM/fmha_sage_fwd/tools/SPARSE_FLAKE.md: given bitwise identical inputs, an occasional launch
-    corrupts a single 32-row x 32-dim accumulator tile of one work item, always in output dims
-    96-127 of rows 128-255 of one query tile. It is inherited from the shared sparse LUT walker,
-    the dense kernel shows a weaker form of it, and reproducing it requires distinct kernel modules
-    to be interleaved, which a test session does.
-
-    So bitwise equality here fails roughly one session in five over a defect that lives in the code
-    object rather than in this port, while a norm-based tolerance would hide a real regression
-    behind averaging. Bounding the footprint does neither: anything systematic, such as a wrong
-    stride, a mis-selected block or a dropped correction term, moves far more than one tile and
-    is not confined to the last accumulator group.
+    The kernel is deterministic: one code object over identical inputs writes identical bytes,
+    whatever else the process happens to be doing. Nothing here is tolerated, and the report below
+    exists only to localise a failure -- which accumulator group, which query tile, which head --
+    because that is what distinguishes a wrong stride from a wrong block selection when one of
+    these does fail.
     """
     if torch.equal(actual, expected):
         return
     where = (actual.float() != expected.float()).nonzero()
     tiles = " ".join(
         f"tile {int(t)} head {int(h)}"
-        for t, h in {(int(r[1]) // SOL_ATTN_TS_QO, int(r[2])) for r in where}
+        for t, h in sorted({(int(r[1]) // SOL_ATTN_TS_QO, int(r[2])) for r in where})
     )
-    detail = (
+    raise AssertionError(
         f"{what}: {len(where)} elements differ across {tiles}, "
         f"dims {int(where[:, 3].min())}..{int(where[:, 3].max())}, "
         f"rows within tile {int((where[:, 1] % SOL_ATTN_TS_QO).min())}.."
         f"{int((where[:, 1] % SOL_ATTN_TS_QO).max())}, "
         f"max delta {(actual.float() - expected.float()).abs().max().item():.3e}"
-    )
-    assert len(where) <= 4 * 32 * 32, (
-        f"{detail} (too widespread for the known kernel flake)"
-    )
-    assert int(where[:, 3].min()) >= 96, (
-        f"{detail} (outside the known flake's dim group)"
     )
 
 
@@ -166,7 +196,11 @@ SHAPES = [
 
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
 def test_matches_reference(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv):
-    """The kernel reproduces the reference's exact + approximate mix on the same routing."""
+    """The kernel reproduces the reference's exact + approximate mix on the same routing.
+
+    The bound is the case's own FP8 arithmetic floor, so this fails if routing the workload sparsely
+    costs anything the same kernel does not already cost at full density.
+    """
     q, k, v = _inputs(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
     expected, routing = _reference(q, k, v)
     actual = mha_v4_sol_attn(q, k, v, BETA)
@@ -174,12 +208,40 @@ def test_matches_reference(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv):
     assert actual.dtype == torch.bfloat16
     assert actual.shape == q.shape
     assert torch.isfinite(actual.float()).all(), "kernel produced non-finite output"
+    error = _rel_error(actual, expected)
+    floor = _fp8_arithmetic_floor(q, k, v)
     selected = routing["block_attn_mask"].float().mean().item()
-    # fp8 operands and a bf16 epilogue put the floor here; the correction term is the thing under
-    # test, and it moves the error by far more than this tolerance.
-    assert _rel_error(actual, expected) < 6e-2, (
-        f"selected fraction {selected:.3f}, rel error {_rel_error(actual, expected):.4f}"
+    assert error <= floor * FLOOR_MARGIN, (
+        f"selected fraction {selected:.3f}, rel error {error:.5f} against an FP8 floor of "
+        f"{floor:.5f} (ratio {error / floor:.3f}), so sparsity is costing accuracy"
     )
+
+
+MHA_SHAPES = [shape for shape in SHAPES if shape[3] == shape[4]]
+
+
+@pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", MHA_SHAPES)
+@pytest.mark.parametrize("softmax_scale", [None, 0.5 / math.sqrt(128), 1.0])
+def test_full_density_matches_the_dense_row_bitwise(
+    batch, seqlen_q, seqlen_k, nhead_q, nhead_kv, softmax_scale
+):
+    """Routed to full density, the sparse row must reproduce the dense FP8 row byte for byte.
+
+    This is the strongest statement available about the sparse kernel and it needs no tolerance. With
+    every block selected the correction branch is inert, so the sparse row is doing exactly the dense
+    row's work through a different code path: the LUT walker instead of a counted loop, a GQA head
+    shift, its own operand strides and its own epilogue. Any error in that machinery -- an off-by-one
+    block index, a stride in elements where bytes were meant, a dropped tail -- breaks equality here
+    while leaving a norm-based accuracy check comfortably green.
+
+    Restricted to matching head counts because the dense v4 row is MHA only; GQA is covered by the
+    floor-relative tests above.
+    """
+    q, k, v = _inputs(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
+    fp8 = native_fp8_format()
+    sparse = mha_v4_sol_attn(q, k, v, FULL_DENSITY_BETA, softmax_scale=softmax_scale)
+    dense = mha_v4(q, k, v, fp8, fp8, fp8, softmax_scale=softmax_scale)
+    assert_launches_agree(sparse, dense, "sparse at full density against the dense row")
 
 
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES[:3])
@@ -248,12 +310,15 @@ def test_tracks_dense_fp8_at_production_density(
     _, routing = _reference(q, k, v)
 
     selected = routing["block_attn_mask"].float().mean().item()
+    error = _rel_error(actual, dense_fp8)
     assert selected < 0.5, (
         f"expected the default threshold to be selective, got {selected:.3f}"
     )
-    assert _rel_error(actual, dense_fp8) < 5e-2, (
-        f"selected fraction {selected:.3f}, rel error against dense FP8 "
-        f"{_rel_error(actual, dense_fp8):.4f}"
+    # Measured 0.0267 at 4096 and 0.0281 at 9419, at roughly 36% density. The bound is set close to
+    # those so that a regression in the correction term has nowhere to hide; it is not a claim about
+    # what Sol-Attn costs on arbitrary data, which depends on how concentrated the attention is.
+    assert error < 3.5e-2, (
+        f"selected fraction {selected:.3f}, rel error against dense FP8 {error:.5f}"
     )
 
 
@@ -270,8 +335,13 @@ def test_kernel_follows_the_reference_across_beta(beta):
     expected, routing = _reference(q, k, v, beta=beta)
 
     selected = routing["block_attn_mask"].float().mean().item()
+    error = _rel_error(actual, expected)
+    floor = _fp8_arithmetic_floor(q, k, v)
     assert torch.isfinite(actual.float()).all()
-    assert _rel_error(actual, expected) < 6e-2, f"beta={beta}, selected={selected:.3f}"
+    assert error <= floor * FLOOR_MARGIN, (
+        f"beta={beta}, selected={selected:.3f}, rel error {error:.5f} against an FP8 floor of "
+        f"{floor:.5f} (ratio {error / floor:.3f})"
+    )
 
 
 def test_sparsity_actually_varies_with_beta():
@@ -291,13 +361,22 @@ def test_sparsity_actually_varies_with_beta():
     assert fractions[0] > fractions[1] > fractions[2], fractions
 
 
-def test_out_is_caller_allocated_and_returned():
-    """The launch mutates the caller's buffer, which is what keeps the compiled fake trivial."""
+def test_out_is_caller_allocated_and_fully_written():
+    """The launch mutates the caller's buffer, which is what keeps the compiled fake trivial.
+
+    Seeded with NaN rather than left uninitialized, so that the finiteness check below proves every
+    element was written. Uninitialized device memory is usually finite, which would let a kernel that
+    skipped a query tile or an accumulator group pass.
+    """
     q, k, v = _inputs(1, 1024, 1024, 4, 4)
-    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    out = torch.full(q.shape, float("nan"), dtype=torch.bfloat16, device=q.device)
     returned = mha_v4_sol_attn(q, k, v, BETA, out=out)
     assert returned.data_ptr() == out.data_ptr()
-    assert torch.isfinite(out.float()).all()
+    assert torch.isfinite(out.float()).all(), (
+        f"{int(torch.isnan(out.float()).sum())} elements were left unwritten"
+    )
+    # And the buffer the kernel filled must hold what an allocated-for-you call returns.
+    assert_launches_agree(out, mha_v4_sol_attn(q, k, v, BETA), "a caller-supplied out")
 
 
 def test_packed_api_matches_raw_api():
@@ -335,21 +414,59 @@ def test_packed_api_matches_raw_api():
 
 
 def test_softmax_scale_is_honoured():
+    """A supplied scale must reach the kernel and be the scale it actually applies.
+
+    Passing the default explicitly has to be bitwise identical: `128 ** -0.5` and
+    `1.0 / math.sqrt(128)` differ by one ULP as doubles, but the launcher narrows to float32 and both
+    land on the same bits, so there is nothing for the kernel to disagree about.
+
+    Then a different scale is checked against the oracle evaluated at that same scale, not merely for
+    having moved the output. "The answer changed" is satisfied by a kernel that mangles the scale;
+    "the answer matches the reference at that scale, to the FP8 floor measured at that scale" is not.
+    """
     q, k, v = _inputs(1, 1024, 1024, 4, 4)
     default = mha_v4_sol_attn(q, k, v, BETA)
     explicit = mha_v4_sol_attn(q, k, v, BETA, softmax_scale=1.0 / math.sqrt(128))
     assert_launches_agree(explicit, default, "explicit default scale")
-    other = mha_v4_sol_attn(q, k, v, BETA, softmax_scale=0.5 / math.sqrt(128))
-    assert _rel_error(other, default) > 1e-3, (
+
+    half = 0.5 / math.sqrt(128)
+    other = mha_v4_sol_attn(q, k, v, BETA, softmax_scale=half)
+    expected, _ = _reference(q, k, v, softmax_scale=half)
+    error = _rel_error(other, expected)
+    floor = _fp8_arithmetic_floor(q, k, v, softmax_scale=half)
+    assert error <= floor * FLOOR_MARGIN, (
+        f"at half the default scale the kernel sits {error:.5f} from the reference against an FP8 "
+        f"floor of {floor:.5f} (ratio {error / floor:.3f})"
+    )
+    # Halving the temperature flattens the distribution enough to move the output substantially;
+    # measured 0.654. A kernel that quietly ignored the argument would land near zero here.
+    assert _rel_error(other, default) > 0.1, (
         "the softmax scale did not reach the kernel"
     )
 
 
 def test_repeated_calls_agree():
-    q, k, v = _inputs(1, 2048, 2048, 8, 8)
-    first = mha_v4_sol_attn(q, k, v, BETA)
-    second = mha_v4_sol_attn(q, k, v, BETA)
-    assert_launches_agree(second, first, "a repeated call")
+    """The sparse forward pass is reproducible, including across interleaved code objects.
+
+    Interleaving a different kernel module and reallocating between launches is deliberate: an
+    earlier revision of this code object lost bitwise reproducibility precisely when distinct modules
+    were interleaved, and a lone back-to-back pair would not have caught it. Repeats are cheap here,
+    so this walks the shape list rather than sampling one.
+    """
+    fp8 = native_fp8_format()
+    for shape in SHAPES[:3]:
+        q, k, v = _inputs(*shape)
+        first = mha_v4_sol_attn(q, k, v, BETA)
+        for repeat in range(4):
+            churn = torch.empty(1 << 22, device="cuda", dtype=torch.bfloat16)
+            if shape[3] == shape[4]:
+                mha_v4(q, k, v, fp8, fp8, fp8)
+            assert_launches_agree(
+                mha_v4_sol_attn(q, k, v, BETA),
+                first,
+                f"repeat {repeat} of {shape} across an interleaved dense launch",
+            )
+            del churn
 
 
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES[:4])
@@ -426,11 +543,22 @@ def test_non_power_of_two_gqa_is_refused():
         mha_v4_sol_attn(heads(6), heads(4), heads(4), BETA)
 
 
-def test_sparse_mode_selects_the_row():
-    """A dense request must never reach the sparse kernel, and vice versa."""
+def _launch_sparse(
+    q,
+    k,
+    v,
+    mean_format=None,
+    mean_view_dtype=None,
+    sparse_mode=AttentionSparseMode.POOLED_CORRECTION,
+):
+    """Drive the private sparse launch directly, so dispatch-key rejections can be provoked.
+
+    The public entrypoints cannot express an unsupported key, which is the point of them; reaching
+    past them is the only way to assert that the launcher rejects one instead of quietly running the
+    nearest row.
+    """
     from aiter.ops.mha_v4 import _mha_v4_fwd_sparse_launch
 
-    q, k, v = _inputs(1, 1024, 1024, 4, 4)
     fp8 = native_fp8_format()
     q_quant, q_descale = quantize_fp8(q)
     k_quant, k_descale = quantize_fp8(k)
@@ -438,30 +566,98 @@ def test_sparse_mode_selects_the_row():
     routing = sol_attn_prepare(
         q_quant, k_quant, v_quant, BETA, SOL_ATTN_TS_QO, SOL_ATTN_TS_KV
     )
-    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    mean_k, mean_v = routing["mean_k"], routing["mean_v"]
+    if mean_view_dtype is not None:
+        mean_k, mean_v = mean_k.view(mean_view_dtype), mean_v.view(mean_view_dtype)
+    per_tensor = int(AttentionScaleMode.F32_PER_TENSOR)
+    _mha_v4_fwd_sparse_launch(
+        q_quant,
+        k_quant,
+        v_quant,
+        q_descale,
+        k_descale,
+        v_descale,
+        mean_k,
+        mean_v,
+        routing["kv_block_indices"],
+        routing["lut_start"],
+        routing["lut_count"],
+        routing["block_bitmap"],
+        torch.empty(q.shape, dtype=torch.bfloat16, device=q.device),
+        int(fp8),
+        int(fp8),
+        int(fp8),
+        per_tensor,
+        per_tensor,
+        per_tensor,
+        int(fp8 if mean_format is None else mean_format),
+        per_tensor,
+        int(sparse_mode),
+        128**-0.5,
+    )
+
+
+@pytest.mark.parametrize(
+    "sparse_mode", [AttentionSparseMode.NONE, AttentionSparseMode.BLOCK_LUT]
+)
+def test_unimplemented_sparse_modes_are_refused(sparse_mode):
+    """Only the pooled-correction row exists, and asking for another must fail rather than run one.
+
+    A plain block LUT drops the skipped blocks instead of recovering them, so serving that request
+    from this kernel would silently return a different function of the inputs. NONE is refused for the
+    mirror-image reason: a dense request has no business arriving at the sparse launcher.
+    """
     with pytest.raises(RuntimeError, match="pooled correction"):
-        _mha_v4_fwd_sparse_launch(
-            q_quant,
-            k_quant,
-            v_quant,
-            q_descale,
-            k_descale,
-            v_descale,
-            routing["mean_k"],
-            routing["mean_v"],
-            routing["kv_block_indices"],
-            routing["lut_start"],
-            routing["lut_count"],
-            routing["block_bitmap"],
-            out,
-            int(fp8),
-            int(fp8),
-            int(fp8),
-            int(AttentionScaleMode.F32_PER_TENSOR),
-            int(AttentionScaleMode.F32_PER_TENSOR),
-            int(AttentionScaleMode.F32_PER_TENSOR),
-            int(fp8),
-            int(AttentionScaleMode.F32_PER_TENSOR),
-            int(AttentionSparseMode.BLOCK_LUT),
-            128**-0.5,
+        _launch_sparse(*_inputs(1, 1024, 1024, 4, 4), sparse_mode=sparse_mode)
+
+
+def test_pooled_operand_format_selects_the_row():
+    """mean_format is a real dispatch dimension, not decoration.
+
+    The manifest row is keyed on the pooled operands' format and scale mode because pooling may only
+    inherit K's descale under a per-tensor scale. Requesting pooled operands in a format no row
+    provides therefore has to fail at manifest lookup; were the key ignored, this would launch the FP8
+    row over pooled memory it had been told is int8.
+    """
+    with pytest.raises(RuntimeError, match="no MHA v4 kernel"):
+        _launch_sparse(
+            *_inputs(1, 1024, 1024, 4, 4),
+            mean_format=AttentionFormat.INT8,
+            mean_view_dtype=torch.int8,
+        )
+
+
+def test_manifest_keeps_dense_and_sparse_rows_disjoint():
+    """No dense request can match the Sol-Attn row, by construction of the manifest key.
+
+    The dense launcher looks up `mean_format` 0, `mean_scale_mode` 0 and sparse mode NONE, so this is
+    a property of the manifest rather than of any output, and it is asserted there: every sparse row
+    must carry a non-zero sparse mode and pooled-operand format, and no dense row may carry either.
+    Comparing outputs cannot express it, because full density is the one setting where the two rows
+    legitimately agree -- bitwise, as the test above requires.
+    """
+    manifest = (
+        Path(aiter.__file__).resolve().parent.parent
+        / "hsa"
+        / arch_info.get_arch()
+        / "fmha_v4_fwd"
+        / "fmha_v4_fwd.csv"
+    )
+    rows = list(
+        csv.DictReader(
+            line
+            for line in manifest.read_text().splitlines()
+            if line and not line.startswith("#")
+        )
+    )
+    sparse_rows = [row for row in rows if int(row["sparse"]) != 0]
+    assert sparse_rows, f"no sparse row in {manifest.name}"
+    for row in sparse_rows:
+        assert int(row["mean_format"]) and int(row["mean_scale_mode"]), (
+            f"sparse row {row['co_name']} declares no pooled-operand format, so a dense "
+            "lookup would match it"
+        )
+    for row in (row for row in rows if int(row["sparse"]) == 0):
+        assert not int(row["mean_format"]) and not int(row["mean_scale_mode"]), (
+            f"dense row {row['co_name']} declares pooled operands it does not take"
         )

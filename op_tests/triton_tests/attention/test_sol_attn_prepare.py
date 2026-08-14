@@ -162,13 +162,12 @@ def test_lut_and_bitmap_agree_with_mask(batch, seqlen_q, seqlen_k, nhead_q, nhea
     )
     assert torch.equal(prep["lut_start"], expected_start)
 
-    for row in range(0, flat.shape[0], max(1, flat.shape[0] // 8)):
-        start = int(prep["lut_start"][row])
-        count = int(prep["lut_count"][row])
-        listed = prep["kv_block_indices"][start : start + count]
-        assert torch.equal(listed, flat[row].nonzero().flatten().to(torch.int32)), (
-            f"LUT row {row} does not match the mask"
-        )
+    # Every row, not a sample of them: nonzero() returns row-major order, so its column indices are
+    # exactly the concatenation of the per-row block lists that lut_start and lut_count carve up.
+    total = int(prep["lut_count"].sum())
+    assert torch.equal(
+        prep["kv_block_indices"][:total], flat.nonzero()[:, 1].to(torch.int32)
+    ), "the LUT does not list the mask's selected blocks, in row-major order"
 
     bits = prep["block_bitmap"].to(torch.int64)
     unpacked = (
@@ -180,6 +179,36 @@ def test_lut_and_bitmap_agree_with_mask(batch, seqlen_q, seqlen_k, nhead_q, nhea
     assert torch.equal(unpacked[:, :num_kv_blocks], flat), "bitmap disagrees with mask"
     # Padding bits mean "already computed exactly" and are what clips the last tile's overhang.
     assert unpacked[:, num_kv_blocks:].all(), "bitmap padding bits must be set"
+
+
+@pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
+def test_pooled_kv_matches_an_independent_block_mean(
+    batch, seqlen_q, seqlen_k, nhead_q, nhead_kv
+):
+    """mean_k and mean_v must be the per-block mean of the stored values, tail block included.
+
+    Nothing else pins their values. The routing tests consume mean_k rather than deriving it, and the
+    kernel comparison feeds the same pooled tensors to both sides, so a pooling error would agree with
+    itself everywhere and surface only as an unexplained accuracy gap. The ragged tail is the case
+    that matters: dividing a short final block by the full block size scales it down by up to 128x
+    while leaving every shape, dtype and contiguity check green.
+    """
+    q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
+    prep = sol_attn_prepare(q, k, v, BETA)
+    num_kv_blocks = -(-seqlen_k // SOL_ATTN_TS_KV)
+
+    for name, source in (("mean_k", k), ("mean_v", v)):
+        pooled = prep[name]
+        for block in range(num_kv_blocks):
+            lo = block * SOL_ATTN_TS_KV
+            hi = min(lo + SOL_ATTN_TS_KV, seqlen_k)
+            expected = (source[:, lo:hi].float().sum(dim=1) / (hi - lo)).to(
+                source.dtype
+            )
+            assert torch.equal(pooled[:, block], expected), (
+                f"{name} block {block} covers tokens {lo}:{hi} ({hi - lo} of "
+                f"{SOL_ATTN_TS_KV}) and does not equal their mean"
+            )
 
 
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)

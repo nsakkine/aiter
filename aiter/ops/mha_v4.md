@@ -5,8 +5,9 @@
 
 ## Current Status
 
-Last updated: 2026-08-10. Dense BF16-output MHA v4 and the xDiT integration are implemented and
-validated on gfx950. A gfx942 signed INT8/FP8 row is also preserved under v4.
+Last updated: 2026-08-14. Dense BF16-output MHA v4 and the xDiT integration are implemented and
+validated on gfx950. A gfx942 signed INT8/FP8 row is also preserved under v4. One sparse row is
+implemented, FP8 Sol-Attn with pooled correction; see Sol-Attn And Pooled Operands.
 
 The public raw and packed APIs support six dense combinations:
 
@@ -19,10 +20,17 @@ The public raw and packed APIs support six dense combinations:
 | MXFP6 E2M3 | MXFP4 E2M1 | BF16 |
 | MXFP4 E2M1 | MXFP4 E2M1 | BF16 |
 
-Current scope is batched, dense, non-causal MHA with matching Q/KV head counts, BF16 raw inputs,
-head dimension 128, and BF16 output. It is inference-only: no backward, dropout, RNG state, LSE,
-GQA, varlen, or sparse metadata. Unsupported requests fail explicitly and never fall back to
-`aiter.ops.mha`.
+and one sparse combination:
+
+| Q/K | V | Pooled K/V | Output | Sparse mode |
+|---|---|---|---|---|
+| FP8 | FP8 | FP8 | BF16 | pooled correction |
+
+Every row is batched, non-causal, head dimension 128, BF16 raw input and BF16 output, and inference
+only: no backward, dropout, RNG state, LSE, or varlen. The dense rows require matching Q/KV head
+counts. The sparse row also accepts GQA, at power-of-two query:KV head ratios and only those,
+because its kernel reaches a KV head by shifting rather than dividing. Unsupported requests fail
+explicitly and never fall back to `aiter.ops.mha`.
 
 ## Stable Decisions And Ownership
 
@@ -72,15 +80,20 @@ for Ulysses overlap.
 Validation includes eager accuracy for all six combinations, fullgraph eager/compiled parity,
 finite outputs, allocator churn with downstream consumers, explicit code-object dispatch,
 unaligned and unequal sequence lengths, retained Wan captures, and balanced multi-GPU target-shape
-benchmarks. The focused suites currently pass `46/46` in `op_tests/test_mha_v4.py` and `15/15` in
-xDiT `tests/test_aiter_mixed_attention.py`.
+benchmarks. The focused suites currently pass `46/46` in `op_tests/test_mha_v4.py`, `47/47` in
+`op_tests/test_mha_v4_sol_attn.py`, `43/43` in
+`op_tests/triton_tests/attention/test_sol_attn_prepare.py`, and `15/15` in xDiT
+`tests/test_aiter_mixed_attention.py`.
 
 Still deferred:
 
-- sparse ragged-LUT execution, VSA/Sparge compatibility, and ring/LSE support;
+- VSA/Sparge compatibility and ring/LSE support;
+- sparse rows beyond FP8; MX Q/K/V needs a pooled-operand scale contract of its own, because pooling
+    cannot inherit a block-granular descale;
+- a plain block-LUT sparse mode, which drops the skipped blocks instead of recovering them;
 - low-precision output with an explicit data/scale ABI;
 - approximate BF16 input under a distinct identity from v3 BF16;
-- GQA, causal, varlen, other head dimensions, and more Q/K/V/O combinations;
+- causal, varlen, other head dimensions, more Q/K/V/O combinations, and GQA on the dense rows;
 - broader gfx942, CDNA5, and RDNA manifest/code-object coverage.
 
 ## Current Dense Performance
@@ -183,8 +196,10 @@ both focused suites, and repeated retained Wan captures. At
 `b=1,hq=hk=5,sq=sk=65536,d=dv=128`, final eight-GPU e2e medians were
 `3574.8 TFLOP/s` for F4F4 versus `3459.0` for F4F8, and `3351.2 TFLOP/s` for F6F4 versus
 `3205.1` for F6F8. The deployed code-object SHA256 values are
-`212981592d1e4801f93db1cb8cc37db1ed7335e3fdadf53c0d01e7bd53917d72` (F4F4) and
-`a5046f1dcc0d51033122310efab70796e690086391285b9e5cdeaa5496d292a9` (F6F4).
+`c09b4bad4374bdf8c77326a7cff3e7083061d586416152e1014fad831e702065` (F4F4) and
+`a5046f1dcc0d51033122310efab70796e690086391285b9e5cdeaa5496d292a9` (F6F4). The F4F4 object was
+refreshed after those medians were taken, so re-measure before quoting the F4F4 figure; the
+`op_tests/test_mha_v4.py` byte-equality and accuracy rows were re-run against the current object.
 
 ### Future MXFP6 K Fusion
 
@@ -339,16 +354,16 @@ this contract. Record the pooled operands' format and scale mode as explicit man
 (`mean_format`, `mean_scale_mode`) rather than implying "same as K/V", so an MX row can pool into
 FP8 or into a freshly scaled image without redefining the sparse ABI.
 
-The sparse path is not bitwise reproducible today, and that is a property of the code object rather
-than of the dispatch above it. The gfx950 FP8 forward kernels carry an open nondeterminism,
-characterised in pyisa's `ASM/fmha_sage_fwd/tools/SPARSE_FLAKE.md`: given bitwise identical inputs,
-an occasional launch corrupts a single 32-row x 32-dim accumulator tile of one work item, always in
-output dims 96-127 of rows 128-255 of one query tile. It is inherited from the shared sparse LUT
-walker, the dense kernel shows a weaker form, and it only reproduces when distinct kernel modules
-are interleaved. `op_tests/test_mha_v4_sol_attn.py` therefore bounds that footprint instead of
-asserting bitwise equality between two launches, which keeps a systematic regression detectable
-while the kernel defect stays open. Do not promise callers a reproducible sparse forward pass, and
-do not write a test whose green depends on one.
+The sparse forward pass is bitwise reproducible, and the deployed code object is
+`773599d0c8c2cfdbd204549dfbf520cd7f2b75a4ee3596d7f4bd8cf87d4a4110`.
+
+Accuracy is asserted against the kernel's own FP8 arithmetic floor rather than a constant. Routed to
+full density the sparse row reproduces the dense FP8 row bit for bit, and the oracle reduces exactly
+to dense attention over the dequantized FP8 operands, so the residual at full density is what FP8
+costs by itself. Measured across the suite's shapes and thresholds the routed residual sits at 0.91
+to 1.00 of that floor, i.e. sparsity and the correction cost nothing beyond FP8. Prefer that
+comparison to a fixed tolerance: on this data a constant would have to be set near `6e-2`, which is
+also the size of a regression it would then accept.
 
 Routing is not part of the kernel ABI and must remain traceable. `sol_attn_prepare` in
 `aiter/ops/triton/attention/utils.py` derives every output shape from input shapes alone and reads
@@ -405,7 +420,8 @@ Fix offsets with the first implementing kernel; existing v1 binaries retain thei
 
 ## Forward Roadmap
 
-1. Add sparse manifest rows, ragged-LUT validation, and exact 256x128/128x128 execution paths.
+1. Extend sparse coverage past the FP8 Sol-Attn row: a plain block-LUT mode, pooled-operand scale
+    contracts for MX, and exact 256x128/128x128 execution paths.
 2. Add VSA/Sparge adapters over the shared sparse descriptor and packed executor.
 3. Add LSE under a stable output schema for ring attention.
 4. Add approximate BF16 under a distinct symbol and code object from generic v3 BF16.
