@@ -69,7 +69,7 @@ def mp_lock(
             return ret
         # Could not acquire: another process holds the lock. Wait for it.
         # wait() returns True if the holder released normally (work done),
-        # or False if it broke a stale lock left by a dead/abandoned holder —
+        # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
         if baton.wait():
             if WaitFunc is not None:
@@ -93,6 +93,11 @@ AITER_CONFIG_GEMM_A4W4 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A6W6 = os.getenv(
+    "AITER_CONFIG_GEMM_A6W6",
+    f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
@@ -111,6 +116,11 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_FHMOE = os.getenv(
+    "AITER_CONFIG_FHMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
 )
 
 AITER_CONFIG_GROUPED_FMOE = os.getenv(
@@ -133,9 +143,42 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
 
+# fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
+# (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
+# future fp32 rowwise-scale variant lands in a separate CSV and never collides
+# on key. The scale type is identified by the filename alone. The
+# per-model tuned data currently lives under model_configs/ (e.g.
+# dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
+# get_config_file; this canonical path may not exist on disk.
+AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
+)
+
+AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/"
+    "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv",
+)
+
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GDR_DECODE = os.getenv(
+    "AITER_CONFIG_GDR_DECODE",
+    f"{AITER_ROOT_DIR}/aiter/configs/gdr_decode_tuned.csv",
+)
+
+# K5 opt BV tuned config. Per-model tuned rows live under model_configs/
+# (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
+# get_config_file. It ships header-only: with no per-model table present
+# get_config_file returns this path as-is, and the opt AOT reads it, so it has to
+# be a readable csv rather than a missing path.
+AITER_CONFIG_GDN_K5_OPT = os.getenv(
+    "AITER_CONFIG_GDN_K5_OPT",
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
 
@@ -146,6 +189,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A4W4",
             AITER_CONFIG_GEMM_A4W4,
             "a4w4_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A6W6_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W6",
+            AITER_CONFIG_GEMM_A6W6,
+            "a6w6_blockscale_tuned_gemm",
         )
 
     @property
@@ -174,6 +225,12 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_FHMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
         )
 
     @property
@@ -212,6 +269,34 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GDR_DECODE_FILE(self):
+        return AITER_CONFIG_GDR_DECODE
+
+    @property
+    def AITER_CONFIG_GDN_K5_OPT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GDN_K5_OPT",
+            AITER_CONFIG_GDN_K5_OPT,
+            "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE,
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
+            "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
 
     def update_config_files(self, file_path: str, merge_name: str):
@@ -269,11 +354,10 @@ class AITER_CONFIG:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
 
         ## get keys from untuned file to drop_duplicates
-        untuned_name = (
-            re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
-            if re.search(r"(?:_)?tuned$", merge_name)
-            else merge_name.replace("tuned", "untuned")
-        )
+        # Turn the tuned-file base name into its untuned sibling by rewriting the
+        # LAST "tuned" token (handles both mid-string names like
+        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
@@ -283,6 +367,11 @@ class AITER_CONFIG:
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
+            # Only key on columns actually present in the merged frame. Most
+            # families carry cu_num, but some (e.g. the mxscale batched-GEMM
+            # table) key on gfx and never carry cu_num; keeping a missing column
+            # in the subset would raise inside pandas' duplicated().
+            dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())
@@ -330,6 +419,7 @@ class AITER_CONFIG:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
+
         from pathlib import Path
 
         config_path = Path("/tmp/aiter_configs/")
@@ -418,6 +508,15 @@ AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfxs = get_gfx_list()
 AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+# Pre-compiled opus code objects (csrc/opus_gemm/gen_co/<arch>/<symbol>.co).
+# Resolved HERE, at import time, for the same reason AITER_ASM_DIR is: the
+# module also carries -DOPUS_GEN_CO_DIR, but that macro is baked when the module
+# is COMPILED, which for a prebuilt wheel is the build tree's aiter_meta/ (a
+# directory setup.py deletes when it is done). Only an import-time value knows
+# where the files ended up after install. The C++ loader prefers this env var
+# over the macro, so an explicit user override still wins.
+OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
+os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
 
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
@@ -632,6 +731,77 @@ def _so_offload_archs(so_path):
     return archs
 
 
+_PYBIND11_ABI_KEY_RE = re.compile(rb"__pybind11_internals_v[0-9A-Za-z_]+__")
+
+
+def _so_pybind11_abi_key(so_path):
+    # the key of pybind11's cross-module type registry, as embedded in a built
+    # .so. two extensions see the same registry only when this string matches
+    # byte for byte; it encodes the pybind11 internals version plus the compiler
+    # / stdlib / C++ ABI the module was built with. None means missing file or a
+    # module built without pybind11.
+    # find() first, then the regex: a plain scan over a several-hundred-MB CK
+    # module would otherwise touch every page just to reach one short string.
+    import mmap
+
+    try:
+        with open(so_path, "rb") as f, mmap.mmap(
+            f.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mm:
+            pos = mm.find(b"__pybind11_internals_v")
+            if pos < 0:
+                return None
+            m = _PYBIND11_ABI_KEY_RE.match(mm, pos)
+            return m.group(0).decode() if m else None
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _pybind11_abi_keys(md_name, so_path, core_so_path):
+    # (module key, core key) when the two disagree, else None. lru_cached on the
+    # paths, so each .so is read at most once per process and the healthy answer
+    # costs one dict lookup. A module with no key at all (host-only, or built
+    # without pybind11) counts as agreeing: there is nothing to mismatch.
+    core_key = _so_pybind11_abi_key(core_so_path)
+    mod_key = _so_pybind11_abi_key(so_path)
+    if not core_key or not mod_key or core_key == mod_key:
+        return None
+    return (mod_key, core_key)
+
+
+def _raise_on_pybind11_abi_split(md_name, so_path, core_so_path, has_tensor_arg):
+    # aiter_tensor_t is registered exactly once, by module_aiter_core, and
+    # develop=True ops hand one of those objects to a different .so. That
+    # resolves only if both modules landed in the same pybind11 type registry,
+    # i.e. share the key above. When they do not, pybind11 sees an unregistered
+    # type and rejects the tensor arguments with a bare "incompatible function
+    # arguments", naming neither cause nor cure -- which is what PR #4847 hit and
+    # worked around by reverting a module to at::Tensor.
+    #
+    # The call is going to fail either way, so fail it here with the reason
+    # attached instead. Gated on an argument actually being a tensor: a mismatch
+    # only bites when an aiter_tensor_t has to cross, and a develop op called
+    # with none would otherwise still work.
+    keys = _pybind11_abi_keys(md_name, so_path, core_so_path)
+    if keys is None or not has_tensor_arg():
+        return
+    mod_key, core_key = keys
+    raise RuntimeError(
+        f"[{md_name}] was built against a different pybind11 ABI than "
+        f"module_aiter_core, so it cannot see the aiter_tensor_t registration "
+        f"and every tensor argument would be rejected:\n"
+        f"    {md_name}: {mod_key}\n"
+        f"      ({so_path})\n"
+        f"    module_aiter_core: {core_key}\n"
+        f"      ({core_so_path})\n"
+        f"The two .so files come from different build environments -- differing "
+        f"pybind11 version, C++ ABI, or one built against torch and one not. "
+        f"Rebuild both in one environment: AITER_REBUILD=1, or remove "
+        f"{get_user_jit_dir()} and let them rebuild."
+    )
+
+
 def _needs_arch_rebuild(md_name):
     # a prebuilt .so is a valid host extension on any GPU, so importing one
     # built for the wrong arch succeeds and only faults later at kernel launch.
@@ -662,7 +832,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_core"]
+rebuilded_list = []
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -882,7 +1052,16 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
-        if get_gfx() == "gfx1250" and hip_version >= Version("7.0.0"):
+        # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
+        # HIP_LAUNCH_CONFIG appear in ROCm 7.0), not a question about which GPU
+        # this machine has -- so the arch test must accept a cross-compile for
+        # gfx1250 the way the gfx1250 flags in optCompilerConfig.json already do.
+        # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
+        # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
+        # path was compiled out (AiterAsmKernelFast then rejects them at launch).
+        if (
+            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
+        ) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:
@@ -1197,9 +1376,11 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],
+                        "torch_exclude": single_ops["torch_exclude"],
                     }
                     for (  # noqa: PLC0206  loop mutates d_all_ops[k] by key while reading single_ops[k]; .items() does not help
                         k
@@ -1274,6 +1455,17 @@ def _ctypes_call(func, fc_name, md_name):
     import torch
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
+
+    # Avoid constructing a Python Stream object on every ctypes invocation.
+    # Keep the public API fallback for torch versions without the private raw
+    # stream getter, and preserve the first tensor's device selection.
+    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw_stream is None:
+
+        def raw_stream(device_index):
+            return torch.cuda.current_stream(device_index).cuda_stream
+
+    current_device = torch.cuda.current_device
 
     _cache = {}
     _arg_checked = False
@@ -1505,14 +1697,14 @@ def _ctypes_call(func, fc_name, md_name):
                 add_arg(value)
             elif kind == _ARG_TENSOR:
                 if tensor_device is None:
-                    tensor_device = value.device
+                    tensor_device = value.get_device()
                 at = torch_to_aiter(value)
                 keep_alive(at)
                 add_arg(ctypes.byref(at))
             elif kind == _ARG_OPT_TENSOR:
                 if value is not None:
                     if tensor_device is None:
-                        tensor_device = value.device
+                        tensor_device = value.get_device()
                     at = torch_to_aiter(value)
                     keep_alive(at)
                     add_arg(ctypes.byref(at))
@@ -1527,9 +1719,9 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
-        c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-        )
+        if tensor_device is None:
+            tensor_device = current_device()
+        c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
         if err_clear is not None:
             err_clear()
         ret = c_func(*c_args)
@@ -1553,6 +1745,41 @@ def _ctypes_call(func, fc_name, md_name):
         return ret
 
     return caller
+
+
+_pybind_develop_hooks_cache = None
+
+
+def _pybind_develop_hooks():
+    """Everything the develop=True pybind path needs, resolved once.
+
+    All four are per-call on that path -- the converter runs once per tensor
+    argument -- and importing them inside the wrapper meant a sys.modules round
+    trip each time for names that never change. aiter.utility.dtypes imports back
+    into this module, so binding them at import time is not an option either.
+    """
+    global _pybind_develop_hooks_cache
+    if _pybind_develop_hooks_cache is None:
+        import torch
+
+        from ..utility.dtypes import torch_to_aiter_pybind
+
+        # Hands back the same handle as current_stream().cuda_stream without
+        # building the Python Stream object to carry it. Private, so fall back to
+        # the public spelling rather than assume a torch version floor.
+        raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+        if raw_stream is None:
+
+            def raw_stream(_device_index):
+                return torch.cuda.current_stream().cuda_stream
+
+        _pybind_develop_hooks_cache = (
+            torch_to_aiter_pybind,
+            torch.Tensor,
+            raw_stream,
+            torch.cuda.current_device,
+        )
+    return _pybind_develop_hooks_cache
 
 
 def compile_ops(
@@ -1839,27 +2066,38 @@ def compile_ops(
                     log_args(func, *args, **kwargs)
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
-                    import torch
+                    convert, tensor_cls, raw_stream, current_device = (
+                        _pybind_develop_hooks()
+                    )
 
-                    from ..utility.dtypes import torch_to_aiter_pybind
+                    # Both .so files are loaded by now, so their real paths are
+                    # known (a prebuilt module lives in the package dir, a JIT
+                    # one under the user jit dir; only __file__ tells them
+                    # apart). The scan of each .so happens once per process; the
+                    # tensor-argument sweep is passed as a thunk so it only runs
+                    # on the broken path.
+                    core_mod = __mds.get("module_aiter_core")
+                    if core_mod is not None:
+                        _raise_on_pybind11_abi_split(
+                            md_name,
+                            getattr(module, "__file__", "") or "",
+                            getattr(core_mod, "__file__", "") or "",
+                            lambda: any(
+                                isinstance(a, tensor_cls)
+                                for a in (*args, *kwargs.values())
+                            ),
+                        )
 
                     args = tuple(
-                        torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a
-                        for a in args
+                        convert(a) if isinstance(a, tensor_cls) else a for a in args
                     )
-                    kwargs = {
-                        k: (
-                            torch_to_aiter_pybind(v)
-                            if isinstance(v, torch.Tensor)
-                            else v
-                        )
-                        for k, v in kwargs.items()
-                    }
+                    if kwargs:
+                        kwargs = {
+                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            for k, v in kwargs.items()
+                        }
 
-                if develop:
-                    module._set_current_hip_stream(
-                        torch.cuda.current_stream().cuda_stream
-                    )
+                    module._set_current_hip_stream(raw_stream(current_device()))
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
