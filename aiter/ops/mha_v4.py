@@ -32,7 +32,10 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_amax_partial_kernel,
     sage_quant_v_kernel,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.attention.utils import (
+    block_attn_mask_to_ragged_lut,
+    sol_attn_prepare,
+)
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     fp6_k_lds_order_views_from_raw,
     fp6_k_raw_buffer_sizes,
@@ -189,6 +192,10 @@ _MHA_V4_Q_TILE = 256
 # mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
 # find_config(..., mode=1).
 _MHA_V4_SPARSE_MODE = 1
+# mode=2 selects the Sol-Attn rows, which run the same block-sparse exact pass and then correct it
+# with a pooled approximate pass, so they share the sparse modes' block geometry.
+_MHA_V4_SOL_ATTN_MODE = 2
+_MHA_V4_BLOCK_SPARSE_MODES = (_MHA_V4_SPARSE_MODE, _MHA_V4_SOL_ATTN_MODE)
 
 
 def native_fp8_format() -> AttentionFormat:
@@ -202,11 +209,12 @@ def native_fp8_format() -> AttentionFormat:
 
 @functools.cache
 def mha_v4_kv_tile() -> int:
-    """Return the KV tile of sorted-sparse MHA v4 rows on the active GPU.
+    """Return the KV tile of the block-sparse MHA v4 rows on the active GPU.
 
     Read from the same manifest the launcher dispatches on rather than restated here, so adding a
     sparse row with a different tile cannot leave the two disagreeing. 256x128 on gfx950, 256x64 on
-    gfx942.
+    gfx942. Sorted-sparse and Sol-Attn rows are read together: a caller builds one block mask and
+    may route it either way, so the geometry is only well defined when both agree.
     """
     return _mha_v4_kv_tile_from_manifest()
 
@@ -226,18 +234,18 @@ def _mha_v4_kv_tile_from_manifest() -> int:
             for row in csv.DictReader(
                 filter(lambda line: not line.startswith("#"), handle)
             ):
-                if int(row["mode"]) == _MHA_V4_SPARSE_MODE:
+                if int(row["mode"]) in _MHA_V4_BLOCK_SPARSE_MODES:
                     tiles.add(int(row["ts_kv"]))
     except FileNotFoundError as error:
         raise ValueError(
-            f"no MHA v4 manifest for {gfx} at {manifest}; sorted-sparse MHA v4 is "
+            f"no MHA v4 manifest for {gfx} at {manifest}; block-sparse MHA v4 is "
             "unavailable on this GPU"
         ) from error
     if not tiles:
-        raise ValueError(f"{gfx} has no sorted-sparse MHA v4 manifest row")
+        raise ValueError(f"{gfx} has no block-sparse MHA v4 manifest row")
     if len(tiles) > 1:
         raise ValueError(
-            f"{gfx} sorted-sparse manifest rows disagree on ts_kv ({sorted(tiles)}); the "
+            f"{gfx} block-sparse manifest rows disagree on ts_kv ({sorted(tiles)}); the "
             "mask geometry a caller builds is only well defined when they agree"
         )
     return tiles.pop()
@@ -615,6 +623,171 @@ def _mha_v4_fwd_sparse_launch_fake(
     del kv_block_indices, lut_start, lut_count
 
 
+def _fmha_v4_fwd_sol_attn_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: float,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    block_bitmap: Tensor,
+    mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
+    mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
+) -> None:
+    del q, k, v, q_descale, k_descale, v_descale
+    del q_format, k_format, v_format
+    del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
+    del kv_block_indices, lut_start, lut_count
+    del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale
+    del out
+
+
+@compile_ops(
+    "module_fmha_v4_fwd",
+    fc_name="fmha_v4_fwd_sol_attn",
+    gen_fake=_fmha_v4_fwd_sol_attn_fake,
+)
+def _fmha_v4_fwd_sol_attn(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: float,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    block_bitmap: Tensor,
+    mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
+    mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
+) -> None: ...
+
+
+@torch.library.custom_op("aiter::mha_v4_fwd_sol_attn_launch", mutates_args=("out",))
+def _mha_v4_fwd_sol_attn_launch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: float,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    block_bitmap: Tensor,
+    mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
+    mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
+) -> None:
+    _fmha_v4_fwd_sol_attn(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        out,
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        softmax_scale,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        mean_k,
+        mean_v,
+        block_bitmap,
+        mean_k_scale,
+        mean_v_scale,
+    )
+
+
+@_mha_v4_fwd_sol_attn_launch.register_fake
+def _mha_v4_fwd_sol_attn_launch_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    softmax_scale: float,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    mean_k: Tensor,
+    mean_v: Tensor,
+    block_bitmap: Tensor,
+    mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
+    mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
+) -> None:
+    del q, k, v, q_descale, k_descale, v_descale, out
+    del q_format, k_format, v_format
+    del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
+    del kv_block_indices, lut_start, lut_count
+    del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale
+
+
+def _sol_attn_triple(
+    mean_k: Optional[Tensor],  # noqa: UP045
+    mean_v: Optional[Tensor],  # noqa: UP045
+    block_bitmap: Optional[Tensor],  # noqa: UP045
+) -> Optional[tuple[Tensor, Tensor, Tensor]]:  # noqa: UP045
+    present = (
+        mean_k is not None,
+        mean_v is not None,
+        block_bitmap is not None,
+    )
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError(
+            "mean_k, mean_v, and block_bitmap must all be set or all omitted"
+        )
+    return mean_k, mean_v, block_bitmap
+
+
 def mha_v4_packed(
     q: Tensor,
     k: Tensor,
@@ -634,6 +807,11 @@ def mha_v4_packed(
     kv_block_indices: Optional[Tensor] = None,  # noqa: UP045
     lut_start: Optional[Tensor] = None,  # noqa: UP045
     lut_count: Optional[Tensor] = None,  # noqa: UP045
+    mean_k: Optional[Tensor] = None,  # noqa: UP045
+    mean_v: Optional[Tensor] = None,  # noqa: UP045
+    block_bitmap: Optional[Tensor] = None,  # noqa: UP045
+    mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
+    mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
 ) -> Tensor:
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
@@ -641,10 +819,29 @@ def mha_v4_packed(
     nonstandard K layouts are validated before launch; output is BF16 BSHD.
     Pass the ragged LUT triple to select the sorted-sparse row; omit all three
     tensors for dense. The work table is built inside the sparse custom op.
+    Adding the pooled triple (mean_k, mean_v, block_bitmap) on top of the LUT
+    selects Sol-Attn instead, which corrects the blocks the LUT dropped rather
+    than discarding them; aiter.ops.triton's sol_attn_prepare() builds all six
+    tensors from one mask. A row that selects nothing falls back to the
+    pooled-only softmax over every block instead of to a zero tile.
+    A block-granular operand also needs its pooled scale (mean_k_scale,
+    mean_v_scale), which sol_attn_prepare() returns for exactly the operands
+    whose source scale could not survive pooling.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
+    pooled = _sol_attn_triple(mean_k, mean_v, block_bitmap)
+    if pooled is not None and lut is None:
+        raise ValueError(
+            "Sol-Attn MHA v4 needs the ragged LUT triple as well: the pooled pass corrects the "
+            "blocks the LUT did not compute exactly, so it has no meaning without one"
+        )
+    if pooled is None and (mean_k_scale is not None or mean_v_scale is not None):
+        raise ValueError(
+            "a pooled scale only describes a pooled operand: pass mean_k / mean_v / block_bitmap "
+            "alongside it"
+        )
     expected_scale_modes = scale_modes_for_formats(q_format, k_format, v_format)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     mxfp8_scale_modes = (
@@ -734,17 +931,23 @@ def mha_v4_packed(
     if lut is None:
         _mha_v4_fwd_launch(*launch_args)
     else:
+        mode_name = "Sol-Attn" if pooled is not None else "sorted-sparse"
         if q_format == AttentionFormat.BF16:
             raise NotImplementedError(
-                "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
+                f"{mode_name} MHA v4 does not have a BF16 manifest row yet"
             )
         kv_tile = mha_v4_kv_tile()
         if k.shape[1] % kv_tile != 0:
             raise ValueError(
-                "sorted-sparse MHA v4 requires key length padded to a "
+                f"{mode_name} MHA v4 requires key length padded to a "
                 f"multiple of {kv_tile}"
             )
-        _mha_v4_fwd_sparse_launch(*launch_args, *lut)
+        if pooled is None:
+            _mha_v4_fwd_sparse_launch(*launch_args, *lut)
+        else:
+            _mha_v4_fwd_sol_attn_launch(
+                *launch_args, *lut, *pooled, mean_k_scale, mean_v_scale
+            )
     return out
 
 
@@ -1490,4 +1693,98 @@ def mha_v4(
         out=out,
         return_lse=return_lse,
         **packed_lut,
+    )
+
+
+def mha_v4_sol_attn(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+    beta: float = 0.4,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
+    return_lse: bool = False,
+) -> Tensor:
+    """Quantize BF16 BSHD operands, route the blocks, and run non-causal Sol-Attn MHA v4.
+
+    Sol-Attn (arXiv 2607.24027) computes the above-threshold KV blocks exactly and recovers the
+    rest from pooled per-block K/V under the same online softmax, so dropping a block costs its
+    higher-order terms rather than all of its mass. ``beta`` sets the threshold at
+    ``mean_j(proxy) + beta * std_j(proxy)`` per query tile, so it selects a block *density* rather
+    than a block count: larger beta keeps fewer blocks exact and leans harder on the correction.
+
+    Unlike ``mha_v4(block_mask=...)`` the selection is not the caller's to pass, because routing
+    has to see the quantized K that the kernel will read. Everything here is traceable, so this
+    composes under torch.compile(fullgraph=True).
+
+    Only recipes with a mode-2 manifest row are supported: the pooled K/V are pooled in the source
+    dtype and reuse the source descales, which holds for per-tensor scales but not for the
+    block-granular MX ones, which would need pooled scales of their own.
+    """
+    if return_lse:
+        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
+    is_fp8_recipe = (
+        q_format in _FP8_FORMATS and k_format == q_format and v_format == q_format
+    )
+    is_i8fp8_recipe = (
+        q_format == AttentionFormat.INT8
+        and k_format == q_format
+        and _is_fp8_format(v_format)
+    )
+    if not (is_fp8_recipe or is_i8fp8_recipe):
+        raise NotImplementedError(
+            "Sol-Attn MHA v4 currently has manifest rows for the per-tensor FP8 and i8fp8 "
+            f"recipes only; got Q={q_format.name}, K={k_format.name}, V={v_format.name}"
+        )
+    out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_sol_attn")
+    q_scale_mode, k_scale_mode, v_scale_mode = scale_modes_for_formats(
+        q_format, k_format, v_format
+    )
+
+    if is_i8fp8_recipe:
+        q_quantized, q_descale = quantize_int8(q)
+        k_quantized, k_descale = quantize_int8(k)
+    else:
+        q_quantized, q_descale = quantize_fp8_rotated(q)
+        k_quantized, k_descale = quantize_fp8_rotated(k)
+    v_quantized, v_descale = quantize_fp8(v)
+
+    # Routed from the quantized K/V, not the BF16 inputs: the proxy scores have to be the ones the
+    # kernel's exact pass will reproduce, or a block sitting within rounding distance of the
+    # threshold can be selected here and skipped there.
+    plan = sol_attn_prepare(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        beta=beta,
+        BLOCK_M=_MHA_V4_Q_TILE,
+        BLOCK_N=mha_v4_kv_tile(),
+        num_heads=q.shape[2],
+    )
+
+    return mha_v4_packed(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        softmax_scale=softmax_scale,
+        out=out,
+        return_lse=return_lse,
+        kv_block_indices=plan["kv_block_indices"],
+        lut_start=plan["lut_start"],
+        lut_count=plan["lut_count"],
+        mean_k=plan["mean_k"],
+        mean_v=plan["mean_v"],
+        block_bitmap=plan["block_bitmap"],
     )

@@ -24,6 +24,7 @@ import torch
 import torch._dynamo
 
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.attention.utils import (
     SOL_ATTN_TS_KV,
     SOL_ATTN_TS_QO,
@@ -336,3 +337,176 @@ def test_no_graph_breaks_and_routing_is_in_the_graph():
         f"graph breaks: {[str(r) for r in explained.break_reasons]}"
     )
     assert explained.graph_count == 1
+
+
+@pytest.mark.skipif(
+    get_gfx() != "gfx950", reason="the MXFP4 packers are gfx950 kernels"
+)
+def test_packed_path_compiles_fullgraph_and_matches_eager():
+    """The packed path reaches production packers and rebuilds strided views over raw buffers.
+
+    None of that is obviously traceable -- it calls out to custom ops and lands on torch.as_strided
+    for both the K/V views and the V-scale slack -- so the same fullgraph requirement the rest of
+    this suite pins for the ordinary path is pinned here. Strides are compared as well as values,
+    because a view rebuilt with the right contents and the wrong stride would still feed the kernel
+    a wrong descriptor.
+    """
+    batch, seqlen_k, nhead = 1, 16 * SOL_ATTN_TS_KV, 2
+    q = torch.randn(batch, 512, nhead, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nhead, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    kwargs = dict(
+        k_source=k, v_source=v, k_packed_format="mxfp4", v_packed_format="mxfp4"
+    )
+
+    eager = sol_attn_prepare(q, k, v, BETA, **kwargs)
+    compiled = torch.compile(sol_attn_prepare, fullgraph=True, dynamic=False)(
+        q, k, v, BETA, **kwargs
+    )
+
+    for name in ("mean_k", "mean_v", "mean_k_scale", "mean_v_scale"):
+        assert eager[name] is not None, name
+        assert compiled[name].shape == eager[name].shape, name
+        assert compiled[name].stride() == eager[name].stride(), name
+        assert torch.equal(compiled[name], eager[name]), name
+
+    # The V-scale gather reads a tile past the image, so the slack has to be real storage.
+    scale = eager["mean_v_scale"]
+    slack = scale.untyped_storage().size() - scale.numel() * scale.element_size()
+    assert slack >= 512, f"only {slack} bytes of slack behind the pooled V scale"
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        (dict(k_packed_format="mxfp4"), "k_source and k_packed_format go together"),
+        (dict(v_source="v"), "v_source and v_packed_format go together"),
+        (dict(k_packed_format="fp3", k_source="k"), "is not one of"),
+    ],
+)
+def test_packed_path_rejects_an_incoherent_request(kwargs, message):
+    """A packed operand needs both its source and its format; neither implies the other."""
+    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    resolved = {
+        key: {"k": k, "v": v}.get(value, value) for key, value in kwargs.items()
+    }
+    with pytest.raises(ValueError, match=message):
+        sol_attn_prepare(q, k, v, BETA, **resolved)
+
+
+@pytest.mark.skipif(
+    get_gfx() != "gfx950", reason="the MXFP4 packers are gfx950 kernels"
+)
+def test_packed_path_rejects_a_stored_scale_it_cannot_pool():
+    """A packed operand is quantized again from its source, so a stored scale has no meaning here.
+
+    Accepting one silently would be the bad failure: the pooled tensor would come back correct and
+    the argument would simply have been ignored.
+    """
+    batch, seqlen_k, nhead = 1, 2 * SOL_ATTN_TS_KV, 2
+    q = torch.randn(batch, 256, nhead, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nhead, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    scale = torch.full(
+        (batch, seqlen_k, nhead, 4), 127, dtype=torch.uint8, device="cuda"
+    )
+
+    with pytest.raises(ValueError, match="k_scale does not apply to a packed operand"):
+        sol_attn_prepare(
+            q, k, v, BETA, k_scale=scale, k_source=k, k_packed_format="mxfp4"
+        )
+
+
+@pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
+def test_a_supplied_mask_replaces_routing_and_leaves_pooling_alone(
+    batch, seqlen_q, seqlen_k, nhead_q, nhead_kv
+):
+    """A supplied selection must reach BOTH consumed forms, and must not disturb the pooled K/V.
+
+    The split matters: pooling reduces the sequence axis and knows nothing about selection, so a
+    supplied mask has to change the LUT and the bitmap and nothing else. If it perturbed the pooled
+    tensors, timing a Sol-Attn row against a sparse row over one mask would no longer be comparing
+    the same approximate work, and a caller supplying a fixed pattern would silently get different
+    pooled operands than the routed path builds.
+    """
+    q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
+    routed = sol_attn_prepare(q, k, v, BETA)
+    num_q_tiles, num_kv_blocks = routed["num_q_tiles"], routed["num_kv_blocks"]
+
+    torch.manual_seed(7)
+    supplied = (
+        torch.rand(batch, nhead_q, num_q_tiles, num_kv_blocks, device="cuda") > 0.5
+    )
+    prep = sol_attn_prepare(q, k, v, block_attn_mask=supplied)
+
+    for name in ("mean_k", "mean_v"):
+        assert torch.equal(prep[name], routed[name]), f"{name} depends on the selection"
+
+    used = prep["block_attn_mask"]
+    flat = used.reshape(-1, num_kv_blocks)
+    assert torch.equal(prep["lut_count"], flat.sum(-1, dtype=torch.int32))
+    total = int(prep["lut_count"].sum())
+    assert torch.equal(
+        prep["kv_block_indices"][:total], flat.nonzero()[:, 1].to(torch.int32)
+    ), "the LUT does not list the supplied mask's blocks"
+
+    bits = prep["block_bitmap"].to(torch.int64)
+    unpacked = (
+        (bits.unsqueeze(-1) >> torch.arange(32, device=bits.device))
+        .bitwise_and(1)
+        .bool()
+        .reshape(bits.shape[0], -1)
+    )
+    assert torch.equal(unpacked[:, :num_kv_blocks], flat), "bitmap ignored the mask"
+
+    # Only the partial-tail column may differ from what was handed in.
+    if seqlen_k % SOL_ATTN_TS_KV == 0:
+        assert torch.equal(used, supplied)
+    else:
+        assert used[..., -1].all(), "a short tail block must be forced onto the exact pass"
+        assert torch.equal(used[..., :-1], supplied[..., :-1])
+
+
+def test_a_supplied_mask_and_beta_are_exclusive():
+    """Routing and a supplied selection are alternatives, so silently preferring one would hide a
+    caller's mistake: passing both usually means the mask was expected to win."""
+    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
+
+    with pytest.raises(ValueError, match="exactly one of beta"):
+        sol_attn_prepare(q, k, v, BETA, block_attn_mask=mask)
+    with pytest.raises(ValueError, match="exactly one of beta"):
+        sol_attn_prepare(q, k, v)
+
+
+@pytest.mark.parametrize(
+    "mask, message",
+    [
+        (torch.zeros(1, 2, 1, 2, dtype=torch.bool), "block_attn_mask must be"),
+        (torch.zeros(1, 2, 2, 3, dtype=torch.bool), "block_attn_mask must be"),
+        (torch.zeros(1, 2, 2, 2, dtype=torch.uint8), "must be bool"),
+    ],
+)
+def test_a_supplied_mask_is_shape_and_dtype_checked(mask, message):
+    """A wrongly shaped selection would reshape into the bitmap without complaint.
+
+    num_work_items * num_kv_blocks is the only thing the packing arithmetic needs, so a mask that
+    got num_q_tiles and num_kv_blocks the wrong way round, or carried a stale tile count, can pack
+    to the right total and scramble which block each bit refers to.
+    """
+    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    with pytest.raises(ValueError, match=message):
+        sol_attn_prepare(q, k, v, block_attn_mask=mask.cuda())
+
+
+def test_a_supplied_mask_stays_fullgraph_traceable():
+    """The supplied-mask branch must not cost the traceability the routed path is built around."""
+    q, k, v = _operands(1, 512, 4 * SOL_ATTN_TS_KV, 2, 2)
+    mask = torch.rand(1, 2, 2, 4, device="cuda") > 0.5
+
+    eager = sol_attn_prepare(q, k, v, block_attn_mask=mask)
+    compiled = torch.compile(sol_attn_prepare, fullgraph=True, dynamic=False)(
+        q, k, v, block_attn_mask=mask
+    )
+    for name in ("mean_k", "mean_v", "block_bitmap", "lut_start", "lut_count"):
+        assert torch.equal(compiled[name], eager[name]), name

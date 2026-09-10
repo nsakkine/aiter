@@ -154,6 +154,67 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_lut_count) == 0x2B0);
 static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_lut_freeze) == 0x2C0);
 static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 
+// Sol-Attn kernarg: the same sparse LUT prefix, then the pooled K/V of the approximate branch, the
+// selection bitmap, the pooled strides, and the pooled SCALES, padded to 1040.
+//
+// ptr_work_table keeps its 0x2D0 slot but stays NULL: Sol-Attn dispatches the dense 3-D grid, so
+// there is no work table to read. That slot is also why sorted dispatch and Sol-Attn are mutually
+// exclusive rather than merely redundant -- the sorted layout puts s_num_wgs/s_total_tiles at 0x2E0,
+// exactly where this one starts ptr_mean_k, so combining them needs those two scalars relocated
+// past 0x390 on both sides of the ABI.
+//
+// The pooled scales from 0x390 exist for the block-granular recipes. Pooling runs along the
+// SEQUENCE axis, so whether a descale survives it depends only on whether that descale varies along
+// that axis: per-tensor and per-channel ones do not, and mean(x) * descale == mean(x * descale)
+// lets the pooled K/V reuse the source descale outright. An E8M0 1x32 scale does vary per token, so
+// those recipes have to pool in dequantized space and requantize, which produces scales of its own
+// that the approximate pass must read instead of K's or V's. Recipes that do not need them leave
+// these slots NULL and keep reading the source scales.
+struct __attribute__((packed)) FmhaV4SolAttnKernarg
+{
+    FmhaV4Kernarg dense;
+    ConstPointerSlot ptr_kv_block_indices;
+    ConstPointerSlot ptr_lut_start;
+    ConstPointerSlot ptr_lut_count;
+    ConstPointerSlot ptr_lut_freeze;
+    ConstPointerSlot ptr_work_table;
+    ConstPointerSlot ptr_mean_k;
+    ConstPointerSlot ptr_mean_v;
+    ConstPointerSlot ptr_block_bitmap;
+    ScalarSlot s_mean_k_Seqs;
+    ScalarSlot s_mean_k_Hs;
+    ScalarSlot s_mean_k_Bs;
+    ScalarSlot s_mean_v_Seqs;
+    ScalarSlot s_mean_v_Hs;
+    ScalarSlot s_mean_v_Bs;
+    ScalarSlot s_num_kv_blocks;
+    ScalarSlot s_bitmap_Ds;
+    ConstPointerSlot ptr_mean_k_scale;
+    ConstPointerSlot ptr_mean_v_scale;
+    ScalarSlot s_mean_k_scale_Seqs;
+    ScalarSlot s_mean_k_scale_Hs;
+    ScalarSlot s_mean_k_scale_Bs;
+    ScalarSlot s_mean_v_scale_Seqs;
+    ScalarSlot s_mean_v_scale_Hs;
+    ScalarSlot s_mean_v_scale_Bs;
+};
+
+static_assert(sizeof(FmhaV4SolAttnKernarg) == 1040,
+              "MHA v4 Sol-Attn kernarg ABI must remain 1040 bytes");
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_kv_block_indices) == 0x290);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_work_table) == 0x2D0);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k) == 0x2E0);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_v) == 0x2F0);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_block_bitmap) == 0x300);
+static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_k_Seqs) == 0x310);
+static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_v_Seqs) == 0x340);
+static_assert(offsetof(FmhaV4SolAttnKernarg, s_num_kv_blocks) == 0x370);
+static_assert(offsetof(FmhaV4SolAttnKernarg, s_bitmap_Ds) == 0x380);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k_scale) == 0x390);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_v_scale) == 0x3A0);
+static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_k_scale_Seqs) == 0x3B0);
+static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_v_scale_Seqs) == 0x3E0);
+
 void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* name)
 {
     if(format == format_id(AttentionFormat::Bf16))
@@ -225,7 +286,7 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 v_scale_mode,
                 ", output=BF16, head_dim=128, mode=",
                 mode,
-                " (0=dense, 1=sorted-sparse)");
+                " (0=dense, 1=sorted-sparse, 2=sol-attn)");
 }
 
 void set_descale_strides(const at::Tensor& tensor,
@@ -372,7 +433,8 @@ build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhea
 // LUT contents are device data, so the launcher cannot check them without a synchronization. This
 // is therefore opt-in: off, an out-of-range index reaches the ASM and faults with only a raw address
 // to go on; on, it fails at the launcher with the offending condition named. A row with
-// lut_count == 0 is not an error: the ASM skips it and writes zeros for that query tile.
+// lut_count == 0 is not an error in either mode: sparse skips it and writes zeros for that query
+// tile, and Sol-Attn falls back to the pooled-only softmax over every block.
 enum LutError : int32_t
 {
     kLutNegative   = 1 << 0,
@@ -862,6 +924,248 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     size_t arg_size          = sizeof(args);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, 512, 1, 1, stream});
+}
+
+void fmha_v4_fwd_sol_attn(const at::Tensor& q,
+                          const at::Tensor& k,
+                          const at::Tensor& v,
+                          const at::Tensor& q_descale,
+                          const at::Tensor& k_descale,
+                          const at::Tensor& v_descale,
+                          at::Tensor out,
+                          int64_t q_format,
+                          int64_t k_format,
+                          int64_t v_format,
+                          int64_t q_scale_mode,
+                          int64_t k_scale_mode,
+                          int64_t v_scale_mode,
+                          double softmax_scale,
+                          const at::Tensor& kv_block_indices,
+                          const at::Tensor& lut_start,
+                          const at::Tensor& lut_count,
+                          const at::Tensor& mean_k,
+                          const at::Tensor& mean_v,
+                          const at::Tensor& block_bitmap,
+                          const std::optional<at::Tensor>& mean_k_scale,
+                          const std::optional<at::Tensor>& mean_v_scale)
+{
+    const auto shapes = validate_packed_mha_v4(q,
+                                               k,
+                                               v,
+                                               q_descale,
+                                               k_descale,
+                                               v_descale,
+                                               out,
+                                               q_format,
+                                               k_format,
+                                               v_format,
+                                               q_scale_mode,
+                                               k_scale_mode,
+                                               v_scale_mode);
+
+    const HipDeviceGuard device_guard{q.get_device()};
+
+    const auto arch = get_gpu_arch();
+    const auto& cfg = find_config(
+        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/2);
+    // Matches the sorted-sparse sibling, whose LUT machinery Sol-Attn reuses verbatim for its exact
+    // pass. sol_attn_prepare() does handle a ragged tail (it forces the short last block to be
+    // computed exactly, since the pooled x128 factor only holds for a full block), so this can be
+    // relaxed whenever the sparse restriction is.
+    TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
+                "Sol-Attn MHA v4 requires key length padded to a multiple of ",
+                cfg.ts_kv);
+
+    const int64_t q_tiles       = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int64_t kv_tiles      = shapes.seqlen_k / cfg.ts_kv;
+    const int64_t lut_rows      = shapes.batch * shapes.nhead_q * q_tiles;
+    const int64_t bitmap_groups = (kv_tiles + 127) / 128;
+    const int64_t bitmap_ds     = 4 * bitmap_groups;
+
+    TORCH_CHECK(kv_block_indices.is_cuda() && lut_start.is_cuda() && lut_count.is_cuda(),
+                "LUT tensors must be GPU tensors");
+    TORCH_CHECK(kv_block_indices.device() == q.device() && lut_start.device() == q.device() &&
+                    lut_count.device() == q.device(),
+                "LUT tensors must be on the same GPU as Q");
+    TORCH_CHECK(kv_block_indices.scalar_type() == at::ScalarType::Int &&
+                    lut_start.scalar_type() == at::ScalarType::Int &&
+                    lut_count.scalar_type() == at::ScalarType::Int,
+                "LUT tensors must be int32");
+    TORCH_CHECK(kv_block_indices.dim() == 1 && lut_start.dim() == 1 && lut_count.dim() == 1,
+                "LUT tensors must be 1-D");
+    TORCH_CHECK(lut_start.numel() == lut_rows && lut_count.numel() == lut_rows,
+                "lut_start and lut_count must have one entry per (batch, head, query tile); "
+                "expected ",
+                lut_rows);
+    TORCH_CHECK(kv_block_indices.numel() >= 1,
+                "kv_block_indices must be non-empty; the sparse kernels dereference the row base "
+                "even for a row that selects no KV block");
+
+    // The pooled tensors are K and V with seqlen -> num_kv_blocks, in the SOURCE quantized dtype,
+    // so the approximate pass reuses q/k/v_descale unchanged. That identity is what keeps the
+    // per-tensor recipes free; a block-granular scale mode would need its own pooled scales, which
+    // is why only per-tensor rows carry a mode-2 manifest entry today.
+    TORCH_CHECK(mean_k.is_cuda() && mean_v.is_cuda() && block_bitmap.is_cuda(),
+                "Sol-Attn pooled tensors and bitmap must be GPU tensors");
+    TORCH_CHECK(mean_k.device() == q.device() && mean_v.device() == q.device() &&
+                    block_bitmap.device() == q.device(),
+                "Sol-Attn pooled tensors and bitmap must be on the same GPU as Q");
+    TORCH_CHECK(mean_k.scalar_type() == k.scalar_type(),
+                "mean_k must have K's dtype so the approximate pass can reuse k_descale");
+    TORCH_CHECK(mean_v.scalar_type() == v.scalar_type(),
+                "mean_v must have V's dtype so the approximate pass can reuse v_descale");
+    TORCH_CHECK(mean_k.sizes() == torch::IntArrayRef({shapes.batch,
+                                                      kv_tiles,
+                                                      shapes.nhead_k,
+                                                      k.size(3)}),
+                "mean_k must have shape [batch, num_kv_blocks, key_heads, K packed width]");
+    TORCH_CHECK(mean_v.sizes() == torch::IntArrayRef({shapes.batch,
+                                                      kv_tiles,
+                                                      shapes.nhead_k,
+                                                      v.size(3)}),
+                "mean_v must have shape [batch, num_kv_blocks, key_heads, V head dim]");
+    TORCH_CHECK(mean_k.stride(3) == 1 && mean_v.stride(3) == 1,
+                "Sol-Attn pooled tensors must have contiguous last dimensions");
+    // One aligned 16-byte load per approximate tile at byte offset 16 * tile, so a row length that
+    // is not a multiple of 4 words would misalign every tile after the first.
+    TORCH_CHECK(block_bitmap.element_size() == 4 &&
+                    (block_bitmap.scalar_type() == at::ScalarType::UInt32 ||
+                     block_bitmap.scalar_type() == at::ScalarType::Int),
+                "block_bitmap must be a 32-bit integer tensor");
+    TORCH_CHECK(block_bitmap.dim() == 2 &&
+                    block_bitmap.sizes() == torch::IntArrayRef({lut_rows, bitmap_ds}),
+                "block_bitmap must have shape [batch * query_heads * query_tiles, "
+                "4 * ceil(num_kv_blocks / 128)]; expected [",
+                lut_rows,
+                ", ",
+                bitmap_ds,
+                "]");
+    TORCH_CHECK(block_bitmap.is_contiguous(), "block_bitmap must be contiguous");
+
+    // Whether an operand needs a pooled scale is decided by its scale mode, not by the caller: an
+    // E8M0 1x32 scale varies along the axis pooling reduces, so that operand had to be pooled in
+    // dequantized space and requantized, and the approximate pass must read the scale that came out
+    // of that rather than the source one. Anything that does not vary along the sequence axis
+    // survives pooling untouched, so passing a pooled scale for it would describe a read the kernel
+    // never performs.
+    const bool k_needs_pooled_scale =
+        k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    const bool v_needs_pooled_scale =
+        v_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    TORCH_CHECK(mean_k_scale.has_value() == k_needs_pooled_scale,
+                "Sol-Attn needs mean_k_scale exactly when K's scale mode is E8M0_PER_1X32; K's is ",
+                k_scale_mode);
+    TORCH_CHECK(mean_v_scale.has_value() == v_needs_pooled_scale,
+                "Sol-Attn needs mean_v_scale exactly when V's scale mode is E8M0_PER_1X32; V's is ",
+                v_scale_mode);
+    if(k_needs_pooled_scale)
+    {
+        const auto& ks = mean_k_scale.value();
+        TORCH_CHECK(ks.is_cuda() && ks.device() == q.device(),
+                    "mean_k_scale must be on the same GPU as Q");
+        TORCH_CHECK(ks.scalar_type() == at::ScalarType::Byte,
+                    "mean_k_scale must be a uint8 E8M0 tensor");
+        // Only num_kv_blocks rows carry meaning, but the height may be padded up to a whole tile.
+        // Some recipes read a full tile of scale bytes however short the pooled image is, and an
+        // uninitialized E8M0 byte of 0xFF is 2^128, which reaches QK as inf before the bitmap masks
+        // the column out. Those have to pass a zero-padded image, so accept either height.
+        const int64_t padded_rows = ((kv_tiles + 127) / 128) * 128;
+        TORCH_CHECK(ks.dim() == 4 && ks.size(0) == shapes.batch &&
+                        ks.size(2) == shapes.nhead_k && ks.size(3) == kHeadDim / 32 &&
+                        (ks.size(1) == kv_tiles || ks.size(1) == padded_rows),
+                    "mean_k_scale must have shape [batch, rows, key_heads, 4] with rows either "
+                    "num_kv_blocks (",
+                    kv_tiles,
+                    ") or that padded to a whole tile (",
+                    padded_rows,
+                    "), matching K's own scale image with key_length replaced by num_kv_blocks");
+        TORCH_CHECK(ks.stride(3) == 1, "mean_k_scale must have a contiguous last dimension");
+    }
+    if(v_needs_pooled_scale)
+    {
+        // The V-scale image is packed, not strided, and carries no stride slots of its own, so all
+        // it needs is a base with whole 128-row tiles behind it. Hence a size check only.
+        const auto& vs = mean_v_scale.value();
+        const int64_t pooled_tiles = (kv_tiles + 127) / 128;
+        TORCH_CHECK(vs.is_cuda() && vs.device() == q.device(),
+                    "mean_v_scale must be on the same GPU as Q");
+        TORCH_CHECK(vs.scalar_type() == at::ScalarType::Byte,
+                    "mean_v_scale must be a uint8 E8M0 tensor");
+        TORCH_CHECK(vs.sizes() ==
+                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, pooled_tiles * 512}),
+                    "mean_v_scale must have shape [batch, key_heads, "
+                    "ceil(num_kv_blocks / 128) * 512], matching V's own packed scale image with "
+                    "key_length replaced by num_kv_blocks");
+        TORCH_CHECK(vs.is_contiguous(), "mean_v_scale must be contiguous");
+    }
+
+    const auto kv_idx = kv_block_indices.contiguous();
+    const auto start  = lut_start.contiguous();
+    const auto count  = lut_count.contiguous();
+    if(lut_validation_enabled())
+    {
+        validate_lut_contents(kv_idx, start, count, lut_rows, kv_tiles);
+    }
+
+    FmhaV4SolAttnKernarg args{};
+    populate_dense_kernarg(args.dense,
+                           q,
+                           k,
+                           v,
+                           q_descale,
+                           k_descale,
+                           v_descale,
+                           out,
+                           cfg,
+                           q_format,
+                           shapes.seqlen_q,
+                           shapes.seqlen_k,
+                           shapes.nhead_q,
+                           shapes.gqa_ratio,
+                           softmax_scale);
+    args.ptr_kv_block_indices.value = kv_idx.data_ptr();
+    args.ptr_lut_start.value        = start.data_ptr();
+    args.ptr_lut_count.value        = count.data_ptr();
+    // ptr_work_table stays null: the grid below is the dense 3-D raster, so no workgroup decodes a
+    // work-table entry.
+    args.ptr_mean_k.value           = mean_k.data_ptr();
+    args.ptr_mean_v.value           = mean_v.data_ptr();
+    args.ptr_block_bitmap.value     = block_bitmap.data_ptr();
+    args.s_mean_k_Seqs.value        = mean_k.stride(1) * mean_k.element_size();
+    args.s_mean_k_Hs.value          = mean_k.stride(2) * mean_k.element_size();
+    args.s_mean_k_Bs.value          = mean_k.stride(0) * mean_k.element_size();
+    args.s_mean_v_Seqs.value        = mean_v.stride(1) * mean_v.element_size();
+    args.s_mean_v_Hs.value          = mean_v.stride(2) * mean_v.element_size();
+    args.s_mean_v_Bs.value          = mean_v.stride(0) * mean_v.element_size();
+    args.s_num_kv_blocks.value      = static_cast<uint32_t>(kv_tiles);
+    args.s_bitmap_Ds.value          = static_cast<uint32_t>(bitmap_ds);
+    // Left NULL for the per-tensor recipes, which is what keeps their scale reads on the source
+    // image. s_mean_v_scale_* stay unset on purpose: no recipe reads them, since the packed V-scale
+    // image needs only a base pointer.
+    if(mean_k_scale.has_value())
+    {
+        const auto& ks                  = mean_k_scale.value();
+        args.ptr_mean_k_scale.value     = ks.data_ptr();
+        args.s_mean_k_scale_Seqs.value  = ks.stride(1) * ks.element_size();
+        args.s_mean_k_scale_Hs.value    = ks.stride(2) * ks.element_size();
+        args.s_mean_k_scale_Bs.value    = ks.stride(0) * ks.element_size();
+    }
+    if(mean_v_scale.has_value())
+    {
+        args.ptr_mean_v_scale.value = mean_v_scale.value().data_ptr();
+    }
+
+    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
+    const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
+    auto& kernel                = kernels.get_or_create(
+        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
+
+    size_t arg_size          = sizeof(args);
+    const int gdx            = static_cast<int>(q_tiles);
+    const int gdy            = static_cast<int>(shapes.nhead_q);
+    const int gdz            = static_cast<int>(shapes.batch);
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, 512, 1, 1, stream});
 }
 
 } // namespace torch_itfs

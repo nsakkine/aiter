@@ -10,6 +10,9 @@ Dense BF16-output MHA v4 is implemented and validated on gfx950. Sorted block-sp
 deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8 have both dense
 and sorted-sparse rows under v4 (256×64 tiles).
 
+Sol-Attn (`mode=2`, see the Sol-Attn Contract below) ships for the gfx950 FP8, i8fp8, MXFP8 and
+MXFP4 recipes.
+
 The public raw and packed APIs support eight dense combinations:
 
 | Q/K | V | Output |
@@ -185,7 +188,9 @@ the complete recipe plus dtype, shape, and layout before launching. Call
 `scale_modes_for_formats()` for the production recipe rather than duplicating mode triples.
 The optional LUT triple (`kv_block_indices`, `lut_start`, `lut_count`) must be all set or all
 omitted; do not pass a dataclass and do not pass a mask to the packed API. Sparse launch uses
-manifest `mode=1`; the work table is built inside the sparse custom op.
+manifest `mode=1`; the work table is built inside the sparse custom op. Adding the pooled triple
+(`mean_k`, `mean_v`, `block_bitmap`) on top of the LUT triple selects Sol-Attn (`mode=2`) instead;
+it is likewise all-or-nothing, and is rejected without a LUT triple to correct.
 
 MX Q/K/V producers return contiguous raw buffers where the ASM layout is not an ordinary tensor
 layout. `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` reconstruct logical views. Raw buffers,
@@ -369,6 +374,116 @@ Sparse code objects live next to dense ones: `hsa/gfx950/fmha_v4_fwd/` (for exam
 
 Do not add optional LUT arguments to the dense MXFP4/MXFP6 launch custom ops; sparse MX goes
 through `mha_v4_packed` after reconstructing views.
+
+## Sol-Attn Contract
+
+Sol-Attn (arXiv 2607.24027) is `mode=2`, shipped for four gfx950 recipes: FP8
+(`fwd_hd128_fp8_sol_attn.co`), i8fp8 (`fwd_hd128_i8fp8_sol_attn.co`), MXFP8
+(`fwd_hd128_mxfp8_sol_attn.co`) and MXFP4 (`fwd_hd128_mxfp4_sol_attn.co`). Every mode-2 row shares
+one 1040-byte kernarg whose tail carries pooled scales; see Pooled Scales below for which rows fill
+them. It runs the same block-sparse exact pass as `mode=1` and then a
+second pass over pooled per-block K/V, masking off the blocks the LUT already covered, so a
+below-threshold block contributes its zeroth-order term instead of nothing. Both passes share one
+online-softmax state, which is what normalizes the two contributions under a single denominator.
+
+Raw API: `mha_v4_sol_attn(..., beta=0.4)`. Unlike `mha_v4(block_mask=...)` it takes no selection,
+because routing has to see the quantized K the kernel will read; `beta` sets the per-query-tile
+threshold at `mean_j(proxy) + beta * std_j(proxy)`, so it selects a block *density* rather than a
+block count.
+
+Packed API: the LUT triple plus `mean_k`, `mean_v`, `block_bitmap`, and for a block-granular
+operand its pooled scale.
+`aiter.ops.triton.attention.utils.sol_attn_prepare()` produces all of them from one boolean mask, so
+the bitmap and the LUT cannot disagree. It is fully traceable, so routing and launch compile as one
+graph. The pooled tensors are K and V with seqlen replaced by `num_kv_blocks`, in the source
+quantized dtype.
+
+At this level the selection *is* the caller's to pass: give `sol_attn_prepare()` either `beta` to
+route one or `block_attn_mask` to supply one, but not both. Pooling reduces the sequence axis and
+knows nothing about selection, so a supplied mask changes the LUT and the bitmap and nothing else --
+the pooled operands are identical either way. Supplying one does not turn the approximate branch
+off; the unselected blocks are still swept from the pooled K/V, which is the entire difference
+between this and a `mode=1` keep-or-drop launch over the same mask. A short tail block is forced
+onto the exact pass exactly as routing forces it, because the approximate branch scales every block
+by a constant full-block factor and cannot represent a partial one.
+
+That is what makes Sol-Attn measurable against the sparse row: at a fixed density the two differ
+only by the approximate pass, whereas comparing a routed Sol-Attn run against a dense one mostly
+measures whichever density `beta` happened to pick for that data. Swept from 10% to 100% density on
+an 8192 Wan-like shape, the approximate pass costs nothing outside +/-5% run-to-run noise, so
+Sol-Attn's speed is the sparsity's and its accuracy gain over keep-or-drop is close to free.
+
+### Pooled Scales
+
+Pooling reduces the SEQUENCE axis, so whether a descale survives it depends only on whether that
+descale varies along that axis. Per-tensor and per-channel ones do not, and
+`mean(x) * descale == mean(x * descale)` lets the pooled operand reuse the source descale outright:
+FP8 and i8fp8 are per-tensor throughout, so both leave the pooled scale slots NULL. An E8M0 1x32
+scale does vary per token, so that operand pools in dequantized space and requantizes, producing a
+scale of its own that the approximate pass must read instead of the source one. MXFP8 is that case
+on K and per-tensor on V, so it passes `mean_k_scale` and no `mean_v_scale`. MXFP4 is E8M0 on all
+three operands and so fills both slots.
+
+Pass `k_scale` / `v_scale` to `sol_attn_prepare()` for exactly the operands whose scale mode is
+`E8M0_PER_1X32`; it returns `mean_k_scale` / `mean_v_scale` for those and `None` for the rest, which
+is what `mha_v4_packed` forwards. The requirement is checked against the scale modes rather than
+trusted: a NULL slot is not an error state but an instruction to keep reading the source scale
+image, so a missing pooled scale would otherwise read plausible-looking wrong exponents rather than
+fail. `mean_k_scale` is uint8 `[batch, rows, key_heads, 4]`, K's own scale image with `key_length`
+replaced by `num_kv_blocks`. Only `num_kv_blocks` rows carry meaning, but `rows` may be that padded
+up to a whole tile, and for MXFP4 it must be: that row may read a whole tile of scale bytes however
+short the pooled image is, and an uninitialized E8M0 byte of `0xFF` is 2^128, which reaches the QK
+product as `inf` before the bitmap masks the column out. Zero-fill the padding.
+`mean_v_scale` is uint8 `[batch, key_heads, ceil(num_kv_blocks / 128) * 512]`: the V-scale image is
+packed rather than strided and carries no stride slots of its own, so whole 128-row tiles must sit
+behind its base. It may also be read past the end of the pooled image, which is small enough for
+that to leave the allocation entirely, so back it with 512 bytes of slack.
+
+MXFP4's operands take a different route into `sol_attn_prepare()`, because its stored codes are not
+element addressable: they are four bits packed two to a byte and then permuted, so a plain nibble
+decode does not recover them, and V's logical view carries 128 elements over a 64-byte row stride --
+an aliased descriptor rather than an indexable tensor. Such an operand cannot be pooled from what the
+kernel reads at all. Name it in
+`k_packed_format` / `v_packed_format` and pass its pre-quantization tensor as `k_source` /
+`v_source`; pooling then runs on the source and quantizes once through `quantize_mxfp4_k` /
+`quantize_v_mxfp4`, which tile at 128 rows for any length and so return the layout the operand
+already has. The operand's own `k_scale` / `v_scale` must be omitted, since there is no stored scale
+to pool. Routing scores `q` the same way, so a packed Q must also be passed pre-quantization; scale
+invariance and the packers' orthogonal Hadamard rotation are what make that equivalent. Because such
+a pooled tensor cannot be read back and dequantized either, `sol_attn_prepare()` also returns
+`mean_k_pooled` / `mean_v_pooled`, the values it quantized, which is what a reference should pool
+over.
+
+Pooling the source and rounding once is also the more accurate of the two orders -- relative L2
+against the ideal pooled mean 0.12, against 0.17 for rounding before pooling -- but the difference
+does not reach the output, the two landing within 0.003 cosine of each other end to end.
+
+MXFP4's mode-2 row declares an all-MXFP4 signature, whereas its mode-0 and mode-1 rows declare a
+per-channel FP8 V. That row's signature is also f4f4's, so f4f4 cannot gain a mode-2 row while both
+are in the manifest.
+`block_bitmap` is uint32 `[batch * query_heads * query_tiles, 4 * ceil(num_kv_blocks / 128)]`; the
+row length rounds up to whole 128-block groups because one group is read per approximate tile as a
+single aligned 16-byte load, and the bits at and above `num_kv_blocks` are **set**, which is what
+clips the last tile's overhang and removes the need for a masked-tail path.
+
+A LUT row may select nothing, as in sparse, though it means something different here: with no exact
+block to establish the row's softmax max, the approximate pass still recovers it, so the row lands on
+the pooled-only softmax over every block rather than on a zero tile. Measured at cosine ~0.9997
+against the reference with every row of the LUT empty.
+
+Note this is the pooled-only *approximation* of that row, not its exact attention, so it is a
+graceful floor rather than a free lunch. `sol_attn_prepare()` keeps the highest-proxy block exact
+regardless, for accuracy rather than for safety.
+
+Sol-Attn dispatches the dense 3-D grid, not sorted dispatch. Threshold routing self-normalizes the
+per-row block counts (measured max/mean 1.11 at beta 0.4 and 1.18 at beta 1.0 on Wan shapes), so
+list scheduling recovers only 1.7-4%, less than the grid overhead it costs. The two are also
+mutually exclusive in the ABI: the sorted layout's scheduling fields occupy 0x2E0, exactly where the
+Sol-Attn layout starts `ptr_mean_k`.
+
+Key length must be a multiple of the KV tile, matching `mode=1`. `sol_attn_prepare()` does handle a
+ragged tail -- it forces the short last block exact, since the approximate pass weights every block by
+a constant full-block factor -- so this can be relaxed whenever the sparse restriction is.
 
 ### VSA Compatibility
 
