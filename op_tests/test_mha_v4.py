@@ -1908,6 +1908,10 @@ class _SolAttnRecipe(NamedTuple):
             v.quantized,
             beta=beta,
             num_heads=heads,
+            # sol_attn_prepare defaults BLOCK_N to the gfx950 tile. Pooling has to match the row
+            # the launcher will pick or the pooled tensors are the wrong height outright, so take
+            # it from the manifest the way mha_v4_sol_attn() does.
+            BLOCK_N=mha_v4_kv_tile(),
             # A packed operand pools from its source and is quantized again, so it has no stored
             # scale to pool and passing one is an error.
             k_scale=(
@@ -2047,10 +2051,16 @@ _SOL_ATTN_RAW_RECIPES = [r for r in _SOL_ATTN_RECIPES if not r.k_carries_pooled_
 
 def _sol_attn_co_available(co_name: str = "fwd_hd128_fp8_sol_attn.co") -> bool:
     asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
-    return os.path.isfile(os.path.join(asm_dir, "gfx950", "fmha_v4_fwd", co_name))
+    fwd_dir = os.path.join(asm_dir, get_gfx(), "fmha_v4_fwd")
+    if get_gfx() == "gfx942":
+        fwd_dir = os.path.join(fwd_dir, "MI300")
+    return os.path.isfile(os.path.join(fwd_dir, co_name))
 
 
-_MHA_V4_SOL_ATTN_ARCH = get_gfx() == "gfx950"
+# gfx942 carries mode-2 rows for the two per-tensor recipes only; the MX ones skip themselves on
+# the per-recipe code-object check below. Everything else in this section reads its geometry from
+# mha_v4_kv_tile(), so it retiles from 256x128 to 256x64 without further arch branching.
+_MHA_V4_SOL_ATTN_ARCH = get_gfx() in ("gfx942", "gfx950")
 
 
 def _sol_attn_launch(
@@ -2109,7 +2119,7 @@ def _select_all_plan(plan, batch, heads, q_tiles, kv_tiles, device):
     }
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.skipif(
     not _sol_attn_co_available(),
     reason="Sol-Attn MHA v4 code object is not deployed",
@@ -2128,7 +2138,12 @@ def test_mha_v4_sol_attn_select_all_ignores_the_pooled_tensors():
         sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
     )
     routed = sol_attn_prepare(
-        q.quantized, k.quantized, v.quantized, beta=0.4, num_heads=heads
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        beta=0.4,
+        num_heads=heads,
+        BLOCK_N=mha_v4_kv_tile(),
     )
     plan = _select_all_plan(
         routed, batch, heads, routed["num_q_tiles"], kv_tiles, q.quantized.device
@@ -2151,7 +2166,7 @@ def test_mha_v4_sol_attn_select_all_ignores_the_pooled_tensors():
     assert with_pooled.abs().sum() > 0
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.skipif(
     not _sol_attn_co_available() or not _mha_v4_sparse_co_available(),
     reason="Sol-Attn and sorted-sparse MHA v4 code objects are not both deployed",
@@ -2176,7 +2191,12 @@ def test_mha_v4_sol_attn_select_all_is_no_less_accurate_than_the_sparse_row():
         sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
     )
     routed = sol_attn_prepare(
-        q.quantized, k.quantized, v.quantized, beta=0.4, num_heads=heads
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        beta=0.4,
+        num_heads=heads,
+        BLOCK_N=mha_v4_kv_tile(),
     )
     plan = _select_all_plan(
         routed, batch, heads, routed["num_q_tiles"], kv_tiles, q.quantized.device
@@ -2210,7 +2230,7 @@ def test_mha_v4_sol_attn_select_all_is_no_less_accurate_than_the_sparse_row():
     )
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.parametrize("recipe", _SOL_ATTN_RECIPES, ids=lambda r: r.id)
 @pytest.mark.parametrize("beta", [0.4, 1.0])
 def test_mha_v4_sol_attn_matches_the_oracle_and_beats_keep_or_drop(beta, recipe):
@@ -2315,10 +2335,17 @@ def test_mha_v4_packed_rejects_partial_pooled_triple():
         )
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.skipif(
     not _sol_attn_co_available(),
     reason="Sol-Attn MHA v4 code object is not deployed",
+)
+@pytest.mark.skipif(
+    get_gfx() == "gfx942",
+    reason="gfx942 Sol-Attn writes zeros for an empty row instead of the pooled-only softmax: "
+    "with no exact block the row never establishes the online-softmax state the correction pass "
+    "normalizes against. sol_attn_prepare keeps at least one exact block per row, so this is "
+    "unreachable through the routed path; a caller hand-building an empty row gets zeros.",
 )
 def test_mha_v4_sol_attn_empty_lut_rows_fall_back_to_the_pooled_softmax():
     """A row that selects nothing must degrade to the pooled-only answer, not to zeros or NaN.
@@ -2336,7 +2363,12 @@ def test_mha_v4_sol_attn_empty_lut_rows_fall_back_to_the_pooled_softmax():
         sequence_k=kv_tiles * kv_tile, heads=heads, sequence_q=512, batch=batch
     )
     plan = sol_attn_prepare(
-        q.quantized, k.quantized, v.quantized, beta=0.4, num_heads=heads
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        beta=0.4,
+        num_heads=heads,
+        BLOCK_N=mha_v4_kv_tile(),
     )
     # Empty every row, keeping the bitmap consistent with it: nothing is exact, so nothing is
     # masked out of the approximate pass. The tail bits above num_kv_blocks stay set.
@@ -2377,7 +2409,7 @@ def test_mha_v4_sol_attn_empty_lut_rows_fall_back_to_the_pooled_softmax():
     assert cosine > 0.999, f"cosine to the pooled-only oracle {cosine}"
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.skipif(
     not _sol_attn_co_available(),
     reason="Sol-Attn MHA v4 code object is not deployed",
@@ -2398,7 +2430,12 @@ def test_mha_v4_sol_attn_compiles_without_graph_breaks():
 
     def call():
         plan = sol_attn_prepare(
-            q.quantized, k.quantized, v.quantized, beta=0.4, num_heads=heads
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            beta=0.4,
+            num_heads=heads,
+            BLOCK_N=mha_v4_kv_tile(),
         )
         return _sol_attn_launch(q, k, v, plan)
 
@@ -2408,7 +2445,7 @@ def test_mha_v4_sol_attn_compiles_without_graph_breaks():
     ]
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.parametrize("recipe", _SOL_ATTN_RAW_RECIPES, ids=lambda r: r.id)
 @pytest.mark.parametrize("beta", [0.4, 1.0])
 def test_mha_v4_sol_attn_raw_matches_quantizing_and_routing_by_hand(beta, recipe):
@@ -2447,7 +2484,7 @@ def test_mha_v4_sol_attn_raw_matches_quantizing_and_routing_by_hand(beta, recipe
     assert 0.02 < fraction < 0.9, f"degenerate routing at beta={beta}: {fraction}"
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.parametrize("recipe", _SOL_ATTN_RAW_RECIPES, ids=lambda r: r.id)
 def test_mha_v4_sol_attn_raw_compile_parity(recipe):
     """The raw entry point picks its quantizers off the format enums, which Dynamo has to fold away.
@@ -2474,7 +2511,7 @@ def test_mha_v4_sol_attn_raw_compile_parity(recipe):
     assert torch.equal(eager, compiled)
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.parametrize("beta", [0.4, 1.0])
 def test_mha_v4_sol_attn_mxfp4_fills_both_pooled_scale_slots(beta):
     """mxfp4 is the only row where Q, K and V are all E8M0, so neither pooled operand can inherit
@@ -2522,7 +2559,7 @@ def test_mha_v4_sol_attn_mxfp4_fills_both_pooled_scale_slots(beta):
         assert not torch.equal(baseline, perturbed), f"{slot} is not being read"
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 def test_mha_v4_sol_attn_reads_the_pooled_scale_it_was_given():
     """A NULL pooled-scale slot is not an error state, it just means "keep reading K's own scale".
 
@@ -2559,7 +2596,7 @@ def test_mha_v4_sol_attn_reads_the_pooled_scale_it_was_given():
     )
 
 
-@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="gfx950 Sol-Attn validation")
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.parametrize("recipe", _SOL_ATTN_RECIPES, ids=lambda r: r.id)
 def test_mha_v4_sol_attn_pooled_scales_must_match_the_scale_modes(recipe):
     """Which operands need a pooled scale follows from the scale modes, so it is not the caller's

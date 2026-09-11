@@ -11,7 +11,8 @@ deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8 ha
 and sorted-sparse rows under v4 (256×64 tiles).
 
 Sol-Attn (`mode=2`, see the Sol-Attn Contract below) ships for the gfx950 FP8, i8fp8, MXFP8 and
-MXFP4 recipes.
+MXFP4 recipes, and for the gfx942 FP8 and i8fp8 ones. The two MX recipes are gfx950-only: their
+pooled operands need block-granular scales, and MX quantization itself is gfx950-only.
 
 The public raw and packed APIs support eight dense combinations:
 
@@ -379,7 +380,14 @@ through `mha_v4_packed` after reconstructing views.
 
 Sol-Attn (arXiv 2607.24027) is `mode=2`, shipped for four gfx950 recipes: FP8
 (`fwd_hd128_fp8_sol_attn.co`), i8fp8 (`fwd_hd128_i8fp8_sol_attn.co`), MXFP8
-(`fwd_hd128_mxfp8_sol_attn.co`) and MXFP4 (`fwd_hd128_mxfp4_sol_attn.co`). Every mode-2 row shares
+(`fwd_hd128_mxfp8_sol_attn.co`) and MXFP4 (`fwd_hd128_mxfp4_sol_attn.co`), and for the two
+per-tensor gfx942 recipes, whose objects sit under `hsa/gfx942/fmha_v4_fwd/MI300/` beside the
+sparse ones. The gfx942 rows pool 64 KV rows per block against gfx950's 128, following `ts_kv`,
+and the kernel folds that block size into its softmax bias as a constant, so a caller that pools
+at any other value is silently wrong rather than refused; take it from `mha_v4_kv_tile()`.
+A gfx942 query tile that selects no block at all keeps the zero output the sparse row writes
+instead of falling back to the pooled-only softmax, which routing makes unreachable by keeping the
+highest-proxy block per row. Every mode-2 row shares
 one 1040-byte kernarg whose tail carries pooled scales; see Pooled Scales below for which rows fill
 them. It runs the same block-sparse exact pass as `mode=1` and then a
 second pass over pooled per-block K/V, masking off the blocks the LUT already covered, so a
