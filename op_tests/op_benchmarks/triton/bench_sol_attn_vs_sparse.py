@@ -147,6 +147,11 @@ def time_pair(operands, mask, warmup, rep):
         q_quant,
         k_quant,
         v_quant,
+        # The manifest's KV tile, not the default: gfx942 re-tiles to 64 where gfx950 uses
+        # 128, and the mask this is handed was built at the manifest's size. Leaving it
+        # defaulted made the two disagree by a factor of two and the call fail outright,
+        # which is why this bench only ever ran on gfx950.
+        BLOCK_N=mha_v4_kv_tile(),
         block_attn_mask=mask,
         **operands["prepare_kwargs"],
     )
