@@ -1853,6 +1853,18 @@ def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
     return min(g, kv_cap) if kv_cap > 0 else 0
 
 
+# Module level rather than nested in _flash_attn_forward: defining an annotated function inside a
+# traced region makes Dynamo evaluate the annotation, and it cannot wrap the types.UnionType that
+# `torch.Tensor | None` produces, so a compiled caller breaks on the def rather than on any call.
+# At module scope the annotation is evaluated once at import, out of tracing's way.
+def _validate_cu(name: str, x: torch.Tensor | None):
+    if x is None:
+        return
+    assert x.dim() == 1, f"{name} must be 1D"
+    assert x.dtype in (torch.int32, torch.int64), f"{name} must be int32/int64"
+    # Lightweight monotonicity / length check deferred until integration point.
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2082,13 +2094,6 @@ def _flash_attn_forward(
 
     # Validate newly added optional cumulative length / padded arrays if provided.
     # They are currently only plumbed through for future CK support enabling per-batch padding.
-    def _validate_cu(name: str, x: torch.Tensor | None):
-        if x is None:
-            return
-        assert x.dim() == 1, f"{name} must be 1D"
-        assert x.dtype in (torch.int32, torch.int64), f"{name} must be int32/int64"
-        # Lightweight monotonicity / length check deferred until integration point.
-
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
