@@ -469,6 +469,7 @@ def sol_attn_prepare(
     k_packed_format: str | None = None,
     v_packed_format: str | None = None,
     block_attn_mask: torch.Tensor | None = None,
+    force_block_mask: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """
     Build every host-side input of the gfx950 Sol-Attn kernel (arXiv 2607.24027) from Q and the
@@ -499,6 +500,16 @@ def sol_attn_prepare(
         approximate branch scales every block by a constant full-block factor and so cannot
         represent a short one. That is a kernel requirement rather than a preference, so it is
         applied to a supplied mask rather than rejected.
+    force_block_mask: bool, broadcastable to block_attn_mask's shape and ending in num_kv_blocks,
+        OR-ed into whichever selection was used. Unlike block_attn_mask this composes with beta
+        rather than replacing it: route as normal, then insist on these blocks as well.
+
+        It exists for a caller whose sequence is not homogeneous. Routing compares each block
+        against a threshold built from the mean and standard deviation over ALL blocks, so a
+        minority of the sequence -- one modality in a packed multimodal sequence, say -- competes
+        against a distribution the majority defines, and loses on blocks its own queries needed.
+        Naming those blocks costs one exact block each, which is cheap exactly when it is needed,
+        because the modality that gets outvoted is the small one.
     num_heads: optional cross-check on nheads_q.
     k_scale, v_scale: that operand's E8M0 1x32 scale image, (batch, seqlen_k, nheads_kv, d // 32)
         uint8, for the block-granular recipes. Pass it ONLY when the operand's scale mode is
@@ -628,6 +639,18 @@ def sol_attn_prepare(
                 num_kv_blocks,
             ).bool()
             block_attn_mask = block_attn_mask | tail
+
+    if force_block_mask is not None:
+        if force_block_mask.dtype != torch.bool:
+            raise ValueError(
+                f"force_block_mask must be bool, got {force_block_mask.dtype}"
+            )
+        if force_block_mask.shape[-1] != num_kv_blocks:
+            raise ValueError(
+                f"force_block_mask must end in num_kv_blocks={num_kv_blocks}, got "
+                f"{tuple(force_block_mask.shape)}"
+            )
+        block_attn_mask = block_attn_mask | force_block_mask
 
     kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
         block_attn_mask
