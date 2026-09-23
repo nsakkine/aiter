@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import csv
 import os
 from collections.abc import Callable
 from typing import NamedTuple
@@ -15,10 +16,14 @@ from aiter.jit.core import AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     MHA_V4_LOG2E,
+    MHA_V4_SOL_ATTN_MODE,
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
+    mha_v4_block_tile,
+    mha_v4_block_tiles,
     mha_v4_kv_tile,
+    mha_v4_kv_tile_for_q_tile,
     mha_v4_mxfp8,
     mha_v4_packed,
     mha_v4_q_multiplier,
@@ -1675,8 +1680,8 @@ _EMPTY_ROW_LAUNCHES = [
 def test_mha_v4_sparse_empty_row_writes_zeros(launch):
     """An all-False row selects no KV block, so its output tile must be zero, not garbage.
 
-    Its lut_start also sits one past the last kv_block_indices entry, which is what used to walk
-    the prologue's unguarded reads into a multi-gigabyte scalar offset and fault the kernel.
+    Its lut_start also sits one past the last kv_block_indices entry, which is what used to send
+    the row's reads far out of bounds and fault the kernel.
     """
     heads = 2
     kv_tiles = 4
@@ -1897,9 +1902,10 @@ class _SolAttnRecipe(NamedTuple):
             _Operand(*self.quantize_v(v), v if keep else None),
         )
 
-    def prepare(self, q, k, v, beta, heads):
+    def prepare(self, q, k, v, beta, heads, block_tile=None):
         """Route and pool. K's scale goes in only when pooling cannot preserve it."""
         packed = self.packed_format
+        tile_m, tile_n = mha_v4_block_tile() if block_tile is None else block_tile
         return sol_attn_prepare(
             # Routing scores Q, and a packed Q is not element addressable either, so a packed
             # recipe routes on its source. Scale invariance is what makes that equivalent.
@@ -1911,7 +1917,8 @@ class _SolAttnRecipe(NamedTuple):
             # sol_attn_prepare defaults BLOCK_N to the gfx950 tile. Pooling has to match the row
             # the launcher will pick or the pooled tensors are the wrong height outright, so take
             # it from the manifest the way mha_v4_sol_attn() does.
-            BLOCK_N=mha_v4_kv_tile(),
+            BLOCK_M=tile_m,
+            BLOCK_N=tile_n,
             # A packed operand pools from its source and is quantized again, so it has no stored
             # scale to pool and passing one is an error.
             k_scale=(
@@ -1985,6 +1992,16 @@ def _fp8_recipe():
 _FP8_SOL_ATTN_RECIPE = _fp8_recipe()
 
 
+def _quantize_bf16(t):
+    """Store a BF16 operand as-is.
+
+    The kernel's NONE scale mode makes the descale a placeholder it never reads, but the recipe's
+    dequantize() path multiplies by it unconditionally, so hand back a unit scalar rather than
+    special-casing the reference.
+    """
+    return t, torch.ones((), dtype=torch.float32, device=t.device)
+
+
 def _mxfp8_quantize_q(q):
     return quantize_mxfp8_q(q, mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE))
 
@@ -2007,6 +2024,29 @@ def _mxfp4_quantize_v(v):
 
 _SOL_ATTN_RECIPES = [
     _FP8_SOL_ATTN_RECIPE,
+    # The two BF16 Q/K rows. Neither pools anything it cannot reuse a source scale for -- bf16 has
+    # no scale at all and bf16fp8's V descale is per-tensor -- so both leave the kernarg's pooled
+    # scale slots NULL. They also tile KV at 64 while routing on 128-token blocks, which is the
+    # manifest's business rather than this test's: everything here reads the tile back from it.
+    _SolAttnRecipe(
+        id="bf16",
+        co_name="fwd_hd128_bf16_sol_attn.co",
+        qk_format=AttentionFormat.BF16,
+        qk_scale_mode=AttentionScaleMode.NONE,
+        quantize_q=_quantize_bf16,
+        quantize_k=_quantize_bf16,
+        quantize_v=_quantize_bf16,
+        v_format=AttentionFormat.BF16,
+        v_scale_mode=AttentionScaleMode.NONE,
+    ),
+    _SolAttnRecipe(
+        id="bf16fp8",
+        co_name="fwd_hd128_bf16fp8_sol_attn.co",
+        qk_format=AttentionFormat.BF16,
+        qk_scale_mode=AttentionScaleMode.NONE,
+        quantize_q=_quantize_bf16,
+        quantize_k=_quantize_bf16,
+    ),
     _SolAttnRecipe(
         id="i8fp8",
         co_name="fwd_hd128_i8fp8_sol_attn.co",
@@ -2064,7 +2104,15 @@ _MHA_V4_SOL_ATTN_ARCH = get_gfx() in ("gfx942", "gfx950")
 
 
 def _sol_attn_launch(
-    q, k, v, plan, mean_k=None, mean_v=None, block_bitmap=None, recipe=None
+    q,
+    k,
+    v,
+    plan,
+    mean_k=None,
+    mean_v=None,
+    block_bitmap=None,
+    recipe=None,
+    block_tile=None,
 ):
     """Launch the Sol-Attn row over a sol_attn_prepare() plan, overriding tensors if asked."""
     recipe = _FP8_SOL_ATTN_RECIPE if recipe is None else recipe
@@ -2089,6 +2137,7 @@ def _sol_attn_launch(
         block_bitmap=plan["block_bitmap"] if block_bitmap is None else block_bitmap,
         mean_k_scale=plan["mean_k_scale"],
         mean_v_scale=plan["mean_v_scale"],
+        block_tile=block_tile,
     )
 
 
@@ -2471,7 +2520,7 @@ def test_mha_v4_sol_attn_raw_matches_quantizing_and_routing_by_hand(beta, recipe
     operands = (
         _Operand(*recipe.quantize_q(q)),
         _Operand(*recipe.quantize_k(k)),
-        _Operand(*quantize_fp8(v)),
+        _Operand(*recipe.quantize_v(v)),
     )
     plan = recipe.prepare(*operands, beta=beta, heads=heads)
     by_hand = _sol_attn_launch(*operands, plan, recipe=recipe)
@@ -2647,7 +2696,9 @@ def test_mha_v4_sol_attn_pooled_scales_must_match_the_scale_modes(recipe):
 
 def test_mha_v4_sol_attn_rejects_recipes_without_a_manifest_row():
     dummy = torch.empty((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="per-tensor FP8 and i8fp8 recipes only"):
+    with pytest.raises(
+        NotImplementedError, match="per-tensor FP8, i8fp8, bf16 and bf16fp8 recipes only"
+    ):
         mha_v4_sol_attn(
             dummy,
             dummy,
@@ -2783,3 +2834,256 @@ def test_sol_attn_prepare_with_pooled_scales_compiles_without_graph_breaks():
     traced = torch.compile(routed, fullgraph=True)(q, k_data, v_data, k_scale)
     for got, want in zip(traced, eager):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+# ---------------------------------------------------------------------------
+# 64x64 block-sparse geometry (gfx950 FP8)
+#
+# The same recipe and modes as the 256x128 rows, dispatched on tile geometry instead. These tests
+# are about the plumbing being geometry-generic -- dispatch key, launch width, bitmap grouping and
+# routing all have to move together -- not about 64x64 being more accurate, which depends on the
+# model's routing and is not something a random-input test can show.
+# ---------------------------------------------------------------------------
+
+_MHA_V4_FINE_TILE = (64, 64)
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
+
+
+def _mha_v4_fine_tile_available() -> bool:
+    return _MHA_V4_FINE_TILE in mha_v4_block_tiles()
+
+
+_MHA_V4_FINE_TILE_REASON = "no 64x64 block-sparse MHA v4 row on this GPU"
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+def test_mha_v4_block_tile_default_is_the_256_row():
+    """Adding geometries must not move the default: every existing caller's mask is shaped for it."""
+    q_tile, kv_tile = mha_v4_block_tile()
+    assert q_tile == 256
+    assert kv_tile == mha_v4_kv_tile()
+    assert mha_v4_kv_tile_for_q_tile(q_tile) == kv_tile
+    assert (q_tile, kv_tile) in mha_v4_block_tiles()
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+def test_mha_v4_kv_tile_for_q_tile_is_zero_when_unserved():
+    """0 rather than a raise, so a caller can offer a geometry and fall back."""
+    assert mha_v4_kv_tile_for_q_tile(48) == 0
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+def test_mha_v4_rejects_a_geometry_with_no_row():
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    fp8 = native_fp8_format()
+    mask = torch.ones((1, 2, 2, 2), device="cuda", dtype=torch.bool)
+    with pytest.raises(ValueError, match="has no 128x128 kernel"):
+        mha_v4(q, k, k, fp8, fp8, fp8, block_mask=mask, block_tile=(128, 128))
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+def test_mha_v4_sparse_64x64_all_true_mask_matches_dense():
+    """Not bit-equality, unlike the 256x128 sibling: a 64-row tile accumulates its online softmax
+    in a different order than the dense row's 256, so the two differ by reassociation alone."""
+    torch.manual_seed(41)
+    q_tile, kv_tile = _MHA_V4_FINE_TILE
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(k)
+    fp8 = native_fp8_format()
+    mask = torch.ones(
+        (1, 2, 512 // q_tile, 512 // kv_tile), device="cuda", dtype=torch.bool
+    )
+    dense = mha_v4(q, k, v, fp8, fp8, fp8)
+    sparse = mha_v4(
+        q, k, v, fp8, fp8, fp8, block_mask=mask, block_tile=_MHA_V4_FINE_TILE
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(sparse).all()
+    assert _cosine(sparse, dense) > 0.999
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+def test_mha_v4_sparse_64x64_follows_the_lut():
+    """The LUT has to be read in units of the dispatched kv_tile. If the kernel and the host
+    disagreed about that, naming disjoint block sets would not give disjoint results."""
+    torch.manual_seed(7)
+    q_tile, kv_tile = _MHA_V4_FINE_TILE
+    q = torch.randn((1, 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    fp8 = native_fp8_format()
+    outs = []
+    for block in range(256 // kv_tile):
+        mask = torch.zeros((1, 1, 1, 256 // kv_tile), device="cuda", dtype=torch.bool)
+        mask[..., block] = True
+        outs.append(
+            mha_v4(q, k, v, fp8, fp8, fp8, block_mask=mask, block_tile=_MHA_V4_FINE_TILE)
+        )
+    torch.cuda.synchronize()
+    for i, out in enumerate(outs):
+        assert torch.isfinite(out).all()
+        for j in range(i + 1, len(outs)):
+            assert not torch.equal(out, outs[j]), f"blocks {i} and {j} gave one result"
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+def test_mha_v4_sol_attn_64x64_select_all_matches_dense():
+    """Selecting every block leaves the pooled pass with nothing to correct, so Sol-Attn at 64x64
+    has to reduce to its own exact pass. This is what catches a bitmap grouped for the wrong tile:
+    a misgrouped row would unmask blocks the exact pass already covered and double-count them."""
+    torch.manual_seed(11)
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(k)
+    fp8 = native_fp8_format()
+    dense = mha_v4(q, k, v, fp8, fp8, fp8)
+    # beta=-inf keeps every block, since the threshold is mean + beta * std.
+    sol = mha_v4_sol_attn(
+        q, k, v, fp8, fp8, fp8, beta=float("-inf"), block_tile=_MHA_V4_FINE_TILE
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(sol).all()
+    assert _cosine(sol, dense) > 0.999
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+@pytest.mark.parametrize("beta", [0.4, 1.0])
+def test_mha_v4_sol_attn_64x64_beats_keep_or_drop(beta):
+    """The 64x64 sibling of the oracle test: the correction has to survive the finer geometry.
+
+    Scored against sol_attn_ref on the mask the kernel was routed with, not against dense, for the
+    reason the raw test spells out -- on Gaussian operands the absolute cosine to dense measures
+    the data. What is specific to 64x64 is that the pooled tensors, the bitmap and the kernel's
+    folded block-size factor all have to agree on 64: get any one of them wrong and the correction
+    lands with the wrong weight, which the uncorrected comparison below detects.
+    """
+    from aiter.test_mha_common import sol_attn_ref
+
+    recipe = _FP8_SOL_ATTN_RECIPE
+    tile_m, tile_n = _MHA_V4_FINE_TILE
+    heads, batch = 2, 1
+    operands = recipe.operands(
+        sequence_k=16 * tile_n, heads=heads, sequence_q=512, batch=batch
+    )
+    plan = recipe.prepare(
+        *operands, beta=beta, heads=heads, block_tile=_MHA_V4_FINE_TILE
+    )
+    fraction = plan["block_attn_mask"].float().mean().item()
+    assert 0.02 < fraction < 0.9, f"degenerate routing at beta={beta}: {fraction}"
+
+    sol = _sol_attn_launch(
+        *operands, plan, recipe=recipe, block_tile=_MHA_V4_FINE_TILE
+    )
+    torch.cuda.synchronize()
+
+    ref_args = (
+        *recipe.reference_operands(*operands),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", operands[1]),
+        recipe.dequantize_pooled(plan, "mean_v", operands[2]),
+    )
+    ref_kwargs = dict(
+        BLOCK_M=tile_m,
+        BLOCK_N=tile_n,
+        softmax_scale=recipe.ref_softmax_scale,
+    )
+    reference, _ = sol_attn_ref(*ref_args, **ref_kwargs)
+    keep_or_drop, _ = sol_attn_ref(*ref_args, **ref_kwargs, correction=False)
+
+    to_reference = _cosine(sol, reference)
+    to_keep_or_drop = _cosine(sol, keep_or_drop)
+    assert torch.isfinite(sol).all()
+    assert to_reference > recipe.oracle_floor, f"cosine to oracle {to_reference}"
+    assert to_reference > to_keep_or_drop + recipe.keep_or_drop_margin, (
+        f"correction not observable: {to_reference} vs {to_keep_or_drop}"
+    )
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+def test_mha_v4_sol_attn_64x64_compiles_without_graph_breaks():
+    """As for the default geometry: naming a non-default tile must not reintroduce the manifest
+    read onto the traced path."""
+    torch.manual_seed(17)
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(k)
+    fp8 = native_fp8_format()
+
+    def routed(q, k, v):
+        return mha_v4_sol_attn(
+            q, k, v, fp8, fp8, fp8, beta=1.0, block_tile=_MHA_V4_FINE_TILE
+        )
+
+    eager = routed(q, k, v)
+    traced = torch.compile(routed, fullgraph=True)(q, k, v)
+    torch.cuda.synchronize()
+    assert _cosine(traced, eager) > 0.999
+
+
+def _mha_v4_lut_capacity(mode: int, q_tile: int, kv_tile: int) -> int:
+    """The lut_max the manifest declares for one block-sparse geometry, or 0 if it has no row.
+
+    Read from the CSV rather than from a Python accessor because there is deliberately none: the
+    launcher is what enforces the ceiling, and a caller that needed the number to chunk a sequence
+    would be working around the split the error message asks for.
+    """
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    manifest = os.path.join(asm_dir, get_gfx(), "fmha_v4_fwd", "fmha_v4_fwd.csv")
+    with open(manifest, newline="") as handle:
+        for row in csv.DictReader(
+            filter(lambda line: not line.startswith("#"), handle)
+        ):
+            if (
+                int(row["mode"]) == mode
+                and int(row["ts_qo"]) == q_tile
+                and int(row["ts_kv"]) == kv_tile
+                and int(row["q_format"]) == int(native_fp8_format())
+            ):
+                return int(row["lut_max"])
+    return 0
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+def test_mha_v4_sol_attn_rejects_a_key_length_past_the_lut_capacity():
+    """A LUT row past its staging capacity reads back whatever follows it, so this must not launch.
+
+    The boundary is checked from both sides, because the interesting failure is an off-by-one that
+    rejects a length the kernel handles: the capacity is exactly reachable, a row may select every
+    block, and the pass at capacity is what says so.
+
+    Bounded by the shape rather than by the row's real maximum on purpose -- finding the latter
+    means reading lut_count back from the device on every launch -- so a sequence is refused when
+    any row COULD overrun, whatever this particular mask selected.
+    """
+    q_tile, kv_tile = _MHA_V4_FINE_TILE
+    capacity = _mha_v4_lut_capacity(MHA_V4_SOL_ATTN_MODE, q_tile, kv_tile)
+    assert capacity, "the 64x64 Sol-Attn row must declare a lut_max"
+
+    fp8 = native_fp8_format()
+
+    def run(blocks):
+        q = torch.randn(
+            (1, blocks * kv_tile, 1, 128), device="cuda", dtype=torch.bfloat16
+        )
+        try:
+            out = mha_v4_sol_attn(
+                q, q, q, fp8, fp8, fp8, beta=1.0, block_tile=_MHA_V4_FINE_TILE
+            )
+            torch.cuda.synchronize()
+            return out
+        finally:
+            del q
+            torch.cuda.empty_cache()
+
+    assert torch.isfinite(run(capacity)).all(), (
+        f"{capacity} blocks is exactly the declared capacity and has to run")
+
+    with pytest.raises(RuntimeError, match=f"holds {capacity} LUT entries"):
+        run(capacity + 1)

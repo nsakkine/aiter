@@ -41,7 +41,12 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         double softmax_scale,
                         const at::Tensor& kv_block_indices,
                         const at::Tensor& lut_start,
-                        const at::Tensor& lut_count);
+                        const at::Tensor& lut_count,
+                        // Tile geometry of the manifest row to dispatch. The LUT is in units of
+                        // kv_tile, so this must match what the caller routed with; gfx950 ships
+                        // both a 256x128 and a 64x64 FP8 block-sparse row.
+                        int64_t q_tile,
+                        int64_t kv_tile);
 
 // Sol-Attn sibling (arXiv 2607.24027): the LUT above still drives an EXACT pass, and a second pass
 // then sweeps the pooled per-block K/V, masking off the blocks the LUT already covered via
@@ -81,7 +86,11 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           const at::Tensor& mean_v,
                           const at::Tensor& block_bitmap,
                           const std::optional<at::Tensor>& mean_k_scale,
-                          const std::optional<at::Tensor>& mean_v_scale);
+                          const std::optional<at::Tensor>& mean_v_scale,
+                          // As above; the pooled K/V and the selection bitmap are also in units of
+                          // kv_tile, so all three of routing, pooling and dispatch must agree.
+                          int64_t q_tile,
+                          int64_t kv_tile);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
 // Reordering a permutation costs only load balance, but the table must stay a permutation: each

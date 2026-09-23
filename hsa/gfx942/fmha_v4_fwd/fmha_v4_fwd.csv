@@ -7,10 +7,10 @@
 # wrongly instead of failing.
 # v_format=4 (E4M3FNUZ), not the 3 (E4M3FN) the gfx950 Sol-Attn rows carry: the same byte means
 # twice the value across that bias change, and per-tensor descales cannot absorb it.
-q_format,k_format,v_format,o_format,q_scale_mode,k_scale_mode,v_scale_mode,o_scale_mode,hdim_q,hdim_v,mask,mode,ts_qo,ts_kv,knl_name,co_name
-10,10,4,2,1,1,1,0,128,128,0,0,256,64,_ZN5aiter20fmha_fwd_hd128_i8fp8E,MI300/fwd_hd128_i8fp8.co
-4,4,4,2,1,1,1,0,128,128,0,0,256,64,_ZN5aiter18fmha_fwd_hd128_fp8E,MI300/fwd_hd128_fp8.co
-10,10,4,2,1,1,1,0,128,128,0,1,256,64,_ZN5aiter27fmha_fwd_hd128_i8fp8_sparseE,MI300/fwd_hd128_i8fp8_sparse.co
-4,4,4,2,1,1,1,0,128,128,0,1,256,64,_ZN5aiter25fmha_fwd_hd128_fp8_sparseE,MI300/fwd_hd128_fp8_sparse.co
-10,10,4,2,1,1,1,0,128,128,0,2,256,64,_ZN5aiter36fmha_fwd_hd128_i8fp8_sol_attn_gfx942E,MI300/fwd_hd128_i8fp8_sol_attn.co
-4,4,4,2,1,1,1,0,128,128,0,2,256,64,_ZN5aiter34fmha_fwd_hd128_fp8_sol_attn_gfx942E,MI300/fwd_hd128_fp8_sol_attn.co
+q_format,k_format,v_format,o_format,q_scale_mode,k_scale_mode,v_scale_mode,o_scale_mode,hdim_q,hdim_v,mask,mode,ts_qo,ts_kv,lut_max,knl_name,co_name
+10,10,4,2,1,1,1,0,128,128,0,0,256,64,0,_ZN5aiter20fmha_fwd_hd128_i8fp8E,MI300/fwd_hd128_i8fp8.co
+4,4,4,2,1,1,1,0,128,128,0,0,256,64,0,_ZN5aiter18fmha_fwd_hd128_fp8E,MI300/fwd_hd128_fp8.co
+10,10,4,2,1,1,1,0,128,128,0,1,256,64,7679,_ZN5aiter27fmha_fwd_hd128_i8fp8_sparseE,MI300/fwd_hd128_i8fp8_sparse.co
+4,4,4,2,1,1,1,0,128,128,0,1,256,64,7871,_ZN5aiter25fmha_fwd_hd128_fp8_sparseE,MI300/fwd_hd128_fp8_sparse.co
+10,10,4,2,1,1,1,0,128,128,0,2,256,64,7679,_ZN5aiter36fmha_fwd_hd128_i8fp8_sol_attn_gfx942E,MI300/fwd_hd128_i8fp8_sol_attn.co
+4,4,4,2,1,1,1,0,128,128,0,2,256,64,7871,_ZN5aiter34fmha_fwd_hd128_fp8_sol_attn_gfx942E,MI300/fwd_hd128_fp8_sol_attn.co

@@ -39,6 +39,7 @@ import torch
 import triton
 
 from aiter.ops.mha_v4 import (
+    AttentionFormat,
     AttentionScaleMode,
     mha_v4_kv_tile,
     mha_v4_packed,
@@ -116,6 +117,21 @@ def build_operands(seqlen: int, heads: int, recipe: str, device="cuda"):
         # K is block granular, so its pooled image needs a scale of its own; V is per-
         # tensor.
         prepare_kwargs = {"k_scale": k_descale}
+    elif recipe in ("bf16", "bf16fp8"):
+        # Q and K stay BF16, so they have no descale; the placeholder keeps the launch signature
+        # uniform and the NONE scale mode makes the kernel ignore it. Only V can be quantized,
+        # and only to per-tensor FP8, which survives pooling as the FP8 recipe's does.
+        q_quant, q_descale = q, q
+        k_quant, k_descale = k, k
+        v_is_fp8 = recipe == "bf16fp8"
+        v_quant, v_descale = quantize_fp8(v) if v_is_fp8 else (v, v)
+        formats = (
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            fp8 if v_is_fp8 else AttentionFormat.BF16,
+        )
+        scale_modes = scale_modes_for_formats(*formats)
+        prepare_kwargs = {}
     else:
         raise ValueError(f"unknown recipe {recipe!r}")
 
@@ -267,7 +283,9 @@ def main() -> int:
         default=[1, 8],
         help="Ulysses degrees; each leaves 40/degree heads on a device",
     )
-    parser.add_argument("--recipe", default="fp8", choices=["fp8", "mxfp8"])
+    parser.add_argument(
+        "--recipe", default="fp8", choices=["fp8", "mxfp8", "bf16", "bf16fp8"]
+    )
     parser.add_argument("--warmup", type=int, default=25, help="do_bench warmup ms")
     parser.add_argument("--rep", type=int, default=100, help="do_bench rep ms")
     parser.add_argument(

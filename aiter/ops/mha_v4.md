@@ -10,15 +10,17 @@ Dense BF16-output MHA v4 is implemented and validated on gfx950. Sorted block-sp
 deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8 have both dense
 and sorted-sparse rows under v4 (256×64 tiles).
 
-Sol-Attn (`mode=2`, see the Sol-Attn Contract below) ships for the gfx950 FP8, i8fp8, MXFP8 and
-MXFP4 recipes, and for the gfx942 FP8 and i8fp8 ones. The two MX recipes are gfx950-only: their
-pooled operands need block-granular scales, and MX quantization itself is gfx950-only.
+Sol-Attn (`mode=2`, see the Sol-Attn Contract below) ships for the gfx950 BF16, bf16fp8, FP8,
+i8fp8, MXFP8 and MXFP4 recipes, and for the gfx942 FP8 and i8fp8 ones. The two MX recipes are
+gfx950-only: their pooled operands need block-granular scales, and MX quantization itself is
+gfx950-only.
 
-The public raw and packed APIs support eight dense combinations:
+The public raw and packed APIs support nine dense combinations:
 
 | Q/K | V | Output |
 |---|---|---|
 | BF16 | BF16 | BF16 |
+| BF16 | FP8 | BF16 |
 | INT8 | FP8 | BF16 |
 | FP8 | FP8 | BF16 |
 | MXFP8 | FP8 | BF16 |
@@ -208,10 +210,8 @@ not generic row-major metadata. Packed launch uses `E8M0_PER_1X32`; FP8 V uses
 `F32_PER_CHANNEL`.
 
 One single-warp Triton program owns each `(32-token, 32-channel)` block, eliminating overlapping
-writers. The deployed trailing-underscore F4F4/F6F4 kernels load V scales at QK exit so softmax
-hides their VMEM latency, retain 95 SGPR and 256 VGPR, and use 66,048 and 43,008 bytes LDS
-respectively. F4F4 keeps next-K0 prefetch under the penultimate PV MFMA; F6F4 keeps split-FP6 K0
-prefetch at the PV tail because earlier placement was flat in balanced eight-GPU testing.
+writers. F4F4 and F6F4 are ordinary manifest rows selected by the same explicit key as the rest;
+their code objects are the ones named under `hsa/gfx950/fmha_v4_fwd/`.
 
 Any producer dtype, shape, or layout change requires a versioned custom-op name. Promotion requires
 byte equality against the independent Torch payload/scale reference at sequences
@@ -362,11 +362,10 @@ Up to 8192 entries one fused kernel ranks and packs the table; past that the sor
 ATen. The limit is where the 8-byte keys fill the 64 KB of LDS a workgroup gets.
 
 A LUT row may select nothing. `lut_count == 0` is a no-op that writes a zero output tile, so an
-all-False `block_mask` row is valid input: the ASM clamps the row's prologue reads in bounds and
-skips the KV traversal, and the epilogue's zero-row-sum path zeroes the tile. That makes the entry
-count unbounded below, so the only bound the launcher can check without reading device data is that
-`kv_block_indices` is non-empty (the kernels dereference the row base even for an empty row, and
-read speculatively up to one entry past the row they traverse). Set `AITER_MHA_V4_VALIDATE_LUT=1` to
+all-False `block_mask` row is valid input. That makes the entry count unbounded below, so the only
+bound the launcher can check without reading device data is that `kv_block_indices` is non-empty.
+It must stay allocated for an empty row as well, and the allocation has to cover one entry past
+the last one any row traverses. Set `AITER_MHA_V4_VALIDATE_LUT=1` to
 also check starts, counts, and index ranges device-side, which costs a synchronization per launch
 and is off by default.
 
@@ -378,13 +377,14 @@ through `mha_v4_packed` after reconstructing views.
 
 ## Sol-Attn Contract
 
-Sol-Attn (arXiv 2607.24027) is `mode=2`, shipped for four gfx950 recipes: FP8
+Sol-Attn (arXiv 2607.24027) is `mode=2`, shipped for six gfx950 recipes: BF16
+(`fwd_hd128_bf16_sol_attn.co`), bf16fp8 (`fwd_hd128_bf16fp8_sol_attn.co`), FP8
 (`fwd_hd128_fp8_sol_attn.co`), i8fp8 (`fwd_hd128_i8fp8_sol_attn.co`), MXFP8
 (`fwd_hd128_mxfp8_sol_attn.co`) and MXFP4 (`fwd_hd128_mxfp4_sol_attn.co`), and for the two
 per-tensor gfx942 recipes, whose objects sit under `hsa/gfx942/fmha_v4_fwd/MI300/` beside the
-sparse ones. The gfx942 rows pool 64 KV rows per block against gfx950's 128, following `ts_kv`,
-and the kernel folds that block size into its softmax bias as a constant, so a caller that pools
-at any other value is silently wrong rather than refused; take it from `mha_v4_kv_tile()`.
+sparse ones. The gfx942 rows pool 64 KV rows per block against gfx950's 128, following `ts_kv`.
+The block size is fixed by the row rather than passed to it, so a caller that pools at any other
+value is silently wrong rather than refused; take it from `mha_v4_kv_tile()`.
 A gfx942 query tile that selects no block at all keeps the zero output the sparse row writes
 instead of falling back to the pooled-only softmax, which routing makes unreachable by keeping the
 highest-proxy block per row. Every mode-2 row shares
@@ -412,8 +412,8 @@ knows nothing about selection, so a supplied mask changes the LUT and the bitmap
 the pooled operands are identical either way. Supplying one does not turn the approximate branch
 off; the unselected blocks are still swept from the pooled K/V, which is the entire difference
 between this and a `mode=1` keep-or-drop launch over the same mask. A short tail block is forced
-onto the exact pass exactly as routing forces it, because the approximate branch scales every block
-by a constant full-block factor and cannot represent a partial one.
+onto the exact pass exactly as routing forces it, because the approximate branch is defined for
+whole blocks only and cannot represent a partial one.
 
 That is what makes Sol-Attn measurable against the sparse row: at a fixed density the two differ
 only by the approximate pass, whereas comparing a routed Sol-Attn run against a dense one mostly
@@ -426,7 +426,8 @@ Sol-Attn's speed is the sparsity's and its accuracy gain over keep-or-drop is cl
 Pooling reduces the SEQUENCE axis, so whether a descale survives it depends only on whether that
 descale varies along that axis. Per-tensor and per-channel ones do not, and
 `mean(x) * descale == mean(x * descale)` lets the pooled operand reuse the source descale outright:
-FP8 and i8fp8 are per-tensor throughout, so both leave the pooled scale slots NULL. An E8M0 1x32
+FP8 and i8fp8 are per-tensor throughout, and the two BF16 Q/K rows have either no descale at all
+(BF16 V) or a per-tensor one (FP8 V), so all four leave the pooled scale slots NULL. An E8M0 1x32
 scale does vary per token, so that operand pools in dequantized space and requantizes, producing a
 scale of its own that the approximate pass must read instead of the source one. MXFP8 is that case
 on K and per-tensor on V, so it passes `mean_k_scale` and no `mean_v_scale`. MXFP4 is E8M0 on all
@@ -470,9 +471,9 @@ MXFP4's mode-2 row declares an all-MXFP4 signature, whereas its mode-0 and mode-
 per-channel FP8 V. That row's signature is also f4f4's, so f4f4 cannot gain a mode-2 row while both
 are in the manifest.
 `block_bitmap` is uint32 `[batch * query_heads * query_tiles, 4 * ceil(num_kv_blocks / 128)]`; the
-row length rounds up to whole 128-block groups because one group is read per approximate tile as a
-single aligned 16-byte load, and the bits at and above `num_kv_blocks` are **set**, which is what
-clips the last tile's overhang and removes the need for a masked-tail path.
+row length rounds up to whole 128-block groups, which is the granularity the approximate pass
+consumes it at, and the bits at and above `num_kv_blocks` are **set**, which is what clips the
+last tile's overhang.
 
 A LUT row may select nothing, as in sparse, though it means something different here: with no exact
 block to establish the row's softmax max, the approximate pass still recovers it, so the row lands on
@@ -490,21 +491,21 @@ mutually exclusive in the ABI: the sorted layout's scheduling fields occupy 0x2E
 Sol-Attn layout starts `ptr_mean_k`.
 
 Key length must be a multiple of the KV tile, matching `mode=1`. `sol_attn_prepare()` does handle a
-ragged tail -- it forces the short last block exact, since the approximate pass weights every block by
-a constant full-block factor -- so this can be relaxed whenever the sparse restriction is.
+ragged tail -- it forces the short last block exact, since the approximate pass is defined for whole
+blocks only -- so this can be relaxed whenever the sparse restriction is.
 
 ### VSA Compatibility
 
 AITER VSA supplies delta-encoded fixed-capacity rows plus counts at 128-query-token granularity;
 the proposed MHA v4 descriptor uses flat absolute indices and explicit start/count. Encoding
-conversion is cheap, but geometry is not: current 256x128 ASM workgroups share one KV list across
-two 128-row halves, while adjacent VSA rows may differ. Exact support therefore follows:
+conversion is cheap, but geometry is not: the current 256x128 rows take one KV list per 256-query
+tile, while adjacent 128-query VSA rows may differ. Exact support therefore follows:
 
 1. Directly use an existing 256x128 sparse kernel when adjacent 128-query VSA rows are identical or
     when the policy natively emits 256-query rows.
 2. Add a manifest-selected 128x128 ASM sparse kernel for arbitrary VSA rows. This is the primary
     exact compatibility path and must be benchmarked because reducing the query tile changes the
-    eight-wave load/compute balance.
+    row's load/compute balance.
 3. Optionally add a 256x128 union kernel carrying per-half membership bits if VSA masks have enough
     overlap to make union overcompute cheaper than the 128x128 kernel. This is a separate optimized
     ABI, not the default conversion.

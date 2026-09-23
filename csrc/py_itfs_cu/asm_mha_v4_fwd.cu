@@ -249,6 +249,59 @@ void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* n
     }
 }
 
+// Threads per workgroup for a row. Every kernel in this family gives each wave 32 query rows, so
+// the wave count is ts_qo/32 and the workgroup is that many 64-lane waves. Derived rather than
+// stored in the manifest so a row cannot declare a tile and a launch width that disagree -- a
+// mismatch here does not return wrong numbers, it hangs, because the row's internal
+// synchronization waits on waves that were never dispatched.
+constexpr int kQueryRowsPerWave = 32;
+
+int workgroup_size_for(const fmha_v4_fwdConfig& cfg)
+{
+    TORCH_CHECK(cfg.ts_qo % kQueryRowsPerWave == 0,
+                "MHA v4 row ",
+                cfg.knl_name,
+                " has ts_qo=",
+                cfg.ts_qo,
+                ", which is not a multiple of the ",
+                kQueryRowsPerWave,
+                " query rows each wave owns");
+    return cfg.ts_qo / kQueryRowsPerWave * 64;
+}
+
+// A row stages its LUT in a fixed-capacity region -- lut_max in the manifest -- and overrunning
+// it reads back whatever follows rather than faulting, so the ceiling is checked here. The bound
+// is the shape's, not the row's actual count: a row may legitimately select every block, and
+// reading lut_count to find its true maximum would mean a device sync on every launch.
+void check_lut_capacity(const fmha_v4_fwdConfig& cfg, int64_t kv_tiles, const char* mode_name)
+{
+    TORCH_CHECK(cfg.lut_max > 0,
+                mode_name,
+                " MHA v4 row ",
+                cfg.knl_name,
+                " declares no lut_max; a block-sparse row must state its LUT capacity");
+    TORCH_CHECK(kv_tiles <= cfg.lut_max,
+                mode_name,
+                " MHA v4 row ",
+                cfg.knl_name,
+                " holds ",
+                cfg.lut_max,
+                " LUT entries, but this key length is ",
+                kv_tiles,
+                " blocks of ",
+                cfg.ts_kv,
+                " tokens. Split the sequence, or dispatch a geometry with a larger LUT region.");
+}
+
+// `ts_qo`/`ts_kv` participate in the key because one arch can ship several tile geometries for the
+// SAME recipe and mode (gfx950 has both 256x128 and 64x64 FP8 sparse/Sol-Attn rows), and they are
+// not interchangeable: the block mask, LUT and bitmap a caller builds are all in units of ts_kv.
+// A block-sparse caller therefore names the geometry it prepared its operands for, so a missing row
+// is an error rather than silently whichever row the manifest listed first.
+//
+// 0 means "any", which is what the dense path passes. Dense builds no mask, so its geometry is an
+// implementation detail of the row -- and it genuinely varies (bf16 tiles 256x64 where the
+// quantized rows tile 256x128), so there is nothing for a dense caller to name.
 const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      int64_t q_format,
                                      int64_t k_format,
@@ -256,8 +309,18 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      int64_t q_scale_mode,
                                      int64_t k_scale_mode,
                                      int64_t v_scale_mode,
-                                     int64_t mode)
+                                     int64_t mode,
+                                     int64_t ts_qo,
+                                     int64_t ts_kv)
 {
+    // cfg_fmha_v4_fwd is an unordered_map, so "first row that matches" is only well defined when at
+    // most one row can match. That holds for dense, but gfx950 now has two block-sparse FP8 rows
+    // per mode, so leaving the geometry unnamed there would pick a tile by hash order.
+    TORCH_CHECK(mode == 0 || (ts_qo != 0 && ts_kv != 0),
+                "block-sparse MHA v4 (mode=",
+                mode,
+                ") requires an explicit q_tile/kv_tile: several tile geometries can serve one "
+                "recipe and the LUT, bitmap and pooled K/V are all in units of kv_tile");
     for(const auto& entry : cfg_fmha_v4_fwd)
     {
         const auto& cfg = entry.second;
@@ -266,7 +329,8 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
            cfg.k_scale_mode == k_scale_mode && cfg.v_scale_mode == v_scale_mode &&
            cfg.o_format == format_id(AttentionFormat::Bf16) &&
            cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
-           cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode)
+           cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode &&
+           (ts_qo == 0 || cfg.ts_qo == ts_qo) && (ts_kv == 0 || cfg.ts_kv == ts_kv))
             return cfg;
     }
     TORCH_CHECK(false,
@@ -286,7 +350,10 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 v_scale_mode,
                 ", output=BF16, head_dim=128, mode=",
                 mode,
-                " (0=dense, 1=sorted-sparse, 2=sol-attn)");
+                " (0=dense, 1=sorted-sparse, 2=sol-attn), tile=",
+                ts_qo,
+                "x",
+                ts_kv);
 }
 
 void set_descale_strides(const at::Tensor& tensor,
@@ -669,12 +736,20 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     const bool bf16_format    = q_format == format_id(AttentionFormat::Bf16);
     const bool e8m0_qk_scales = q_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
                                 k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    const bool fp8_v = v_format == format_id(AttentionFormat::Fp8E4M3) ||
+                       v_format == format_id(AttentionFormat::Fp8E4M3Fnuz);
     if(bf16_format)
     {
+        // BF16 Q/K are never scaled. V may still be quantized: the bf16fp8 row stores an FP8 V
+        // behind a per-tensor descale while Q/K stay BF16, which is the only recipe holding its
+        // operands at two different element widths.
         TORCH_CHECK(q_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
-                        k_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
-                        v_scale_mode == scale_mode_id(AttentionScaleMode::None),
-                    "BF16 Q/K/V must use NONE scale modes");
+                        k_scale_mode == scale_mode_id(AttentionScaleMode::None),
+                    "BF16 Q/K must use NONE scale modes");
+        TORCH_CHECK(v_scale_mode == scale_mode_id(AttentionScaleMode::None) ||
+                        (fp8_v && v_scale_mode == scale_mode_id(AttentionScaleMode::F32PerTensor)),
+                    "BF16 Q/K require either a BF16 V with a NONE scale mode or an FP8 V with a "
+                    "per-tensor one");
     }
     else if(e8m0_qk_scales)
     {
@@ -698,9 +773,15 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     }
     const bool mx_v = v_format == format_id(AttentionFormat::Fp6E2M3) ||
                       v_format == format_id(AttentionFormat::Fp4E2M1);
-    if(bf16_format)
+    if(bf16_format && v_scale_mode == scale_mode_id(AttentionScaleMode::None))
     {
         // Raw BF16 operands do not use descale tensors.
+    }
+    else if(bf16_format)
+    {
+        TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
+                    "FP8 V descale must be a float32 tensor");
+        TORCH_CHECK(v_descale.numel() == 1, "FP8 V descale must be a scalar tensor");
     }
     else if(mx_v)
     {
@@ -772,8 +853,16 @@ void fmha_v4_fwd(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(
-        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/0);
+    const auto& cfg = find_config(arch,
+                                  q_format,
+                                  k_format,
+                                  v_format,
+                                  q_scale_mode,
+                                  k_scale_mode,
+                                  v_scale_mode,
+                                  /*mode=*/0,
+                                  /*ts_qo=*/0,
+                                  /*ts_kv=*/0);
 
     FmhaV4Kernarg args{};
     populate_dense_kernarg(args,
@@ -802,7 +891,7 @@ void fmha_v4_fwd(const at::Tensor& q,
     const int gdy            = shapes.nhead_q;
     const int gdz            = shapes.batch;
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, 512, 1, 1, stream});
+    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
 }
 
 void fmha_v4_fwd_sparse(const at::Tensor& q,
@@ -821,7 +910,9 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         double softmax_scale,
                         const at::Tensor& kv_block_indices,
                         const at::Tensor& lut_start,
-                        const at::Tensor& lut_count)
+                        const at::Tensor& lut_count,
+                        int64_t q_tile,
+                        int64_t kv_tile)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -843,8 +934,16 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(
-        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/1);
+    const auto& cfg = find_config(arch,
+                                  q_format,
+                                  k_format,
+                                  v_format,
+                                  q_scale_mode,
+                                  k_scale_mode,
+                                  v_scale_mode,
+                                  /*mode=*/1,
+                                  q_tile,
+                                  kv_tile);
     TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
                 "sorted-sparse MHA v4 requires key length padded to a multiple of ",
                 cfg.ts_kv);
@@ -852,6 +951,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     const int64_t q_tiles  = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
     const int64_t kv_tiles = (shapes.seqlen_k + cfg.ts_kv - 1) / cfg.ts_kv;
     const int64_t lut_rows = shapes.batch * shapes.nhead_q * q_tiles;
+    check_lut_capacity(cfg, kv_tiles, "sorted-sparse");
     TORCH_CHECK(kv_block_indices.is_cuda() && lut_start.is_cuda() && lut_count.is_cuda(),
                 "LUT tensors must be GPU tensors");
     TORCH_CHECK(kv_block_indices.device() == q.device() && lut_start.device() == q.device() &&
@@ -923,7 +1023,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
     size_t arg_size          = sizeof(args);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, 512, 1, 1, stream});
+    kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, workgroup_size_for(cfg), 1, 1, stream});
 }
 
 void fmha_v4_fwd_sol_attn(const at::Tensor& q,
@@ -947,7 +1047,9 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           const at::Tensor& mean_v,
                           const at::Tensor& block_bitmap,
                           const std::optional<at::Tensor>& mean_k_scale,
-                          const std::optional<at::Tensor>& mean_v_scale)
+                          const std::optional<at::Tensor>& mean_v_scale,
+                          int64_t q_tile,
+                          int64_t kv_tile)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -966,11 +1068,19 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(
-        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/2);
+    const auto& cfg = find_config(arch,
+                                  q_format,
+                                  k_format,
+                                  v_format,
+                                  q_scale_mode,
+                                  k_scale_mode,
+                                  v_scale_mode,
+                                  /*mode=*/2,
+                                  q_tile,
+                                  kv_tile);
     // Matches the sorted-sparse sibling, whose LUT machinery Sol-Attn reuses verbatim for its exact
     // pass. sol_attn_prepare() does handle a ragged tail (it forces the short last block to be
-    // computed exactly, since the pooled x128 factor only holds for a full block), so this can be
+    // computed exactly, since the pooled xts_kv factor only holds for a full block), so this can be
     // relaxed whenever the sparse restriction is.
     TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
                 "Sol-Attn MHA v4 requires key length padded to a multiple of ",
@@ -979,8 +1089,13 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     const int64_t q_tiles       = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
     const int64_t kv_tiles      = shapes.seqlen_k / cfg.ts_kv;
     const int64_t lut_rows      = shapes.batch * shapes.nhead_q * q_tiles;
-    const int64_t bitmap_groups = (kv_tiles + 127) / 128;
-    const int64_t bitmap_ds     = 4 * bitmap_groups;
+    check_lut_capacity(cfg, kv_tiles, "Sol-Attn");
+    // The approximate pass sweeps pooled blocks the way the exact pass sweeps tokens, so one of its
+    // tiles covers cfg.ts_kv BLOCKS and needs that many mask bits: ts_kv / 32 words, read as one
+    // aligned load. Everything the pass reads per tile is grouped and padded to that stride.
+    const int64_t blocks_per_tile = cfg.ts_kv;
+    const int64_t bitmap_groups   = (kv_tiles + blocks_per_tile - 1) / blocks_per_tile;
+    const int64_t bitmap_ds       = blocks_per_tile / 32 * bitmap_groups;
 
     TORCH_CHECK(kv_block_indices.is_cuda() && lut_start.is_cuda() && lut_count.is_cuda(),
                 "LUT tensors must be GPU tensors");
@@ -1026,8 +1141,8 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                 "mean_v must have shape [batch, num_kv_blocks, key_heads, V head dim]");
     TORCH_CHECK(mean_k.stride(3) == 1 && mean_v.stride(3) == 1,
                 "Sol-Attn pooled tensors must have contiguous last dimensions");
-    // One aligned 16-byte load per approximate tile at byte offset 16 * tile, so a row length that
-    // is not a multiple of 4 words would misalign every tile after the first.
+    // One aligned load per approximate tile, at byte offset (ts_kv / 8) * tile, so a row length
+    // that is not a whole number of groups would misalign every tile after the first.
     TORCH_CHECK(block_bitmap.element_size() == 4 &&
                     (block_bitmap.scalar_type() == at::ScalarType::UInt32 ||
                      block_bitmap.scalar_type() == at::ScalarType::Int),
@@ -1035,7 +1150,7 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     TORCH_CHECK(block_bitmap.dim() == 2 &&
                     block_bitmap.sizes() == torch::IntArrayRef({lut_rows, bitmap_ds}),
                 "block_bitmap must have shape [batch * query_heads * query_tiles, "
-                "4 * ceil(num_kv_blocks / 128)]; expected [",
+                "(ts_kv / 32) * ceil(num_kv_blocks / ts_kv)]; expected [",
                 lut_rows,
                 ", ",
                 bitmap_ds,
@@ -1069,7 +1184,7 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
         // Some recipes read a full tile of scale bytes however short the pooled image is, and an
         // uninitialized E8M0 byte of 0xFF is 2^128, which reaches QK as inf before the bitmap masks
         // the column out. Those have to pass a zero-padded image, so accept either height.
-        const int64_t padded_rows = ((kv_tiles + 127) / 128) * 128;
+        const int64_t padded_rows = bitmap_groups * blocks_per_tile;
         TORCH_CHECK(ks.dim() == 4 && ks.size(0) == shapes.batch &&
                         ks.size(2) == shapes.nhead_k && ks.size(3) == kHeadDim / 32 &&
                         (ks.size(1) == kv_tiles || ks.size(1) == padded_rows),
@@ -1084,18 +1199,18 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     if(v_needs_pooled_scale)
     {
         // The V-scale image is packed, not strided, and carries no stride slots of its own, so all
-        // it needs is a base with whole 128-row tiles behind it. Hence a size check only.
-        const auto& vs = mean_v_scale.value();
-        const int64_t pooled_tiles = (kv_tiles + 127) / 128;
+        // it needs is a base with whole tiles behind it. Hence a size check only.
+        const auto& vs             = mean_v_scale.value();
+        const int64_t pooled_bytes = bitmap_groups * blocks_per_tile * (kHeadDim / 32);
         TORCH_CHECK(vs.is_cuda() && vs.device() == q.device(),
                     "mean_v_scale must be on the same GPU as Q");
         TORCH_CHECK(vs.scalar_type() == at::ScalarType::Byte,
                     "mean_v_scale must be a uint8 E8M0 tensor");
         TORCH_CHECK(vs.sizes() ==
-                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, pooled_tiles * 512}),
+                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, pooled_bytes}),
                     "mean_v_scale must have shape [batch, key_heads, "
-                    "ceil(num_kv_blocks / 128) * 512], matching V's own packed scale image with "
-                    "key_length replaced by num_kv_blocks");
+                    "ceil(num_kv_blocks / ts_kv) * ts_kv * 4], matching V's own packed scale image "
+                    "with key_length replaced by num_kv_blocks");
         TORCH_CHECK(vs.is_contiguous(), "mean_v_scale must be contiguous");
     }
 
@@ -1165,7 +1280,7 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     const int gdy            = static_cast<int>(shapes.nhead_q);
     const int gdz            = static_cast<int>(shapes.batch);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, 512, 1, 1, stream});
+    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
 }
 
 } // namespace torch_itfs

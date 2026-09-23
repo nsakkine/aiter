@@ -13,9 +13,12 @@ from aiter.ops.triton._triton_kernels.attention.block_lut import (
     block_attn_mask_to_lut_kernel,
 )
 
-# Tile geometry the gfx950 Sol-Attn ASM kernel is built for. SOL_ATTN_TS_KV in particular is the
-# pooling block size whose log2 the kernel folds into its softmax bias as a constant, so pooling with
-# any other value is silently wrong rather than an error.
+# Default tile geometry of the gfx950 Sol-Attn ASM kernels. SOL_ATTN_TS_KV in particular is the
+# pooling block size, which each row fixes rather than reading, so pooling with
+# any other value is silently wrong rather than an error -- which is why BLOCK_M/BLOCK_N below must
+# name the geometry of the row that will actually be dispatched, not a preference. gfx950 also ships
+# a 64x64 FP8 row; mha_v4_sol_attn(block_tile=...) drives routing and dispatch from one value so the
+# two cannot drift apart.
 SOL_ATTN_TS_QO = 256
 SOL_ATTN_TS_KV = 128
 
@@ -158,9 +161,9 @@ def _sol_attn_pool_kv_quant(
 
     The block mean is accumulated in fp32 over the raw stored values and rounded back to the
     source dtype, so K's and V's PER-TENSOR descales stay valid for the pooled tensors
-    (mean(x) * descale == mean(x * descale)). The kernel folds those descales into the softmax
-    temperature and the epilogue, so a separate scale on either mean tensor would corrupt the
-    exact/approximate mix. Rounding a mean of in-range values back to fp8 cannot overflow.
+    (mean(x) * descale == mean(x * descale)). The row applies those descales itself, so a separate
+    scale on either mean tensor would corrupt the exact/approximate mix. Rounding a mean of
+    in-range values back to fp8 cannot overflow.
 
     This identity is what ties pooling to per-tensor scaling: a block-granular scale image
     (E8M0 per 1x32) spans several scale blocks per pooled row and has no single descale to
@@ -497,7 +500,7 @@ def sol_attn_prepare(
         difference between this and a keep-or-drop sparse launch over the same mask.
 
         A partial tail block is forced on here exactly as routing forces it, because the
-        approximate branch scales every block by a constant full-block factor and so cannot
+        approximate branch is defined for whole blocks only and so cannot
         represent a short one. That is a kernel requirement rather than a preference, so it is
         applied to a supplied mask rather than rejected.
     force_block_mask: bool, broadcastable to block_attn_mask's shape and ending in num_kv_blocks,
@@ -538,8 +541,9 @@ def sol_attn_prepare(
             for the addressable recipes, where dequantizing the pooled tensor with its own scale
             recovers this. A reference should pool over these rather than over the source K/V.
         block_bitmap: uint32 (num_work_items, bitmap_Ds), contiguous, bit j of word j // 32 set
-            == KV block j selected for that work item. bitmap_Ds is 4 * ceil(num_kv_blocks / 128)
-            and the bits above num_kv_blocks are SET; see the packing comment below.
+            == KV block j selected for that work item. bitmap_Ds is
+            (BLOCK_N // 32) * ceil(num_kv_blocks / BLOCK_N) and the bits above num_kv_blocks are
+            SET; see the packing comment below.
         kv_block_indices, lut_start, lut_count: the ragged LUT, int32. kv_block_indices is
             overallocated by block_attn_mask_to_ragged_lut; only the spans are meaningful.
         num_kv_blocks, bitmap_Ds, num_q_tiles: kernarg scalars / grid geometry.
@@ -661,15 +665,15 @@ def sol_attn_prepare(
     # Bitmap: same mask, packed 32 blocks per uint32 word, num_work_items rows of bitmap_Ds words in
     # lut_idx order.
     #
-    # The row length is rounded up to whole 128-block groups (4 words), not to a single word: one
-    # group is read per approximate tile as a single aligned 16-byte load at byte offset 16 * tile,
-    # so a row that is not a multiple of 4 words misaligns every tile after the first.
+    # The row length is rounded up to whole BLOCK_N-block groups (BLOCK_N // 32 words), not to a
+    # single word: one group is read per approximate tile as a single aligned load of that width, so
+    # a row that is not a whole number of groups misaligns every tile after the first.
     # The padding bits are SET, because a set bit means "already computed exactly" and so masks that
     # column out of the approximate pass; that is what clips the last tile's overhang, and it is why
     # the kernel needs no masked-tail path at all. Clearing them instead would let the pooled rows
     # past num_kv_blocks contribute spurious mass.
     num_work_items = batch * nhead_q * num_q_tiles
-    bitmap_Ds = 4 * ((num_kv_blocks + 127) // 128)
+    bitmap_Ds = (BLOCK_N // 32) * ((num_kv_blocks + BLOCK_N - 1) // BLOCK_N)
     bits = block_attn_mask.reshape(num_work_items, num_kv_blocks)
     if bitmap_Ds * 32 != num_kv_blocks:
         bits = F.pad(bits, (0, bitmap_Ds * 32 - num_kv_blocks), value=True)
