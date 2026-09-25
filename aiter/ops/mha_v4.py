@@ -208,24 +208,31 @@ def native_fp8_format() -> AttentionFormat:
 
 
 @functools.cache
-def mha_v4_kv_tile() -> int:
+def mha_v4_kv_tile(operands=None, mode=None) -> int:
     """Return the KV tile of the DEFAULT block-sparse MHA v4 geometry on the active GPU.
 
     Read from the same manifest the launcher dispatches on rather than restated here, so adding a
-    sparse row with a different tile cannot leave the two disagreeing. 128 on gfx950, 64 on gfx942.
+    sparse row with a different tile cannot leave the two disagreeing. Narrowed by `operands` and
+    `mode` as mha_v4_kv_tile_for_q_tile is, which see, and which explains why naming a recipe is
+    not optional on an arch whose rows differ at this Q tile.
     """
-    return mha_v4_block_tile()[1]
+    return mha_v4_block_tile(operands, mode)[1]
 
 
 @functools.cache
-def mha_v4_block_tile() -> tuple[int, int]:
-    """Return the default block-sparse (q_tile, kv_tile) on the active GPU.
+def mha_v4_block_tile(operands=None, mode=None) -> tuple[int, int]:
+    """Return the default block-sparse (q_tile, kv_tile) for a recipe on the active GPU.
 
-    The default is the geometry at _MHA_V4_Q_TILE, which is the one every existing caller's block
-    mask is shaped for. An arch may ship others -- gfx950 also has a 64x64 FP8 row, for models
-    routed more finely than a 128-token block -- and mha_v4_block_tiles() lists them.
+    The default is that recipe's geometry at _MHA_V4_Q_TILE. An arch may ship a finer one -- gfx950
+    also has 64x64 FP8 and BF16 rows, for models routed more finely than their Q tile -- and
+    mha_v4_block_tiles() lists every geometry a recipe has.
+
+    `operands` is not optional in practice on gfx950, because its rows no longer agree on the KV
+    tile at this Q tile: BF16 and BF16/FP8 route on 64 tokens and everything else on 128. Asking
+    without them raises rather than picking one, since the caller is about to shape a mask to the
+    answer and a mask cut for the wrong block is not a near miss.
     """
-    return (_MHA_V4_Q_TILE, mha_v4_kv_tile_for_q_tile(_MHA_V4_Q_TILE))
+    return (_MHA_V4_Q_TILE, mha_v4_kv_tile_for_q_tile(_MHA_V4_Q_TILE, operands, mode))
 
 
 @functools.cache
@@ -344,6 +351,19 @@ def _mha_v4_kv_tile_for_q_tile_from_manifest(
             "they agree"
         )
     return kv_tiles.pop() if kv_tiles else 0
+
+
+def mha_v4_block_tiles_in_any_precision(mode: int) -> tuple[tuple[int, int], ...]:
+    """Every (q_tile, kv_tile) this GPU has a `mode` row for, without collapsing precisions.
+
+    mha_v4_block_tiles() answers one KV tile per Q tile, which is what a caller shaping a mask
+    needs and is why it refuses where the rows disagree. This is for describing the hardware --
+    error messages and "is this tile buildable at all" checks -- which want the whole set and must
+    not raise on their way to reporting something else. It is no use for choosing a geometry: a
+    tile listed here may exist in a precision the caller is not running.
+    """
+    rows = _mha_v4_block_rows_from_manifest()[mode]
+    return tuple(sorted({(row[_ROW_TS_QO], row[_ROW_TS_KV]) for row in rows}))
 
 
 def _mha_v4_block_q_tiles_from_manifest() -> tuple[int, ...]:
@@ -1007,9 +1027,11 @@ def mha_v4_packed(
     whose source scale could not survive pooling.
 
     block_tile names the (q_tile, kv_tile) geometry the LUT and pooled tensors
-    were built for; it defaults to mha_v4_block_tile(). Pass 64x64 on gfx950 to
-    route FP8 at a 64-token block instead of 128, which costs throughput per
-    token and only pays off if the finer blocks drop enough attention mass --
+    were built for; it defaults to this call's own operands' geometry, since
+    gfx950's rows no longer agree on the KV tile at a given Q tile. Pass 64x64
+    to route at a 64-token block with a 64-row query tile as well, which costs
+    throughput per token -- the same KV is re-read by four times as many query
+    tiles -- and only pays off if the finer blocks drop enough attention mass.
     mha_v4_block_tiles() lists what the GPU has kernels for.
     """
     if return_lse:
@@ -1116,9 +1138,6 @@ def mha_v4_packed(
         _mha_v4_fwd_launch(*launch_args)
     else:
         mode_name = "Sol-Attn" if pooled is not None else "sorted-sparse"
-        q_tile, kv_tile = (
-            mha_v4_block_tile() if block_tile is None else tuple(block_tile)
-        )
         # Scalar query, not a membership test against mha_v4_block_tiles(): this sits on the
         # torch.compile path, where only the guarded per-Q-tile read is traceable. Asked for these
         # operands rather than for any, because a geometry can be precision-specific and the
@@ -1127,12 +1146,17 @@ def mha_v4_packed(
             q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode
         )
         mode = MHA_V4_SOL_ATTN_MODE if pooled is not None else MHA_V4_SPARSE_MODE
+        q_tile, kv_tile = (
+            mha_v4_block_tile(operands, mode)
+            if block_tile is None
+            else tuple(block_tile)
+        )
         if mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) != kv_tile:
             raise ValueError(
                 f"{mode_name} MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
                 f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
                 f"{mha_v4_block_tiles(operands, mode)} and the GPU has "
-                f"{mha_v4_block_tiles(mode=mode)} in some precision"
+                f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
             )
         if k.shape[1] % kv_tile != 0:
             raise ValueError(
@@ -1669,12 +1693,27 @@ def mha_v4_mxfp8(
     lut_indices: Optional[Tensor] = None  # noqa: UP045
     lut_start: Optional[Tensor] = None  # noqa: UP045
     lut_count: Optional[Tensor] = None  # noqa: UP045
+    fp8_format = native_fp8_format()
     if block_mask is not None:
+        # This recipe's own geometry, not the arch's: the rows do not agree on the KV tile at a
+        # given Q tile, so the mask has to be cut to the tile these operands dispatch at.
         lut_indices, lut_start, lut_count = _block_mask_to_lut(
-            block_mask, q, k, mha_v4_block_tile()
+            block_mask,
+            q,
+            k,
+            mha_v4_block_tile(
+                mha_v4_operands(
+                    fp8_format,
+                    fp8_format,
+                    fp8_format,
+                    AttentionScaleMode.E8M0_PER_1X32,
+                    AttentionScaleMode.E8M0_PER_1X32,
+                    AttentionScaleMode.F32_PER_TENSOR,
+                ),
+                MHA_V4_SPARSE_MODE,
+            ),
         )
 
-    fp8_format = native_fp8_format()
     q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
     k_quantized, k_descale = quantize_mxfp8_k(k)
     v_quantized, v_descale = quantize_fp8(v)
@@ -1720,8 +1759,9 @@ def mha_v4(
     be a power of two no greater than 16; output retains Q's head count.
     ``block_mask`` is optional boolean tile metadata: ``[B, H, Qtiles, KVtiles]``
     or ``[B, Qtiles, KVtiles]`` (broadcast heads). Its geometry is ``block_tile``,
-    defaulting to mha_v4_block_tile() -- 256x128 on gfx950, 256x64 on gfx942 --
-    and gfx950 also accepts 64x64 for finer routing, in FP8 and BF16. Ask
+    defaulting to the geometry this call's own operands dispatch at: 256x64 on
+    gfx950 for BF16 and BF16/FP8, 256x128 there for everything else, 256x64 on
+    gfx942. gfx950 also accepts 64x64 for finer routing, in FP8 and BF16. Ask
     mha_v4_block_tiles() with this call's operands rather than assuming: a
     geometry need not exist in every precision. Sparse LUT rows are one
     per query head; K/V addressing uses the GQA ratio. A row may select nothing:
@@ -1739,7 +1779,24 @@ def mha_v4(
     lut_count: Optional[Tensor] = None  # noqa: UP045
     if block_mask is not None:
         lut_indices, lut_start, lut_count = _block_mask_to_lut(
-            block_mask, q, k, mha_v4_block_tile() if block_tile is None else block_tile
+            block_mask,
+            q,
+            k,
+            (
+                mha_v4_block_tile(
+                    mha_v4_operands(
+                        q_format,
+                        k_format,
+                        v_format,
+                        q_scale_mode,
+                        k_scale_mode,
+                        v_scale_mode,
+                    ),
+                    MHA_V4_SPARSE_MODE,
+                )
+                if block_tile is None
+                else block_tile
+            ),
         )
     packed_lut = {
         "kv_block_indices": lut_indices,
@@ -1944,11 +2001,12 @@ def mha_v4_sol_attn(
     that have no descale at all, but not for the block-granular MX ones, which would need pooled
     scales of their own.
 
-    ``block_tile`` sets the routing and dispatch geometry, defaulting to mha_v4_block_tile(). A
-    finer tile raises beta's resolution -- the threshold is per query tile, so 64x64 gives a block
-    a quarter as much mass to hide behind -- at the cost of more work per token; gfx950 FP8 is the
-    only recipe with a 64x64 row. Routing, pooling and the kernel all read it from here, so they
-    cannot end up disagreeing.
+    ``block_tile`` sets the routing and dispatch geometry, defaulting to the geometry this call's
+    own operands dispatch at. A finer tile raises beta's resolution -- the threshold is per query
+    tile, so a smaller block has less mass to hide behind -- at the cost of more work per token.
+    BF16 and BF16/FP8 route on a 64-token block by default; FP8 and BF16 also have a 64x64 row,
+    which narrows the query tile too. Routing, pooling and the kernel all read it from here, so
+    they cannot end up disagreeing.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
@@ -1990,7 +2048,16 @@ def mha_v4_sol_attn(
     # Routed from the quantized K/V, not the BF16 inputs: the proxy scores have to be the ones the
     # kernel's exact pass will reproduce, or a block sitting within rounding distance of the
     # threshold can be selected here and skipped there.
-    tile_m, tile_n = mha_v4_block_tile() if block_tile is None else block_tile
+    tile_m, tile_n = (
+        mha_v4_block_tile(
+            mha_v4_operands(
+                q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode
+            ),
+            MHA_V4_SOL_ATTN_MODE,
+        )
+        if block_tile is None
+        else block_tile
+    )
     plan = sol_attn_prepare(
         q_quantized,
         k_quantized,

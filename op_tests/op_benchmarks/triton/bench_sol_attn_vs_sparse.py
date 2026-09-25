@@ -39,9 +39,11 @@ import torch
 import triton
 
 from aiter.ops.mha_v4 import (
+    MHA_V4_SOL_ATTN_MODE,
     AttentionFormat,
     AttentionScaleMode,
     mha_v4_kv_tile,
+    mha_v4_operands,
     mha_v4_packed,
     mha_v4_q_multiplier,
     native_fp8_format,
@@ -85,6 +87,43 @@ def wan_self_attn_tokens(resolution: str) -> int:
     )
 
 
+def recipe_formats(recipe: str):
+    """The (formats, scale_modes) naming this recipe's manifest row."""
+    fp8 = native_fp8_format()
+    if recipe == "fp8":
+        formats = (fp8, fp8, fp8)
+        return formats, scale_modes_for_formats(*formats)
+    if recipe == "mxfp8":
+        # FP8 and MXFP8 name the same three formats and are told apart only by the scale modes.
+        return (fp8, fp8, fp8), (
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.F32_PER_TENSOR,
+        )
+    if recipe in ("bf16", "bf16fp8"):
+        formats = (
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            fp8 if recipe == "bf16fp8" else AttentionFormat.BF16,
+        )
+        return formats, scale_modes_for_formats(*formats)
+    raise ValueError(f"unknown recipe {recipe!r}")
+
+
+def recipe_kv_tile(recipe: str) -> int:
+    """The KV tile this recipe routes at, which is the block the mask below is cut to.
+
+    Per recipe rather than per arch: on gfx950 the BF16 rows route on a 64-token block and every
+    other recipe on 128, so there is no arch-wide tile left to ask for. Read off the Sol-Attn row,
+    which is what BLOCK_N feeds; each recipe's sparse row agrees with it, which is what lets one
+    mask serve both launches.
+    """
+    formats, scale_modes = recipe_formats(recipe)
+    return mha_v4_kv_tile(
+        mha_v4_operands(*formats, *scale_modes), MHA_V4_SOL_ATTN_MODE
+    )
+
+
 def build_operands(seqlen: int, heads: int, recipe: str, device="cuda"):
     """Quantize one set of BF16 operands through the production path for this recipe."""
     torch.manual_seed(0)
@@ -100,20 +139,12 @@ def build_operands(seqlen: int, heads: int, recipe: str, device="cuda"):
         q_quant, q_descale = quantize_fp8_rotated(q)
         k_quant, k_descale = quantize_fp8_rotated(k)
         v_quant, v_descale = quantize_fp8(v)
-        formats = (fp8, fp8, fp8)
-        scale_modes = scale_modes_for_formats(*formats)
         # Per-tensor descales survive pooling untouched, so no pooled scale is passed.
         prepare_kwargs = {}
     elif recipe == "mxfp8":
         q_quant, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
         k_quant, k_descale = quantize_mxfp8_k(k)
         v_quant, v_descale = quantize_fp8(v)
-        formats = (fp8, fp8, fp8)
-        scale_modes = (
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.F32_PER_TENSOR,
-        )
         # K is block granular, so its pooled image needs a scale of its own; V is per-
         # tensor.
         prepare_kwargs = {"k_scale": k_descale}
@@ -125,16 +156,11 @@ def build_operands(seqlen: int, heads: int, recipe: str, device="cuda"):
         k_quant, k_descale = k, k
         v_is_fp8 = recipe == "bf16fp8"
         v_quant, v_descale = quantize_fp8(v) if v_is_fp8 else (v, v)
-        formats = (
-            AttentionFormat.BF16,
-            AttentionFormat.BF16,
-            fp8 if v_is_fp8 else AttentionFormat.BF16,
-        )
-        scale_modes = scale_modes_for_formats(*formats)
         prepare_kwargs = {}
     else:
         raise ValueError(f"unknown recipe {recipe!r}")
 
+    formats, scale_modes = recipe_formats(recipe)
     del q, k, v
     torch.cuda.empty_cache()
     return dict(
@@ -143,6 +169,7 @@ def build_operands(seqlen: int, heads: int, recipe: str, device="cuda"):
         scale_modes=scale_modes,
         prepare_kwargs=prepare_kwargs,
         softmax_scale=softmax_scale,
+        recipe=recipe,
     )
 
 
@@ -163,11 +190,11 @@ def time_pair(operands, mask, warmup, rep):
         q_quant,
         k_quant,
         v_quant,
-        # The manifest's KV tile, not the default: gfx942 re-tiles to 64 where gfx950 uses
-        # 128, and the mask this is handed was built at the manifest's size. Leaving it
+        # This recipe's manifest KV tile, not the default: the rows re-tile by arch and by
+        # recipe, and the mask this is handed was built at the manifest's size. Leaving it
         # defaulted made the two disagree by a factor of two and the call fail outright,
         # which is why this bench only ever ran on gfx950.
-        BLOCK_N=mha_v4_kv_tile(),
+        BLOCK_N=recipe_kv_tile(operands["recipe"]),
         block_attn_mask=mask,
         **operands["prepare_kwargs"],
     )
@@ -215,7 +242,7 @@ def run_degree(degree, tokens, sparsities, recipe, warmup, rep):
     # it also keeps the two kernels honest: a short tail block is forced onto Sol-Attn's
     # exact pass
     # and would otherwise be one block of selection the sparse row never saw.
-    block_n = mha_v4_kv_tile()
+    block_n = recipe_kv_tile(recipe)
     seqlen = -(-tokens // block_n) * block_n
     num_q_tiles = -(-seqlen // SOL_ATTN_TS_QO)
     num_kv_blocks = seqlen // block_n

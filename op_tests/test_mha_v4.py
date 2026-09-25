@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     MHA_V4_LOG2E,
     MHA_V4_SOL_ATTN_MODE,
+    MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
@@ -25,6 +26,7 @@ from aiter.ops.mha_v4 import (
     mha_v4_kv_tile,
     mha_v4_kv_tile_for_q_tile,
     mha_v4_mxfp8,
+    mha_v4_operands,
     mha_v4_packed,
     mha_v4_q_multiplier,
     mha_v4_sol_attn,
@@ -1209,7 +1211,7 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
     q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    kv_tiles = 256 // mha_v4_kv_tile()
+    kv_tiles = 256 // _default_kv_tile(q_format, v_format)
     mask = torch.ones((1, 2, 1, kv_tiles), device="cuda", dtype=torch.bool)
     dense = mha_v4(q, k, v, q_format, q_format, v_format)
     sparse = mha_v4(
@@ -1234,12 +1236,12 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
 def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
     """The mask path derives its geometry from host state, which Dynamo cannot trace.
 
-    mha_v4_kv_tile() reads the manifest and get_gfx() shells out to rocminfo, so both sit behind
+    _default_kv_tile() reads the manifest and get_gfx() shells out to rocminfo, so both sit behind
     torch_compile_guard. Without that the sparse mask path costs graph breaks per trace and fails
     under fullgraph, which no other test in this file would notice.
     """
     torch.manual_seed(41)
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 4 * kv_tile, 2, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
@@ -1292,7 +1294,7 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     q = torch.randn((1, 256, query_heads, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 256, kv_heads, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    kv_tiles = 256 // mha_v4_kv_tile()
+    kv_tiles = 256 // _default_kv_tile(q_format, v_format)
     mask = torch.ones((1, query_heads, 1, kv_tiles), device="cuda", dtype=torch.bool)
     k_repeated = k.repeat_interleave(gqa_ratio, dim=2)
     v_repeated = v.repeat_interleave(gqa_ratio, dim=2)
@@ -1386,7 +1388,7 @@ def _sparse_fp8_launch(q, k, v, block_mask=None):
 
 def _gather_kv_tiles(operand, tiles):
     """Concatenate the named KV tiles, leaving the quantized bytes and descale untouched."""
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     gathered = torch.cat(
         [operand.quantized[:, tile * kv_tile : (tile + 1) * kv_tile] for tile in tiles],
         dim=1,
@@ -1412,7 +1414,7 @@ def _tile_mask(heads, kv_tiles, tiles, q_tiles=1, batch=1):
 def test_mha_v4_sparse_reads_only_the_kv_tiles_the_lut_names(tiles):
     """A kernel that ignored kv_block_indices would pass every all-True test."""
     heads = 2
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     kv_tiles = 4
     q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
 
@@ -1437,7 +1439,7 @@ def test_mha_v4_sparse_reads_only_the_kv_tiles_the_lut_names(tiles):
 def test_mha_v4_sparse_distinct_kv_tiles_give_distinct_results():
     """Guards the reference itself: selecting different tiles must change the output."""
     heads = 2
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     kv_tiles = 4
     q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
 
@@ -1462,7 +1464,7 @@ def test_mha_v4_sparse_distinct_kv_tiles_give_distinct_results():
 def test_mha_v4_sparse_gives_each_head_its_own_kv_tiles():
     """4-D masks may give heads different KV lists; each head must follow its own row."""
     heads = 3
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     kv_tiles = 4
     per_head = ((0,), (3,), (1, 2))
     q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
@@ -1492,7 +1494,7 @@ def test_mha_v4_sparse_gives_each_head_its_own_kv_tiles():
 def test_mha_v4_sparse_follows_the_lut_across_query_tiles():
     """Multiple query tiles exercise the work table on a real launch, not just its ordering."""
     heads = 2
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     kv_tiles = 4
     q_tiles = 2
     q, k, v = _sparse_fp8_operands(
@@ -1531,7 +1533,7 @@ def test_mha_v4_sparse_partial_query_tile_follows_the_lut(tail_rows):
     that tile must come back zero rather than reading the masked-off remainder.
     """
     heads = 2
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     kv_tiles = 4
     q_tiles = 3
     per_tile = ((0, (0,)), (1, (1, 2)), (2, (3,)))
@@ -1689,7 +1691,7 @@ def test_mha_v4_sparse_empty_row_writes_zeros(launch):
     torch.manual_seed(0)
     q = torch.randn((1, 256, heads, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn(
-        (1, kv_tiles * mha_v4_kv_tile(), heads, 128),
+        (1, kv_tiles * _default_kv_tile(), heads, 128),
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -1720,7 +1722,7 @@ def test_mha_v4_sparse_empty_row_writes_zeros(launch):
 def test_mha_v4_rejects_non_bool_block_mask():
     """Counts come from a sum but the fill uses truthiness, so non-bool masks disagree."""
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
-    mask = torch.ones((1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.int32)
+    mask = torch.ones((1, 2, 1, 256 // _default_kv_tile()), dtype=torch.int32)
     with pytest.raises(ValueError, match="block_mask must be a bool tensor"):
         mha_v4(
             q,
@@ -1739,7 +1741,7 @@ def test_mha_v4_rejects_non_bool_block_mask():
 def test_mha_v4_rejects_block_mask_on_another_device():
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16, device="cuda:0")
     mask = torch.ones(
-        (1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.bool, device="cuda:1"
+        (1, 2, 1, 256 // _default_kv_tile()), dtype=torch.bool, device="cuda:1"
     )
     with pytest.raises(ValueError, match="block_mask must be on the same device"):
         mha_v4(
@@ -1761,7 +1763,7 @@ def test_mha_v4_rejects_block_mask_on_another_device():
 def test_mha_v4_sparse_rejects_empty_kv_block_indices():
     """Rows may be empty, but the ASM still dereferences the row base, so the buffer cannot be."""
     heads = 2
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     kv_tiles = 4
     q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
     rows = heads  # batch 1, one query tile
@@ -1814,7 +1816,7 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
 def test_mha_v4_sparse_validation_rejects_malformed_lut(mutate, message):
     """Only reachable with AITER_MHA_V4_VALIDATE_LUT=1; otherwise these fault in the ASM."""
     heads = 2
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile()
     kv_tiles = 4
     q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
     mask = _tile_mask(heads, kv_tiles, (0, 1))
@@ -1891,6 +1893,30 @@ class _SolAttnRecipe(NamedTuple):
         """
         return 1.0 / MHA_V4_LOG2E if self.k_carries_pooled_scale else None
 
+    def kv_tile(self):
+        """The KV tile this recipe's Sol-Attn row routes at.
+
+        Built from the recipe's own scale modes rather than derived from its formats, because
+        that is the whole difference between two rows here: FP8 and MXFP8 name the same three
+        formats and are told apart only by the scale modes, so deriving them would ask about
+        the wrong row.
+        """
+        return mha_v4_kv_tile(
+            mha_v4_operands(
+                self.qk_format,
+                self.qk_format,
+                self.v_format,
+                self.qk_scale_mode,
+                self.qk_scale_mode,
+                self.v_scale_mode,
+            ),
+            MHA_V4_SOL_ATTN_MODE,
+        )
+
+    def block_tile(self):
+        """The (q_tile, kv_tile) this recipe's Sol-Attn row dispatches at."""
+        return (256, self.kv_tile())
+
     def operands(self, sequence_k, heads=2, sequence_q=256, batch=1, seed=0):
         q, k, v = _sol_attn_raw_inputs(sequence_k, heads, sequence_q, batch, seed)
         # A packed recipe carries its BF16 source along: pooling and the reference both have to work
@@ -1905,7 +1931,7 @@ class _SolAttnRecipe(NamedTuple):
     def prepare(self, q, k, v, beta, heads, block_tile=None):
         """Route and pool. K's scale goes in only when pooling cannot preserve it."""
         packed = self.packed_format
-        tile_m, tile_n = mha_v4_block_tile() if block_tile is None else block_tile
+        tile_m, tile_n = self.block_tile() if block_tile is None else block_tile
         return sol_attn_prepare(
             # Routing scores Q, and a packed Q is not element addressable either, so a packed
             # recipe routes on its source. Scale invariance is what makes that equivalent.
@@ -2097,9 +2123,30 @@ def _sol_attn_co_available(co_name: str = "fwd_hd128_fp8_sol_attn.co") -> bool:
     return os.path.isfile(os.path.join(fwd_dir, co_name))
 
 
+def _default_kv_tile(q_format=None, v_format=None, mode=MHA_V4_SPARSE_MODE):
+    """The KV tile the block-sparse rows route at for these formats.
+
+    Named rather than left to the arch because gfx950's rows no longer agree at a 256-row query
+    tile: BF16 and BF16/FP8 route on a 64-token block and every other recipe on 128, so an
+    operand-blind query raises. Defaults to the per-tensor FP8 row, which is what most of the
+    tests here build, and takes the formats where a test is parametrized over them.
+    """
+    q_format = native_fp8_format() if q_format is None else q_format
+    v_format = native_fp8_format() if v_format is None else v_format
+    return mha_v4_kv_tile(
+        mha_v4_operands(
+            q_format,
+            q_format,
+            v_format,
+            *scale_modes_for_formats(q_format, q_format, v_format),
+        ),
+        mode,
+    )
+
+
 # gfx942 carries mode-2 rows for the two per-tensor recipes only; the MX ones skip themselves on
 # the per-recipe code-object check below. Everything else in this section reads its geometry from
-# mha_v4_kv_tile(), so it retiles from 256x128 to 256x64 without further arch branching.
+# its recipe's own geometry, so it retiles from 256x128 to 256x64 without further arch branching.
 _MHA_V4_SOL_ATTN_ARCH = get_gfx() in ("gfx942", "gfx950")
 
 
@@ -2181,7 +2228,7 @@ def test_mha_v4_sol_attn_select_all_ignores_the_pooled_tensors():
     bitmap row pitch breaks that: the correction leaks in and the two runs diverge.
     """
     heads, batch = 2, 1
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE)
     kv_tiles = 4
     q, k, v = _sparse_fp8_operands(
         sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
@@ -2192,7 +2239,7 @@ def test_mha_v4_sol_attn_select_all_ignores_the_pooled_tensors():
         v.quantized,
         beta=0.4,
         num_heads=heads,
-        BLOCK_N=mha_v4_kv_tile(),
+        BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE),
     )
     plan = _select_all_plan(
         routed, batch, heads, routed["num_q_tiles"], kv_tiles, q.quantized.device
@@ -2234,7 +2281,7 @@ def test_mha_v4_sol_attn_select_all_is_no_less_accurate_than_the_sparse_row():
     from aiter.test_mha_common import sol_attn_ref
 
     heads, batch = 2, 1
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE)
     kv_tiles = 4
     q, k, v = _sparse_fp8_operands(
         sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
@@ -2245,7 +2292,7 @@ def test_mha_v4_sol_attn_select_all_is_no_less_accurate_than_the_sparse_row():
         v.quantized,
         beta=0.4,
         num_heads=heads,
-        BLOCK_N=mha_v4_kv_tile(),
+        BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE),
     )
     plan = _select_all_plan(
         routed, batch, heads, routed["num_q_tiles"], kv_tiles, q.quantized.device
@@ -2295,7 +2342,7 @@ def test_mha_v4_sol_attn_matches_the_oracle_and_beats_keep_or_drop(beta, recipe)
     from aiter.test_mha_common import sol_attn_ref
 
     heads, batch = 2, 1
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = recipe.kv_tile()
     kv_tiles = 16
     q, k, v = recipe.operands(
         sequence_k=kv_tiles * kv_tile, heads=heads, sequence_q=512, batch=batch
@@ -2406,7 +2453,7 @@ def test_mha_v4_sol_attn_empty_lut_rows_fall_back_to_the_pooled_softmax():
     from aiter.test_mha_common import sol_attn_ref
 
     heads, batch = 2, 1
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE)
     kv_tiles = 8
     q, k, v = _sparse_fp8_operands(
         sequence_k=kv_tiles * kv_tile, heads=heads, sequence_q=512, batch=batch
@@ -2417,7 +2464,7 @@ def test_mha_v4_sol_attn_empty_lut_rows_fall_back_to_the_pooled_softmax():
         v.quantized,
         beta=0.4,
         num_heads=heads,
-        BLOCK_N=mha_v4_kv_tile(),
+        BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE),
     )
     # Empty every row, keeping the bitmap consistent with it: nothing is exact, so nothing is
     # masked out of the approximate pass. The tail bits above num_kv_blocks stay set.
@@ -2471,7 +2518,7 @@ def test_mha_v4_sol_attn_compiles_without_graph_breaks():
     in an opaque custom op of their own. A graph break here would take that away.
     """
     heads, batch = 2, 1
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE)
     kv_tiles = 4
     q, k, v = _sparse_fp8_operands(
         sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
@@ -2484,7 +2531,7 @@ def test_mha_v4_sol_attn_compiles_without_graph_breaks():
             v.quantized,
             beta=0.4,
             num_heads=heads,
-            BLOCK_N=mha_v4_kv_tile(),
+            BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_ATTN_MODE),
         )
         return _sol_attn_launch(q, k, v, plan)
 
@@ -2508,7 +2555,7 @@ def test_mha_v4_sol_attn_raw_matches_quantizing_and_routing_by_hand(beta, recipe
     if not _sol_attn_co_available(recipe.co_name):
         pytest.skip(f"{recipe.co_name} is not deployed")
     heads, batch = 2, 1
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = recipe.kv_tile()
     q, k, v = _sol_attn_raw_inputs(
         sequence_k=16 * kv_tile, heads=heads, sequence_q=512, batch=batch, seed=3
     )
@@ -2545,7 +2592,7 @@ def test_mha_v4_sol_attn_raw_compile_parity(recipe):
     if not _sol_attn_co_available(recipe.co_name):
         pytest.skip(f"{recipe.co_name} is not deployed")
     heads, batch = 2, 1
-    kv_tile = mha_v4_kv_tile()
+    kv_tile = recipe.kv_tile()
     q, k, v = _sol_attn_raw_inputs(
         sequence_k=4 * kv_tile, heads=heads, batch=batch, seed=5
     )
@@ -2577,7 +2624,7 @@ def test_mha_v4_sol_attn_mxfp4_fills_both_pooled_scale_slots(beta):
 
     heads, batch = 2, 1
     q, k, v = recipe.operands(
-        sequence_k=16 * mha_v4_kv_tile(), heads=heads, sequence_q=512, batch=batch
+        sequence_k=16 * recipe.kv_tile(), heads=heads, sequence_q=512, batch=batch
     )
     plan = recipe.prepare(q, k, v, beta=beta, heads=heads)
     assert plan["mean_k_scale"] is not None and plan["mean_v_scale"] is not None, (
@@ -2625,7 +2672,7 @@ def test_mha_v4_sol_attn_reads_the_pooled_scale_it_was_given():
     if not _sol_attn_co_available(recipe.co_name):
         pytest.skip(f"{recipe.co_name} is not deployed")
     heads = 2
-    q, k, v = recipe.operands(sequence_k=8 * mha_v4_kv_tile(), heads=heads)
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
     plan = recipe.prepare(q, k, v, beta=0.4, heads=heads)
     assert plan["mean_k_scale"] is not None
     assert plan["mean_v_scale"] is None, "this recipe's V is per-tensor and pools for free"
@@ -2655,7 +2702,7 @@ def test_mha_v4_sol_attn_pooled_scales_must_match_the_scale_modes(recipe):
     if not _sol_attn_co_available(recipe.co_name):
         pytest.skip(f"{recipe.co_name} is not deployed")
     heads = 2
-    q, k, v = recipe.operands(sequence_k=8 * mha_v4_kv_tile(), heads=heads)
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
     plan = recipe.prepare(q, k, v, beta=0.4, heads=heads)
 
     def launch(**scales):
@@ -2855,20 +2902,47 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _mha_v4_fine_tile_available() -> bool:
-    return _MHA_V4_FINE_TILE in mha_v4_block_tiles()
+    # Asked about the per-tensor FP8 row, which is the only one the tests below launch. A blind
+    # query would raise here rather than answer: this enumerates one KV tile per Q tile, and at
+    # 256 rows gfx950 serves two of them depending on the recipe.
+    fp8 = native_fp8_format()
+    per_tensor = AttentionScaleMode.F32_PER_TENSOR
+    operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
+    return _MHA_V4_FINE_TILE in mha_v4_block_tiles(operands)
 
 
 _MHA_V4_FINE_TILE_REASON = "no 64x64 block-sparse MHA v4 row on this GPU"
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
-def test_mha_v4_block_tile_default_is_the_256_row():
-    """Adding geometries must not move the default: every existing caller's mask is shaped for it."""
-    q_tile, kv_tile = mha_v4_block_tile()
+def test_mha_v4_block_tile_default_is_the_256_row_of_the_named_recipe():
+    """Adding geometries must not move a recipe's default: its callers' masks are shaped for it.
+
+    Asked per recipe because that is the only way the question has an answer once an arch serves
+    more than one KV tile at this Q tile, which gfx950 now does.
+    """
+    fp8 = native_fp8_format()
+    per_tensor = AttentionScaleMode.F32_PER_TENSOR
+    operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
+    q_tile, kv_tile = mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE)
     assert q_tile == 256
-    assert kv_tile == mha_v4_kv_tile()
-    assert mha_v4_kv_tile_for_q_tile(q_tile) == kv_tile
-    assert (q_tile, kv_tile) in mha_v4_block_tiles()
+    assert kv_tile == mha_v4_kv_tile(operands, MHA_V4_SPARSE_MODE)
+    assert mha_v4_kv_tile_for_q_tile(q_tile, operands, MHA_V4_SPARSE_MODE) == kv_tile
+    assert (q_tile, kv_tile) in mha_v4_block_tiles(operands, MHA_V4_SPARSE_MODE)
+
+
+@pytest.mark.skipif(
+    get_gfx() != "gfx950", reason="only gfx950 serves two KV tiles at a 256-row query tile"
+)
+def test_mha_v4_block_tile_refuses_to_guess_when_the_rows_disagree():
+    """BF16 routes on a 64-token block here and every other recipe on 128.
+
+    There is no arch-wide answer to give, and a mask cut for the wrong block does not miss by a
+    little -- it addresses the wrong keys -- so the operand-blind query raises rather than
+    returning one of the two.
+    """
+    with pytest.raises(ValueError, match="disagree on ts_kv"):
+        mha_v4_block_tile()
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
