@@ -2934,6 +2934,52 @@ def test_mha_v4_sparse_64x64_follows_the_lut():
 
 
 @pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+@pytest.mark.parametrize("reversed_order", [False, True])
+def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_order):
+    """Every other sparse case here names one block set and gives it to every query tile, which
+    is the one shape of mask that cannot separate the two KV pointers: if K ignored the LUT and
+    stayed on block 0 while V followed it, a mask whose blocks are all block 0 still reads the
+    right K. Only a mask that differs per query tile pulls them apart. Both orders run because a
+    tile index that happens to equal its block index is its own coincidence.
+    """
+    torch.manual_seed(5)
+    q_tile, kv_tile = _MHA_V4_FINE_TILE
+    seqlen, heads, head_dim = 1024, 2, 128
+    q = torch.randn((1, seqlen, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(k)
+    q_tiles, kv_tiles = seqlen // q_tile, seqlen // kv_tile
+
+    tiles = torch.arange(q_tiles, device="cuda")
+    blocks = tiles % kv_tiles
+    if reversed_order:
+        blocks = (kv_tiles - 1) - blocks
+    mask = torch.zeros((1, heads, q_tiles, kv_tiles), device="cuda", dtype=torch.bool)
+    mask[0, :, tiles, blocks] = True
+
+    out = mha_v4(
+        q,
+        k,
+        v,
+        AttentionFormat.BF16,
+        AttentionFormat.BF16,
+        AttentionFormat.BF16,
+        block_mask=mask,
+        block_tile=_MHA_V4_FINE_TILE,
+    )
+    torch.cuda.synchronize()
+
+    qf, kf, vf = (t.float().transpose(1, 2) for t in (q, k, v))
+    scores = torch.einsum("bhqd,bhkd->bhqk", qf, kf) * head_dim**-0.5
+    tokens = mask.repeat_interleave(q_tile, 2).repeat_interleave(kv_tile, 3)
+    weights = scores.masked_fill(~tokens, float("-inf")).softmax(-1)
+    reference = torch.einsum("bhqk,bhkd->bhqd", weights, vf).transpose(1, 2)
+
+    assert torch.isfinite(out).all()
+    assert _cosine(out, reference) > 0.999
+
+
+@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
 def test_mha_v4_sol_attn_64x64_select_all_matches_dense():
     """Selecting every block leaves the pooled pass with nothing to correct, so Sol-Attn at 64x64
     has to reduce to its own exact pass. This is what catches a bitmap grouped for the wrong tile:

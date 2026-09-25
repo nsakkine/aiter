@@ -241,8 +241,8 @@ def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
     operands is what mha_v4_operands() builds -- the three formats and their three scale modes,
     which together are what picks a manifest row. It matters wherever the answer is not the default
     geometry, because an arch need not serve every geometry in every precision: gfx950's 64x64 rows
-    are FP8 only, so asking without operands says 64x64 exists and asking with MX ones says it does
-    not. The scale modes are part of it and not an over-specification, since the FP8 and MXFP8 rows
+    are FP8 and BF16 only, so asking without operands says 64x64 exists and asking with MX ones says
+    it does not. The scale modes are part of it and not an over-specification, since the FP8 and MXFP8 rows
     take the same three formats and differ only there.
 
     mode picks one of MHA_V4_BLOCK_SPARSE_MODES instead of answering for all of them. Left None
@@ -1721,7 +1721,9 @@ def mha_v4(
     ``block_mask`` is optional boolean tile metadata: ``[B, H, Qtiles, KVtiles]``
     or ``[B, Qtiles, KVtiles]`` (broadcast heads). Its geometry is ``block_tile``,
     defaulting to mha_v4_block_tile() -- 256x128 on gfx950, 256x64 on gfx942 --
-    and gfx950 FP8 also accepts 64x64 for finer routing. Sparse LUT rows are one
+    and gfx950 also accepts 64x64 for finer routing, in FP8 and BF16. Ask
+    mha_v4_block_tiles() with this call's operands rather than assuming: a
+    geometry need not exist in every precision. Sparse LUT rows are one
     per query head; K/V addressing uses the GQA ratio. A row may select nothing:
     an all-False row is a no-op that writes a zero output tile.
     """
