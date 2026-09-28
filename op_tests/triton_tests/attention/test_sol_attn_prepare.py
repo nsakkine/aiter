@@ -510,3 +510,126 @@ def test_a_supplied_mask_stays_fullgraph_traceable():
     )
     for name in ("mean_k", "mean_v", "block_bitmap", "lut_start", "lut_count"):
         assert torch.equal(compiled[name], eager[name]), name
+
+
+# The error router's proxy is not scale invariant. This puts the fixture's fp8 code products at
+# logits of a few nats, where the mass and spread terms both matter.
+ROUTING_SCALE = 2e-6
+
+
+def _tile_moments(q, block_m):
+    """Per-tile mean and population variance of q, one slice at a time (ragged last tile)."""
+    means, variances = [], []
+    for start in range(0, q.shape[1], block_m):
+        tile = q[:, start : start + block_m].float()
+        means.append(tile.mean(dim=1))
+        variances.append(tile.var(dim=1, unbiased=False))
+    return torch.stack(means, dim=1), torch.stack(variances, dim=1)
+
+
+@pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
+def test_error_router_matches_reference(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv):
+    """The error proxy against an independent computation from tile moments and the stored var_k."""
+    q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
+    prep = sol_attn_prepare(
+        q, k, v, BETA, k_variance=True, router="error", routing_scale=ROUTING_SCALE
+    )
+
+    g = nhead_q // nhead_kv
+    c = ROUTING_SCALE
+    q_mean, q_var = _tile_moments(q, SOL_ATTN_TS_QO)
+    k_mean = prep["mean_k"].float().repeat_interleave(g, dim=2)
+    k_var = (prep["mean_k_var"].float() * 512.0).repeat_interleave(g, dim=2)
+    dot = lambda a, b: torch.einsum("bihd,bjhd->bhij", a, b)  # noqa: E731
+    sig2 = c * c * dot(q_var + q_mean * q_mean, k_var)
+    proxy = (
+        c * dot(q_mean, k_mean)
+        + 0.5 * sig2
+        + 0.5 * c * c * dot(q_var, k_mean * k_mean)
+        + torch.log(torch.expm1(sig2.clamp(1e-30, 20.0)))
+    )
+    tau = proxy.mean(-1, keepdim=True) + BETA * proxy.std(-1, unbiased=False, keepdim=True)
+    expected = proxy > tau
+    if seqlen_k % SOL_ATTN_TS_KV:
+        expected[..., -1] = True
+    empty = ~expected.any(dim=-1, keepdim=True)
+    expected = expected | (
+        empty & torch.nn.functional.one_hot(proxy.argmax(-1), proxy.shape[-1]).bool()
+    )
+    # The moments are formed differently here (var vs E[q^2] - mean^2), so a block within fp32
+    # rounding of tau may land either side.
+    mismatched = (prep["block_attn_mask"] != expected).sum().item()
+    assert mismatched <= max(1, expected.numel() // 1000), mismatched
+
+    # And it is a different selection from the mean router, or this test proves nothing.
+    mean_mask = sol_attn_prepare(q, k, v, BETA)["block_attn_mask"]
+    assert not torch.equal(prep["block_attn_mask"], mean_mask)
+
+
+def test_error_router_leaves_the_default_and_the_pooled_operands_alone():
+    q, k, v = _operands(1, 1024, 2048, 4, 2)
+    default = sol_attn_prepare(q, k, v, BETA)
+    explicit = sol_attn_prepare(q, k, v, BETA, router="mean")
+    with_var = sol_attn_prepare(q, k, v, BETA, k_variance=True)
+    error = sol_attn_prepare(q, k, v, BETA, router="error", routing_scale=ROUTING_SCALE)
+    for name in ("mean_k", "mean_v", "block_bitmap", "block_attn_mask"):
+        assert torch.equal(explicit[name], default[name]), name
+        assert torch.equal(with_var[name], default[name]), name
+    for name in ("mean_k", "mean_v"):
+        assert torch.equal(error[name], default[name]), name
+    assert default["mean_k_var"] is None and error["mean_k_var"] is None
+
+
+def test_error_router_takes_a_device_scale():
+    """A per-tensor descale lives on the device; passing it must not need a host read."""
+    q, k, v = _operands(1, 1024, 2048, 4, 2)
+    as_float = sol_attn_prepare(q, k, v, BETA, router="error", routing_scale=ROUTING_SCALE)
+    as_tensor = sol_attn_prepare(
+        q, k, v, BETA, router="error",
+        routing_scale=torch.tensor([ROUTING_SCALE], device="cuda"),
+    )
+    assert torch.equal(as_float["block_attn_mask"], as_tensor["block_attn_mask"])
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"router": "max"}, "router must be"),
+        ({"router": "error"}, "routing_scale goes with"),
+        ({"routing_scale": 1.0}, "routing_scale goes with"),
+    ],
+)
+def test_error_router_rejects_an_incoherent_request(kwargs, message):
+    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    with pytest.raises(ValueError, match=message):
+        sol_attn_prepare(q, k, v, BETA, **kwargs)
+
+
+def test_error_router_rejects_a_supplied_mask_and_an_integer_k():
+    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
+    with pytest.raises(ValueError, match="routes from beta"):
+        sol_attn_prepare(q, k, v, block_attn_mask=mask, router="error", routing_scale=1.0)
+    k_int = k.float().round().clamp(-127, 127).to(torch.int8)
+    with pytest.raises(ValueError, match="floating-point K"):
+        sol_attn_prepare(q, k_int, v, BETA, router="error", routing_scale=1.0)
+    with pytest.raises(ValueError, match="floating-point K"):
+        sol_attn_prepare(q, k_int, v, BETA, k_variance=True)
+
+
+def test_error_router_compiles_fullgraph_and_matches_eager():
+    q, k, v = _operands(1, 9419, 9419, 5, 5)
+    scale = torch.tensor([ROUTING_SCALE], device="cuda")
+    kwargs = dict(k_variance=True, router="error", routing_scale=scale)
+    eager = sol_attn_prepare(q, k, v, BETA, **kwargs)
+    compiled = torch.compile(sol_attn_prepare, fullgraph=True, dynamic=False)(
+        q, k, v, BETA, **kwargs
+    )
+    for name in ("mean_k", "mean_v", "block_attn_mask", "block_bitmap", "lut_start", "lut_count"):
+        assert torch.equal(compiled[name], eager[name]), name
+    # Inductor reduces the fp32 variance in another order, so an element on an e4m3 rounding
+    # boundary can land one step away (1 in ~47k here).
+    a, b = eager["mean_k_var"].float(), compiled["mean_k_var"].float()
+    off = a != b
+    assert off.sum().item() <= max(1, a.numel() // 1000)
+    assert ((a - b).abs() <= 0.125 * torch.maximum(a.abs(), b.abs()))[off].all()

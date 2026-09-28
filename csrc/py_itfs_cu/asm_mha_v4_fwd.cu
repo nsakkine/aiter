@@ -155,13 +155,12 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_lut_freeze) == 0x2C0);
 static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 
 // Sol-Attn kernarg: the same sparse LUT prefix, then the pooled K/V of the approximate branch, the
-// selection bitmap, the pooled strides, and the pooled SCALES, padded to 1040.
+// selection bitmap, the pooled strides, the pooled SCALES, and an optional work table, 1056 bytes.
 //
-// ptr_work_table keeps its 0x2D0 slot but stays NULL: Sol-Attn dispatches the dense 3-D grid, so
-// there is no work table to read. That slot is also why sorted dispatch and Sol-Attn are mutually
-// exclusive rather than merely redundant -- the sorted layout puts s_num_wgs/s_total_tiles at 0x2E0,
-// exactly where this one starts ptr_mean_k, so combining them needs those two scalars relocated
-// past 0x390 on both sides of the ABI.
+// The sorted-sparse layout's 0x2D0 work-table slot carries s_kv_range_blocks here instead. A row
+// that does not declare kv_range never reads it, and the launcher leaves it 0 for those. Sol-Attn
+// cannot reuse the sorted-sparse layout's work table either: that layout puts s_num_wgs and
+// s_total_tiles at 0x2E0, where this one starts ptr_mean_k, so its own table sits at 0x410.
 //
 // The pooled scales from 0x390 exist for the block-granular recipes. Pooling runs along the
 // SEQUENCE axis, so whether a descale survives it depends only on whether that descale varies along
@@ -170,6 +169,15 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 // those recipes have to pool in dequantized space and requantize, which produces scales of its own
 // that the approximate pass must read instead of K's or V's. Recipes that do not need them leave
 // these slots NULL and keep reading the source scales.
+//
+// A row that declares `jensen` (its K is never E8M0, so the K-scale slot is otherwise idle) reads
+// that slot and its three strides as the optional per-block K variance instead: NULL there is the
+// uncorrected pooled pass, non-NULL adds the second-order term to every pooled logit. On an FP8 K
+// the variance is of the codes divided by 512 (SOL_ATTN_FP8_VAR_DIVISOR), which the kernel undoes.
+//
+// A row that declares `sorted` also reads ptr_work_table at 0x410: non-NULL, the grid is 1-D and
+// each workgroup takes its (q_tile, head, batch) from the table, heaviest LUT row first; NULL is
+// the raster 3-D grid. A row without it declares a 1040-byte kernarg and never sees the slot.
 struct __attribute__((packed)) FmhaV4SolAttnKernarg
 {
     FmhaV4Kernarg dense;
@@ -177,7 +185,7 @@ struct __attribute__((packed)) FmhaV4SolAttnKernarg
     ConstPointerSlot ptr_lut_start;
     ConstPointerSlot ptr_lut_count;
     ConstPointerSlot ptr_lut_freeze;
-    ConstPointerSlot ptr_work_table;
+    ScalarSlot s_kv_range_blocks;
     ConstPointerSlot ptr_mean_k;
     ConstPointerSlot ptr_mean_v;
     ConstPointerSlot ptr_block_bitmap;
@@ -197,12 +205,14 @@ struct __attribute__((packed)) FmhaV4SolAttnKernarg
     ScalarSlot s_mean_v_scale_Seqs;
     ScalarSlot s_mean_v_scale_Hs;
     ScalarSlot s_mean_v_scale_Bs;
+    ConstPointerSlot ptr_work_table;
 };
 
-static_assert(sizeof(FmhaV4SolAttnKernarg) == 1040,
-              "MHA v4 Sol-Attn kernarg ABI must remain 1040 bytes");
+static_assert(sizeof(FmhaV4SolAttnKernarg) == 1056,
+              "MHA v4 Sol-Attn kernarg ABI must remain 1056 bytes");
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_work_table) == 0x410);
 static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_kv_block_indices) == 0x290);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_work_table) == 0x2D0);
+static_assert(offsetof(FmhaV4SolAttnKernarg, s_kv_range_blocks) == 0x2D0);
 static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k) == 0x2E0);
 static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_v) == 0x2F0);
 static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_block_bitmap) == 0x300);
@@ -396,11 +406,18 @@ constexpr int32_t kWorkTableSortThreads = 1024;
 // Host-side wave width, only used to size the grid. Device code reads warpSize directly, and the
 // grid-stride loop stays correct if the two disagree.
 constexpr int32_t kWorkTableWave = 64;
+// Sol-Attn sorts on lut_count in this many levels of the KV length rather than on the count
+// itself, raster order within a level. Its ordinary tiles spread over a range of counts, and an
+// exact sort scatters neighbouring query tiles across heads: on 64x64 rows over a 42k-token
+// sequence that lost the shared K/V reads and cost 15-38%. Coarse levels still start an all-exact
+// (sink) row first, which is the straggler the table is for; 2 to 8 levels measured alike.
+constexpr int64_t kSolSortLevels = 4;
 
 // Order and pack in a single launch, by counting each entry's rank rather than moving entries past
-// each other. The key carries the whole ordering: the count is complemented into the high half so
-// longer LUTs come first, and the slot index sits in the low half, which breaks ties toward raster
-// order and so makes uniform counts come out as the identity permutation.
+// each other. The key carries the whole ordering: the count (divided by bucket, 1 for an exact
+// order) is complemented into the high half so longer LUTs come first, and the slot index sits in
+// the low half, which breaks ties toward raster order and so makes uniform counts come out as the
+// identity permutation.
 //
 // Because the slot index makes every key distinct, an entry's rank is exactly the number of keys
 // below it. That is a permutation with no tie-breaking pass, and it is stable by definition.
@@ -418,13 +435,15 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
                                                 const int32_t* __restrict__ lut_count,
                                                 const int32_t total,
                                                 const int32_t q_tiles,
-                                                const int32_t nhead)
+                                                const int32_t nhead,
+                                                const int32_t bucket)
 {
     __shared__ uint64_t keys[kWorkTableFusedMax];
 
     for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
     {
-        keys[slot] = (static_cast<uint64_t>(~static_cast<uint32_t>(lut_count[slot])) << 32) |
+        const uint32_t level = static_cast<uint32_t>(lut_count[slot] / bucket);
+        keys[slot] = (static_cast<uint64_t>(~level) << 32) |
                      static_cast<uint32_t>(slot);
     }
     __syncthreads();
@@ -448,7 +467,11 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
 }
 
 at::Tensor
-build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhead, int64_t q_tiles)
+build_sorted_work_table(const at::Tensor& lut_count,
+                        int64_t batch,
+                        int64_t nhead,
+                        int64_t q_tiles,
+                        int64_t bucket = 1)
 {
     auto flat           = lut_count.reshape({-1}).contiguous();
     const int64_t total = batch * nhead * q_tiles;
@@ -480,13 +503,17 @@ build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhea
             flat.data_ptr<int32_t>(),
             static_cast<int32_t>(total),
             static_cast<int32_t>(q_tiles),
-            static_cast<int32_t>(nhead));
+            static_cast<int32_t>(nhead),
+            static_cast<int32_t>(bucket));
         return table;
     }
 
     // Past the LDS staging limit, defer the sort to ATen and pack separately. A stable sort keeps
     // the tie behaviour identical to the fused path.
-    const auto order = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
+    const auto order = at::argsort(bucket > 1 ? at::floor_divide(flat, bucket) : flat,
+                                   /*stable=*/true,
+                                   /*dim=*/0,
+                                   /*descending=*/true);
     constexpr int32_t block_size = 256;
     const dim3 grid(static_cast<uint32_t>((total + block_size - 1) / block_size));
     pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(table.data_ptr<int32_t>(),
@@ -623,6 +650,9 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
     args.s_k_Hs.value        = k.stride(2) * k.element_size();
     args.s_k_Bs.value        = k.stride(0) * k.element_size();
     args.s_opt.value         = 5;
+    // LSE off unless a caller asks: set_lse_kernarg below overwrites these three slots. A row
+    // whose code object has no LSE store ignores all of them, which is why asking is checked
+    // against the manifest rather than against the pointer being non-null.
     args.s_lse.value         = 0;
     args.s_kv_seq_len.value  = seqlen_k;
     args.s_qk_head_dim.value = kHeadDim;
@@ -658,6 +688,60 @@ struct PackedMhaV4Shapes
     int64_t nhead_k;
     int64_t gqa_ratio;
 };
+
+// Point the kernel's LSE slots at `lse`, or leave the launch writing no LSE when it is nullopt.
+//
+// The kernel writes row (b, h) as seqlen_q unit-stride floats at ptr_lse + (b * nhead_q + h) *
+// s_lse_Hs, and writes nothing past seqlen_q. So the rows must be unit-stride float32 and the batch
+// stride is not independently settable: a tensor whose batch stride is not nhead_q * head stride
+// would have its heads written over each other. A contiguous [batch, nhead_q, seqlen_q] tensor
+// satisfies both.
+void set_lse_kernarg(FmhaV4Kernarg& args,
+                     const std::optional<at::Tensor>& lse,
+                     const fmha_v4_fwdConfig& cfg,
+                     const at::Tensor& q,
+                     int64_t batch,
+                     int64_t nhead_q,
+                     int64_t seqlen_q,
+                     const char* mode_name)
+{
+    if(!lse.has_value())
+    {
+        return;
+    }
+    const at::Tensor& t = lse.value();
+    TORCH_CHECK(cfg.lse != 0,
+                mode_name,
+                " MHA v4 row ",
+                cfg.knl_name,
+                " has no LSE store in its code object, so return_lse would leave the buffer as "
+                "allocated -- which reads as a log-sum-exp of whatever was in it. Use a row whose "
+                "manifest lse column is 1.");
+    TORCH_CHECK(t.is_cuda() && t.get_device() == q.get_device(),
+                mode_name,
+                " MHA v4 LSE must be on the same device as q");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, mode_name, " MHA v4 LSE must be float32");
+    TORCH_CHECK(t.dim() == 3 && t.size(0) == batch && t.size(1) == nhead_q &&
+                    t.size(2) == seqlen_q,
+                mode_name,
+                " MHA v4 LSE must be [batch, nhead_q, seqlen_q] = [",
+                batch,
+                ", ",
+                nhead_q,
+                ", ",
+                seqlen_q,
+                "], got ",
+                t.sizes());
+    TORCH_CHECK(t.stride(2) == 1, mode_name, " MHA v4 LSE rows must be unit-stride");
+    TORCH_CHECK(t.stride(0) == nhead_q * t.stride(1),
+                mode_name,
+                " MHA v4 LSE batch stride must be nhead_q * head stride; the kernel derives the "
+                "batch offset from the head stride and cannot honour an independent one");
+
+    args.ptr_lse.value  = t.data_ptr();
+    args.s_lse.value    = 1;
+    args.s_lse_Hs.value = t.stride(1) * t.element_size();
+}
 
 PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
                                          const at::Tensor& k,
@@ -832,7 +916,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t q_scale_mode,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
-                 double softmax_scale)
+                 double softmax_scale,
+                 std::optional<at::Tensor> lse)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -880,6 +965,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
                            softmax_scale);
+    set_lse_kernarg(
+        args, lse, cfg, q, shapes.batch, shapes.nhead_q, shapes.seqlen_q, "dense");
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
@@ -912,7 +999,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         const at::Tensor& lut_start,
                         const at::Tensor& lut_count,
                         int64_t q_tile,
-                        int64_t kv_tile)
+                        int64_t kv_tile,
+                        std::optional<at::Tensor> lse)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -1009,6 +1097,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
                            softmax_scale);
+    set_lse_kernarg(
+        args.dense, lse, cfg, q, shapes.batch, shapes.nhead_q, shapes.seqlen_q, "sorted-sparse");
     args.ptr_kv_block_indices.value = kv_idx.data_ptr();
     args.ptr_lut_start.value        = start.data_ptr();
     args.ptr_lut_count.value        = count.data_ptr();
@@ -1049,7 +1139,11 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           const std::optional<at::Tensor>& mean_k_scale,
                           const std::optional<at::Tensor>& mean_v_scale,
                           int64_t q_tile,
-                          int64_t kv_tile)
+                          int64_t kv_tile,
+                          std::optional<at::Tensor> lse,
+                          int64_t kv_range_tokens,
+                          const std::optional<at::Tensor>& mean_k_var,
+                          int64_t sorted_dispatch)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -1090,6 +1184,20 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     const int64_t kv_tiles      = shapes.seqlen_k / cfg.ts_kv;
     const int64_t lut_rows      = shapes.batch * shapes.nhead_q * q_tiles;
     check_lut_capacity(cfg, kv_tiles, "Sol-Attn");
+    // Ranges are laid end to end and each has to start on a 32-block word of the selection bitmap.
+    const int64_t kv_range_quantum = 32 * cfg.ts_kv;
+    TORCH_CHECK(kv_range_tokens >= 0, "kv_range_tokens must be non-negative");
+    TORCH_CHECK(kv_range_tokens == 0 || cfg.kv_range != 0,
+                "Sol-Attn row ",
+                cfg.knl_name,
+                " has no in-kernel KV range reset; pass kv_range_tokens=0");
+    TORCH_CHECK(kv_range_tokens % kv_range_quantum == 0,
+                "kv_range_tokens must be a multiple of ",
+                kv_range_quantum,
+                " (32 blocks of ",
+                cfg.ts_kv,
+                " keys); got ",
+                kv_range_tokens);
     // The approximate pass sweeps pooled blocks the way the exact pass sweeps tokens, so one of its
     // tiles covers cfg.ts_kv BLOCKS and needs that many mask bits: ts_kv / 32 words, read as one
     // aligned load. Everything the pass reads per tile is grouped and padded to that stride.
@@ -1213,6 +1321,39 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                     "with key_length replaced by num_kv_blocks");
         TORCH_CHECK(vs.is_contiguous(), "mean_v_scale must be contiguous");
     }
+    if(mean_k_var.has_value())
+    {
+        // The kernel reads the variance with mean_k's block stride; only its base and head/batch
+        // strides are passed separately.
+        const auto& kvar = mean_k_var.value();
+        TORCH_CHECK(cfg.jensen != 0,
+                    "Sol-Attn row ",
+                    cfg.knl_name,
+                    " has no second-order pooled correction; pass mean_k_var=None");
+        TORCH_CHECK(!k_needs_pooled_scale,
+                    "mean_k_var shares the pooled K-scale slot, so it needs a K without one");
+        TORCH_CHECK(kvar.is_cuda() && kvar.device() == q.device(),
+                    "mean_k_var must be on the same GPU as Q");
+        TORCH_CHECK(kvar.scalar_type() == mean_k.scalar_type(),
+                    "mean_k_var must have mean_k's dtype");
+        TORCH_CHECK(kvar.sizes() == mean_k.sizes(), "mean_k_var must have mean_k's shape");
+        TORCH_CHECK(kvar.stride(3) == 1 && kvar.stride(1) == mean_k.stride(1),
+                    "mean_k_var must have a contiguous last dimension and mean_k's block stride");
+    }
+
+    // -1 sorts wherever the row supports it and the table's packing can address the grid, 0 keeps
+    // the raster grid, 1 insists. Rows whose LUT counts sit in one level lose nothing to it: ties
+    // keep raster order, so the table is the identity permutation. See kSolSortLevels.
+    TORCH_CHECK(sorted_dispatch >= -1 && sorted_dispatch <= 1,
+                "sorted_dispatch must be -1 (auto), 0 (raster) or 1 (sorted), got ",
+                sorted_dispatch);
+    TORCH_CHECK(sorted_dispatch != 1 || cfg.sorted != 0,
+                "Sol-Attn MHA v4 kernel ",
+                cfg.knl_name,
+                " has no sorted dispatch; pass sorted_dispatch=0 or -1");
+    const bool packable = shapes.batch < 256 && shapes.nhead_q < 256 && q_tiles < 65536;
+    const bool use_sorted =
+        cfg.sorted != 0 && (sorted_dispatch == 1 || (sorted_dispatch == -1 && packable));
 
     const auto kv_idx = kv_block_indices.contiguous();
     const auto start  = lut_start.contiguous();
@@ -1220,6 +1361,12 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     if(lut_validation_enabled())
     {
         validate_lut_contents(kv_idx, start, count, lut_rows, kv_tiles);
+    }
+    at::Tensor work_table;
+    if(use_sorted)
+    {
+        const int64_t bucket = (kv_tiles + kSolSortLevels - 1) / kSolSortLevels;
+        work_table = build_sorted_work_table(count, shapes.batch, shapes.nhead_q, q_tiles, bucket);
     }
 
     FmhaV4SolAttnKernarg args{};
@@ -1238,11 +1385,24 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
                            softmax_scale);
+    // The Sol-Attn LSE is the denominator of the ONE softmax the two branches share, so it counts
+    // the pooled proxy columns as well as the exact ones. That is the quantity partial outputs
+    // merge by, and it merges exactly, because a merge adds numerators and denominators separately
+    // and the proxy sits in both. What it does not carry is which blocks were proxied: that is
+    // decided from the blocks a caller hands this launch, so a caller splitting the KV across ranks
+    // owns keeping the routing consistent. See the note on mha_v4_sol_attn.
+    set_lse_kernarg(args.dense,
+                    lse,
+                    cfg,
+                    q,
+                    shapes.batch,
+                    shapes.nhead_q,
+                    shapes.seqlen_q,
+                    "Sol-Attn");
     args.ptr_kv_block_indices.value = kv_idx.data_ptr();
     args.ptr_lut_start.value        = start.data_ptr();
     args.ptr_lut_count.value        = count.data_ptr();
-    // ptr_work_table stays null: the grid below is the dense 3-D raster, so no workgroup decodes a
-    // work-table entry.
+    args.s_kv_range_blocks.value    = static_cast<uint32_t>(kv_range_tokens / cfg.ts_kv);
     args.ptr_mean_k.value           = mean_k.data_ptr();
     args.ptr_mean_v.value           = mean_v.data_ptr();
     args.ptr_block_bitmap.value     = block_bitmap.data_ptr();
@@ -1269,6 +1429,18 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     {
         args.ptr_mean_v_scale.value = mean_v_scale.value().data_ptr();
     }
+    if(mean_k_var.has_value())
+    {
+        const auto& kvar                = mean_k_var.value();
+        args.ptr_mean_k_scale.value     = kvar.data_ptr();
+        args.s_mean_k_scale_Seqs.value  = kvar.stride(1) * kvar.element_size();
+        args.s_mean_k_scale_Hs.value    = kvar.stride(2) * kvar.element_size();
+        args.s_mean_k_scale_Bs.value    = kvar.stride(0) * kvar.element_size();
+    }
+    if(use_sorted)
+    {
+        args.ptr_work_table.value = work_table.data_ptr();
+    }
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
@@ -1276,9 +1448,9 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
         cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
     size_t arg_size          = sizeof(args);
-    const int gdx            = static_cast<int>(q_tiles);
-    const int gdy            = static_cast<int>(shapes.nhead_q);
-    const int gdz            = static_cast<int>(shapes.batch);
+    const int gdx            = static_cast<int>(use_sorted ? lut_rows : q_tiles);
+    const int gdy            = use_sorted ? 1 : static_cast<int>(shapes.nhead_q);
+    const int gdz            = use_sorted ? 1 : static_cast<int>(shapes.batch);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
 }

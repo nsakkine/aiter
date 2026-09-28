@@ -180,22 +180,57 @@ def _sol_attn_pool_kv_quant(
     )
 
 
+# An 8-bit float K's block variance can reach its format maximum squared (448^2 for e4m3), far past
+# what the format holds, so it is stored divided by this. |k| <= max bounds the variance by max^2,
+# and max^2 / 512 stays below max for every FP8 format the kernels take.
+SOL_ATTN_FP8_VAR_DIVISOR = 512.0
+
+
 def _sol_attn_pool_reuse_descale(
-    x_quant: torch.Tensor, BLOCK_N: int
-) -> torch.Tensor:
+    x_quant: torch.Tensor, BLOCK_N: int, variance: bool = False
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Pool one operand's stored codes, in its own dtype, keeping the source descale valid.
 
     Only correct for a descale that does not vary along the sequence axis; see
     :func:`_sol_attn_pool_kv_quant` for why, and :func:`_sol_attn_pool_mx` for the case where it
     does. Rounding a mean of in-range values back to the source dtype cannot overflow.
+
+    `variance` also returns the per-block population variance from the same fp32 copy, in the
+    same dtype and layout, divided by SOL_ATTN_FP8_VAR_DIVISOR for an 8-bit float; the mean is
+    unaffected by asking for it.
     """
-    mean = _sol_attn_block_mean(x_quant.float(), BLOCK_N)
+    xf = x_quant.float()
+    mean = _sol_attn_block_mean(xf, BLOCK_N)
     if not x_quant.dtype.is_floating_point:
         # Casting to an integer dtype TRUNCATES toward zero, which would pull every pooled row
         # toward zero and shrink the approximate pass's scores. The float8 dtypes round on cast, so
         # only the integer operands (i8fp8's K) need this made explicit.
         mean = mean.round()
-    return mean.to(x_quant.dtype).contiguous()
+    mean = mean.to(x_quant.dtype).contiguous()
+    if not variance:
+        return mean
+    var = _sol_attn_block_variance(xf, BLOCK_N)
+    if x_quant.element_size() == 1:
+        var = var / SOL_ATTN_FP8_VAR_DIVISOR
+    return mean, var.to(x_quant.dtype).contiguous()
+
+
+def _sol_attn_block_variance(xf: torch.Tensor, BLOCK_N: int) -> torch.Tensor:
+    """Population variance of an fp32 BSHD tensor over each BLOCK_N-token KV block.
+
+    A short last block is taken over its real tokens, as in :func:`_sol_attn_block_mean`.
+    """
+    batch, seqlen_k, nhead_kv, channels = xf.shape
+    full = seqlen_k // BLOCK_N
+    var = (
+        xf[:, : full * BLOCK_N]
+        .reshape(batch, full, BLOCK_N, nhead_kv, channels)
+        .var(dim=2, unbiased=False)
+    )
+    if seqlen_k % BLOCK_N:
+        tail = xf[:, full * BLOCK_N :].var(dim=1, unbiased=False, keepdim=True)
+        var = torch.cat([var, tail], dim=1)
+    return var
 
 
 def _sol_attn_block_mean(xf: torch.Tensor, BLOCK_N: int) -> torch.Tensor:
@@ -386,11 +421,15 @@ def _sol_attn_pool_mxfp4_v(
     return mxfp4_v_view(raw, scale, blocks), slack_scale, pooled
 
 
-def _sol_attn_pool_q(q: torch.Tensor, BLOCK_M: int) -> torch.Tensor:
+def _sol_attn_pool_q(
+    q: torch.Tensor, BLOCK_M: int, second_moment: bool = False
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Pool Q into one representative row per query tile (the paper's Q-bar), fp32.
 
     q: (batch, seqlen_q, nheads_q, d) -> (batch, num_q_tiles, nheads_q, d)
+
+    `second_moment` also returns the per-tile mean of q^2, same shape; the mean is unaffected.
     """
     batch, seqlen_q, nhead_q, d = q.shape
     num_q_tiles = (seqlen_q + BLOCK_M - 1) // BLOCK_M
@@ -402,7 +441,18 @@ def _sol_attn_pool_q(q: torch.Tensor, BLOCK_M: int) -> torch.Tensor:
     if pad:
         qf = F.pad(qf, (0, 0, 0, 0, 0, pad))
     qf = qf.reshape(batch, num_q_tiles, BLOCK_M, nhead_q, d)
-    return qf.sum(dim=2) / counts.view(1, num_q_tiles, 1, 1)
+    counts = counts.view(1, num_q_tiles, 1, 1)
+    mean = qf.sum(dim=2) / counts
+    if not second_moment:
+        return mean
+    # One fused reduction; (qf * qf).sum would write a second full-size fp32 copy of Q first.
+    return mean, torch.linalg.vector_norm(qf, dim=2).square() / counts
+
+
+def _log_expm1(x: torch.Tensor) -> torch.Tensor:
+    """log(exp(x) - 1) for x >= 0, finite everywhere: x itself once expm1 would overflow."""
+    y = x.clamp(1e-30, 20.0)
+    return torch.log(torch.expm1(y)) + (x - y)
 
 
 def _sol_attn_route(
@@ -410,6 +460,9 @@ def _sol_attn_route(
     k_mean: torch.Tensor,
     beta: float,
     partial_tail: bool,
+    q_sq_mean: torch.Tensor | None = None,
+    k_var: torch.Tensor | None = None,
+    logit_scale: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Query-dependent threshold routing, paper Eq. (3)-(5) and (7).
@@ -418,10 +471,25 @@ def _sol_attn_route(
         tau[b, h, i]      = mean_j(proxy) + beta * population_std_j(proxy)
         selected          = proxy > tau
 
+    With q_sq_mean, k_var and logit_scale (the "error" router) the proxy is instead the log of
+    the tile-to-block mass, to second order, times the relative variance of the weights inside
+    the block, i.e. how much the pooled estimate stands to get wrong by skipping it:
+
+        c        = logit_scale, so c * q . k is the softmax logit in nats
+        var_q    = q_sq_mean - q_mean^2
+        sig2     = c^2 * q_sq_mean . k_var          row-averaged in-block logit variance
+        mass     = c * q_mean . k_mean + 0.5 * sig2 + 0.5 * c^2 * var_q . k_mean^2
+        proxy    = mass + log(expm1(sig2))
+
+    A block whose keys barely spread scores low whatever its mass, since pooling it is nearly
+    exact once the kernel takes the second-order term. That proxy is not scale invariant, which is
+    why it needs c.
+
     The std is the population std, which is what the Eq. (5) closed form over the pooled-key first
-    and second moments computes. Selection is invariant to a positive rescale of the logits (mu and
-    sigma scale with proxy), so the softmax scale and the per-tensor descales are deliberately NOT
-    applied here: host and kernel cannot disagree about routing because of a scale factor.
+    and second moments computes. The first proxy's selection is invariant to a positive rescale of
+    the logits (mu and sigma scale with proxy), so the softmax scale and the per-tensor descales are
+    deliberately NOT applied to it: host and kernel cannot disagree about routing because of a
+    scale factor.
 
     That invariance is exact in real arithmetic but not in fp32: routing on quantized values here
     and on dequantized values in a reference rounds the last bit differently, so a block whose proxy
@@ -439,7 +507,24 @@ def _sol_attn_route(
     """
     g = q_mean.shape[2] // k_mean.shape[2]
     k_rep = k_mean.float().repeat_interleave(g, dim=2)
-    proxy = torch.einsum("bihd,bjhd->bhij", q_mean.float(), k_rep)
+    if k_var is None:
+        proxy = torch.einsum("bihd,bjhd->bhij", q_mean.float(), k_rep)
+    else:
+        c = logit_scale
+        if isinstance(c, torch.Tensor):
+            c = c.float().reshape(())
+        q_m = q_mean.float()
+        q_sq = q_sq_mean.float()
+        q_var = (q_sq - q_m.square()).clamp_min(0.0)
+        kv_rep = k_var.float().repeat_interleave(g, dim=2)
+        # The three mass terms as one product over concatenated features; the operands are one
+        # row per tile or block, so the concatenation is cheap next to a (tiles x blocks) op.
+        half_c2 = 0.5 * c * c
+        lhs = torch.cat([c * q_m, half_c2 * q_sq, half_c2 * q_var], dim=-1)
+        rhs = torch.cat([k_rep, kv_rep, k_rep.square()], dim=-1)
+        mass = torch.einsum("bihd,bjhd->bhij", lhs, rhs)
+        sig2 = torch.einsum("bihd,bjhd->bhij", (c * c) * q_sq, kv_rep)
+        proxy = mass + _log_expm1(sig2)
     mu = proxy.mean(dim=-1, keepdim=True)
     sigma = proxy.std(dim=-1, unbiased=False, keepdim=True)
     selected = proxy > (mu + beta * sigma)
@@ -473,6 +558,9 @@ def sol_attn_prepare(
     v_packed_format: str | None = None,
     block_attn_mask: torch.Tensor | None = None,
     force_block_mask: torch.Tensor | None = None,
+    k_variance: bool = False,
+    router: str = "mean",
+    routing_scale: float | torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """
     Build every host-side input of the gfx950 Sol-Attn kernel (arXiv 2607.24027) from Q and the
@@ -528,6 +616,18 @@ def sol_attn_prepare(
         still required, and still describe the exact pass.
     k_source, v_source: that operand's pre-quantization tensor, required exactly when the matching
         *_packed_format is named and rejected otherwise.
+    k_variance: also return mean_k_var, for a row whose pooled logits take the second-order term
+        0.5 * scale^2 * sum_d q_d^2 * var_k[d]. Only for a floating-point K pooled in its own
+        dtype, i.e. without k_scale or k_packed_format.
+    router: how beta routing scores blocks. "mean" (the default) is the paper's q_mean . k_mean.
+        "error" scores each block by its second-order mass times the relative variance of the
+        weights inside it, which spends the exact budget where the pooled estimate is least
+        reliable; see _sol_attn_route. It is meant for a kernel that takes mean_k_var, and has
+        the same K restriction as k_variance. It does not change the default outputs.
+    routing_scale: required by router="error" and rejected otherwise: the multiplier that turns
+        q . k_quant, as passed here, into the softmax logit in nats. softmax_scale for a BF16 Q/K;
+        softmax_scale * q_descale * k_descale for a per-tensor quantized one. A float or a
+        one-element tensor, so a device-side descale needs no host read.
 
     Returns a dict with:
         mean_k, mean_v: pooled K/V in K's / V's own dtype, BSHD
@@ -536,6 +636,10 @@ def sol_attn_prepare(
         mean_k_scale, mean_v_scale: the pooled operand's own E8M0 scale, same layout as the input
             scale with seqlen_k replaced by num_kv_blocks, or None when the source descale was
             reused. These go in the mode-2 kernarg's pooled scale slots.
+        mean_k_var: the per-block population variance of k_quant, in mean_k's dtype and layout,
+            when k_variance is set; otherwise None. For an 8-bit float K it is stored divided by
+            SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes. mha_v4_packed takes it as
+            mean_k_var.
         mean_k_pooled, mean_v_pooled: the pooled operand as the packer saw it, before quantization,
             for a packed operand whose mean_k / mean_v cannot be read back and dequantized. None
             for the addressable recipes, where dequantizing the pooled tensor with its own scale
@@ -594,6 +698,29 @@ def sol_attn_prepare(
                 f"{name}_source must share (batch, seqlen_k, nheads_kv) with k_quant"
             )
 
+    if router not in ("mean", "error"):
+        raise ValueError(f"router must be 'mean' or 'error', got {router!r}")
+    error_router = router == "error"
+    if error_router and block_attn_mask is not None:
+        raise ValueError(
+            "router='error' routes from beta; a supplied block_attn_mask is not routed"
+        )
+    if error_router != (routing_scale is not None):
+        raise ValueError(
+            "routing_scale goes with router='error': the error proxy is not scale invariant and "
+            "needs it, and the mean proxy is and ignores it"
+        )
+    for flag, name in ((k_variance, "k_variance"), (error_router, "router='error'")):
+        if flag and (
+            k_scale is not None
+            or k_packed_format is not None
+            or not k_quant.dtype.is_floating_point
+        ):
+            raise ValueError(
+                f"{name} needs a floating-point K pooled in its own dtype: a block-scaled or "
+                "packed K has no single unit for the variance, and an integer one cannot hold it"
+            )
+
     num_q_tiles = (seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (seqlen_k + BLOCK_N - 1) // BLOCK_N
 
@@ -601,9 +728,21 @@ def sol_attn_prepare(
     # other: mxfp8 has an E8M0 K and a per-tensor V, f8f6 the reverse.
     mean_k_scale = mean_v_scale = None
     mean_k_pooled = mean_v_pooled = None
+    mean_k_var = None
+    k_routing_var = None
     if k_packed_format is not None:
         mean_k, mean_k_scale, mean_k_pooled = _sol_attn_pool_mxfp4_k(k_source, BLOCK_N)
         k_routing = mean_k_pooled
+    elif k_variance or error_router:
+        mean_k, stored_var = _sol_attn_pool_reuse_descale(k_quant, BLOCK_N, variance=True)
+        k_routing = mean_k
+        if k_variance:
+            mean_k_var = stored_var
+        if error_router:
+            # The variance the kernel will load, back in K's own units.
+            k_routing_var = stored_var.float()
+            if k_quant.element_size() == 1:
+                k_routing_var = k_routing_var * SOL_ATTN_FP8_VAR_DIVISOR
     elif k_scale is None:
         mean_k = _sol_attn_pool_reuse_descale(k_quant, BLOCK_N)
         k_routing = mean_k
@@ -619,12 +758,24 @@ def sol_attn_prepare(
     partial_tail = seqlen_k % BLOCK_N != 0
     if block_attn_mask is None:
         # Route on the pooled values the kernel will actually load, i.e. after the rounding.
-        block_attn_mask = _sol_attn_route(
-            _sol_attn_pool_q(q, BLOCK_M),
-            k_routing,
-            beta,
-            partial_tail=partial_tail,
-        )
+        if error_router:
+            q_mean, q_sq_mean = _sol_attn_pool_q(q, BLOCK_M, second_moment=True)
+            block_attn_mask = _sol_attn_route(
+                q_mean,
+                k_routing,
+                beta,
+                partial_tail=partial_tail,
+                q_sq_mean=q_sq_mean,
+                k_var=k_routing_var,
+                logit_scale=routing_scale,
+            )
+        else:
+            block_attn_mask = _sol_attn_route(
+                _sol_attn_pool_q(q, BLOCK_M),
+                k_routing,
+                beta,
+                partial_tail=partial_tail,
+            )
     else:
         expected = (batch, nhead_q, num_q_tiles, num_kv_blocks)
         if tuple(block_attn_mask.shape) != expected:
@@ -692,6 +843,7 @@ def sol_attn_prepare(
         "mean_v_scale": mean_v_scale,
         "mean_k_pooled": mean_k_pooled,
         "mean_v_pooled": mean_v_pooled,
+        "mean_k_var": mean_k_var,
         "block_bitmap": block_bitmap,
         "kv_block_indices": kv_block_indices,
         "lut_start": lut_start,

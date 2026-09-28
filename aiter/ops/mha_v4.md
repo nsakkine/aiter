@@ -388,7 +388,8 @@ value is silently wrong rather than refused; take it from `mha_v4_kv_tile()`.
 A gfx942 query tile that selects no block at all keeps the zero output the sparse row writes
 instead of falling back to the pooled-only softmax, which routing makes unreachable by keeping the
 highest-proxy block per row. Every mode-2 row shares
-one 1040-byte kernarg whose tail carries pooled scales; see Pooled Scales below for which rows fill
+one 1040-byte kernarg (1056 with the optional sorted work table) whose tail carries pooled
+scales; see Pooled Scales below for which rows fill
 them. It runs the same block-sparse exact pass as `mode=1` and then a
 second pass over pooled per-block K/V, masking off the blocks the LUT already covered, so a
 below-threshold block contributes its zeroth-order term instead of nothing. Both passes share one
@@ -484,11 +485,16 @@ Note this is the pooled-only *approximation* of that row, not its exact attentio
 graceful floor rather than a free lunch. `sol_attn_prepare()` keeps the highest-proxy block exact
 regardless, for accuracy rather than for safety.
 
-Sol-Attn dispatches the dense 3-D grid, not sorted dispatch. Threshold routing self-normalizes the
-per-row block counts (measured max/mean 1.11 at beta 0.4 and 1.18 at beta 1.0 on Wan shapes), so
-list scheduling recovers only 1.7-4%, less than the grid overhead it costs. The two are also
-mutually exclusive in the ABI: the sorted layout's scheduling fields occupy 0x2E0, exactly where the
-Sol-Attn layout starts `ptr_mean_k`.
+Sol-Attn dispatches the raster 3-D grid unless the row declares `sorted`, in which case
+`sorted_dispatch` (default: wherever the row supports it) launches a 1-D grid over a work table at
+kernarg 0x410, ordered by `lut_count` in four coarse levels and raster order within each. Threshold
+routing alone self-normalizes the per-row block counts (measured max/mean 1.11 at beta 0.4 and 1.18
+at beta 1.0 on Wan shapes), so there the table is close to the identity; what it moves is a forced
+all-exact row, such as folded sink queries, which would otherwise trail the grid. An exact sort by
+count is slower: it scatters neighbouring query tiles across heads and loses their shared K/V
+reads. The output is bitwise identical either way. Sol-Attn cannot reuse the sorted-sparse work
+table at 0x2D0, because that layout's scheduling fields occupy 0x2E0, where the Sol-Attn layout
+starts `ptr_mean_k`.
 
 Key length must be a multiple of the KV tile, matching `mode=1`. `sol_attn_prepare()` does handle a
 ragged tail -- it forces the short last block exact, since the approximate pass is defined for whole

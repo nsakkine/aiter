@@ -12,6 +12,7 @@ custom op.
 
 import csv
 import functools
+import math
 import os
 from enum import IntEnum
 from typing import Optional
@@ -594,11 +595,12 @@ def _fmha_v4_fwd_fake(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    lse: Optional[Tensor] = None,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del out
+    del out, lse
 
 
 @compile_ops(
@@ -621,10 +623,11 @@ def _fmha_v4_fwd(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    lse: Optional[Tensor] = None,
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_launch", mutates_args=("out",))
+@torch.library.custom_op("aiter::mha_v4_fwd_launch", mutates_args=("out", "lse"))
 def _mha_v4_fwd_launch(
     q: Tensor,
     k: Tensor,
@@ -640,6 +643,7 @@ def _mha_v4_fwd_launch(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    lse: Optional[Tensor],
 ) -> None:
     _fmha_v4_fwd(
         q,
@@ -656,6 +660,7 @@ def _mha_v4_fwd_launch(
         k_scale_mode,
         v_scale_mode,
         softmax_scale,
+        lse,
     )
 
 
@@ -675,8 +680,9 @@ def _mha_v4_fwd_launch_fake(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    lse: Optional[Tensor],
 ) -> None:
-    del q, k, v, q_descale, k_descale, v_descale, out
+    del q, k, v, q_descale, k_descale, v_descale, out, lse
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
 
@@ -701,12 +707,13 @@ def _fmha_v4_fwd_sparse_fake(
     lut_count: Tensor,
     q_tile: int = 0,
     kv_tile: int = 0,
+    lse: Optional[Tensor] = None,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
-    del out
+    del out, lse
 
 
 @compile_ops(
@@ -734,10 +741,13 @@ def _fmha_v4_fwd_sparse(
     lut_count: Tensor,
     q_tile: int = 0,
     kv_tile: int = 0,
+    lse: Optional[Tensor] = None,
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out",))
+@torch.library.custom_op(
+    "aiter::mha_v4_fwd_sparse_launch", mutates_args=("out", "lse")
+)
 def _mha_v4_fwd_sparse_launch(
     q: Tensor,
     k: Tensor,
@@ -756,6 +766,7 @@ def _mha_v4_fwd_sparse_launch(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],
     q_tile: int = 0,
     kv_tile: int = 0,
 ) -> None:
@@ -779,6 +790,7 @@ def _mha_v4_fwd_sparse_launch(
         lut_count,
         q_tile,
         kv_tile,
+        lse,
     )
 
 
@@ -801,10 +813,11 @@ def _mha_v4_fwd_sparse_launch_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],
     q_tile: int = 0,
     kv_tile: int = 0,
 ) -> None:
-    del q, k, v, q_descale, k_descale, v_descale, out
+    del q, k, v, q_descale, k_descale, v_descale, out, lse
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
@@ -835,13 +848,17 @@ def _fmha_v4_fwd_sol_attn_fake(
     mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
     q_tile: int = 0,
     kv_tile: int = 0,
+    lse: Optional[Tensor] = None,  # noqa: UP045
+    kv_range_tokens: int = 0,
+    mean_k_var: Optional[Tensor] = None,  # noqa: UP045
+    sorted_dispatch: int = -1,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
     del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale
-    del out
+    del out, lse, kv_range_tokens, mean_k_var, sorted_dispatch
 
 
 @compile_ops(
@@ -874,10 +891,16 @@ def _fmha_v4_fwd_sol_attn(
     mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
     q_tile: int = 0,
     kv_tile: int = 0,
+    lse: Optional[Tensor] = None,  # noqa: UP045
+    kv_range_tokens: int = 0,
+    mean_k_var: Optional[Tensor] = None,  # noqa: UP045
+    sorted_dispatch: int = -1,
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_sol_attn_launch", mutates_args=("out",))
+@torch.library.custom_op(
+    "aiter::mha_v4_fwd_sol_attn_launch", mutates_args=("out", "lse")
+)
 def _mha_v4_fwd_sol_attn_launch(
     q: Tensor,
     k: Tensor,
@@ -899,10 +922,14 @@ def _mha_v4_fwd_sol_attn_launch(
     mean_k: Tensor,
     mean_v: Tensor,
     block_bitmap: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
     mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
     mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
     q_tile: int = 0,
     kv_tile: int = 0,
+    kv_range_tokens: int = 0,
+    mean_k_var: Optional[Tensor] = None,  # noqa: UP045
+    sorted_dispatch: int = -1,
 ) -> None:
     _fmha_v4_fwd_sol_attn(
         q,
@@ -929,6 +956,10 @@ def _mha_v4_fwd_sol_attn_launch(
         mean_v_scale,
         q_tile,
         kv_tile,
+        lse,
+        kv_range_tokens,
+        mean_k_var,
+        sorted_dispatch,
     )
 
 
@@ -954,16 +985,21 @@ def _mha_v4_fwd_sol_attn_launch_fake(
     mean_k: Tensor,
     mean_v: Tensor,
     block_bitmap: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
     mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
     mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
     q_tile: int = 0,
     kv_tile: int = 0,
+    kv_range_tokens: int = 0,
+    mean_k_var: Optional[Tensor] = None,  # noqa: UP045
+    sorted_dispatch: int = -1,
 ) -> None:
-    del q, k, v, q_descale, k_descale, v_descale, out
+    del q, k, v, q_descale, k_descale, v_descale, out, lse
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
-    del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale
+    del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale, kv_range_tokens, mean_k_var
+    del sorted_dispatch
 
 
 def _sol_attn_triple(
@@ -1010,6 +1046,9 @@ def mha_v4_packed(
     mean_k_scale: Optional[Tensor] = None,  # noqa: UP045
     mean_v_scale: Optional[Tensor] = None,  # noqa: UP045
     block_tile: Optional[tuple[int, int]] = None,  # noqa: UP045
+    kv_range_tokens: int = 0,
+    mean_k_var: Optional[Tensor] = None,  # noqa: UP045
+    sorted_dispatch: Optional[bool] = None,  # noqa: UP045
 ) -> Tensor:
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
@@ -1033,11 +1072,42 @@ def mha_v4_packed(
     throughput per token -- the same KV is re-read by four times as many query
     tiles -- and only pays off if the finer blocks drop enough attention mass.
     mha_v4_block_tiles() lists what the GPU has kernels for.
+
+    kv_range_tokens > 0 makes Sol-Attn restart its softmax every that many keys
+    within the one launch: each range gets its own running max and pooled
+    correction, and the ranges merge by their log-sum-exp as a KV-split would,
+    without re-reading Q or re-launching. It must be a multiple of 32 KV tiles
+    and needs a row that declares kv_range; 0 is one range over the sequence.
+
+    mean_k_var, the per-block population variance of K in mean_k's dtype, shape and
+    block stride, adds the second-order term 0.5 * scale^2 * sum_d q_d^2 * var[d] to
+    every pooled logit: the Gaussian estimate of a block's log-mean-exp rather than
+    its Jensen lower bound q . mean_k. It needs a row that declares jensen; None is
+    the uncorrected pass on the same code object.
+
+    sorted_dispatch orders Sol-Attn's workgroups by lut_count, heaviest first in a few
+    coarse levels and raster order within each, so the query tiles that compute the most
+    blocks exactly (a forced sink row, say) start first instead of trailing the grid.
+    The output is identical either way. None sorts wherever the row declares sorted,
+    False keeps raster order, True requires it.
     """
-    if return_lse:
-        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     pooled = _sol_attn_triple(mean_k, mean_v, block_bitmap)
+    if mean_k_var is not None and pooled is None:
+        raise ValueError(
+            "mean_k_var corrects the Sol-Attn pooled logits; it needs the pooled triple "
+            "(mean_k, mean_v, block_bitmap)"
+        )
+    if sorted_dispatch and pooled is None:
+        raise ValueError(
+            "sorted_dispatch orders the Sol-Attn launch; it needs the pooled triple "
+            "(mean_k, mean_v, block_bitmap)"
+        )
+    if kv_range_tokens and pooled is None:
+        raise ValueError(
+            "kv_range_tokens resets the Sol-Attn pooled correction per range; "
+            "it needs the pooled triple (mean_k, mean_v, block_bitmap)"
+        )
     if pooled is not None and lut is None:
         raise ValueError(
             "Sol-Attn MHA v4 needs the ragged LUT triple as well: the pooled pass corrects the "
@@ -1118,6 +1188,17 @@ def mha_v4_packed(
     elif out.dtype != torch.bfloat16 or out.device != q.device:
         raise ValueError("out must be a BF16 tensor on the same device as Q")
 
+    # [batch, head, query] rather than out's [batch, query, head]: the kernel writes one
+    # contiguous row of queries per (batch, head). It is also the layout flash-attn returns,
+    # which is what a ring merge expects.
+    lse = (
+        torch.empty(
+            (batch, query_heads, query_length), dtype=torch.float32, device=q.device
+        )
+        if return_lse
+        else None
+    )
+
     launch_args = (
         q,
         k,
@@ -1135,7 +1216,7 @@ def mha_v4_packed(
         softmax_scale,
     )
     if lut is None:
-        _mha_v4_fwd_launch(*launch_args)
+        _mha_v4_fwd_launch(*launch_args, lse)
     else:
         mode_name = "Sol-Attn" if pooled is not None else "sorted-sparse"
         # Scalar query, not a membership test against mha_v4_block_tiles(): this sits on the
@@ -1164,18 +1245,27 @@ def mha_v4_packed(
                 f"multiple of {kv_tile}"
             )
         if pooled is None:
-            _mha_v4_fwd_sparse_launch(*launch_args, *lut, q_tile, kv_tile)
+            _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse, q_tile, kv_tile)
         else:
             _mha_v4_fwd_sol_attn_launch(
                 *launch_args,
                 *lut,
                 *pooled,
+                lse,
                 mean_k_scale,
                 mean_v_scale,
                 q_tile,
                 kv_tile,
+                kv_range_tokens,
+                mean_k_var,
+                -1 if sorted_dispatch is None else int(bool(sorted_dispatch)),
             )
-    return out
+            # The Sol-Attn rows return ln(L) - ln(kv_tile). A constant cancels in a ring merge of
+            # Sol-Attn ranks, but merging against a dense row's or flash-attn's LSE would misweight
+            # this rank by kv_tile, so restore the true log-sum-exp here.
+            if lse is not None:
+                lse.add_(math.log(kv_tile))
+    return (out, lse) if return_lse else out
 
 
 def _quantize_per_tensor(
@@ -1684,8 +1774,6 @@ def mha_v4_mxfp8(
     Optional ``block_mask`` selects the sorted-sparse row (gfx950 MXFP8 only);
     LUT rows are one per query head, and K/V addressing uses the GQA ratio.
     """
-    if return_lse:
-        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_mxfp8")
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1735,6 +1823,7 @@ def mha_v4_mxfp8(
         kv_block_indices=lut_indices,
         lut_start=lut_start,
         lut_count=lut_count,
+        return_lse=return_lse,
     )
 
 
@@ -1767,8 +1856,6 @@ def mha_v4(
     per query head; K/V addressing uses the GQA ratio. A row may select nothing:
     an all-False row is a no-op that writes a zero output tile.
     """
-    if return_lse:
-        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     q_scale_mode, k_scale_mode, v_scale_mode = scale_modes_for_formats(
         q_format, k_format, v_format
@@ -1856,6 +1943,12 @@ def mha_v4(
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
         if lut_indices is None:
+            if return_lse:
+                raise NotImplementedError(
+                    "dense MXFP4 MHA v4 takes the coalesced launch, which is a separate code "
+                    "object from the manifest rows and has no LSE store. Pass a block mask to "
+                    "reach the sparse row, which does."
+                )
             _launch_mxfp4_coalesced(
                 q_quantized,
                 q_descale,
@@ -1983,6 +2076,8 @@ def mha_v4_sol_attn(
     out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
     block_tile: Optional[tuple[int, int]] = None,  # noqa: UP045
+    kv_range_tokens: int = 0,
+    sorted_dispatch: Optional[bool] = None,  # noqa: UP045
 ) -> Tensor:
     """Quantize BF16 BSHD operands, route the blocks, and run non-causal Sol-Attn MHA v4.
 
@@ -2007,9 +2102,29 @@ def mha_v4_sol_attn(
     BF16 and BF16/FP8 route on a 64-token block by default; FP8 and BF16 also have a 64x64 row,
     which narrows the query tile too. Routing, pooling and the kernel all read it from here, so
     they cannot end up disagreeing.
+
+    ``return_lse`` gives the log-sum-exp of the ONE softmax the exact and pooled branches share,
+    so it counts the proxy columns too. That merges exactly: a ring merge adds numerators and
+    denominators separately, and the proxy sits in both, so the cancellation that makes the
+    single-rank output good survives the merge unchanged (measured to 1.6e-7 in fp32 against a
+    single-rank run of the same problem).
+
+    What does NOT survive a shard is the routing. The threshold above is taken over the blocks
+    this call is shown, so a rank holding part of the KV normalizes against its own shard, and the
+    merged result is Sol-Attn with a selection that depends on how the keys were split. Usually
+    that is harmless or even generous -- a homogeneous shard clears the bar more often, costing
+    exact work rather than accuracy -- but a rank whose blocks are uniformly relevant has almost no
+    spread for beta to cut against, so it pools content it holds: a constructed case measured 0.68
+    against exact attention on one rank and 0.50 split across two. Decide the routing globally if
+    that matters; ``mha_v4(block_mask=...)`` takes a selection the caller owns.
+
+    ``kv_range_tokens`` splits the softmax, not the routing: the kernel restarts its max and pooled
+    correction every that many keys and merges the ranges by LSE, while the selection above stays
+    global. See mha_v4_packed for the constraints; 0 is one range.
+
+    ``sorted_dispatch`` starts the query tiles with the most exact blocks first; see
+    mha_v4_packed. It changes only the order, never the output.
     """
-    if return_lse:
-        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     is_fp8_recipe = (
         q_format in _FP8_FORMATS and k_format == q_format and v_format == q_format
     )
@@ -2091,4 +2206,6 @@ def mha_v4_sol_attn(
         mean_v=plan["mean_v"],
         block_bitmap=plan["block_bitmap"],
         block_tile=(tile_m, tile_n),
+        kv_range_tokens=kv_range_tokens,
+        sorted_dispatch=sorted_dispatch,
     )

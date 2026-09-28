@@ -632,14 +632,21 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
 
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="do not produce LSE"):
+    # Refused by the manifest's lse column rather than by a blanket rule, because the rows differ:
+    # BF16, BF16/FP8 and FP8 write an LSE and the rest do not. Refusing at all matters more than
+    # where -- a row without the store leaves the buffer as allocated, which reads as a log-sum-exp
+    # rather than as a failure. Checked in the launcher because only it knows which row the dispatch
+    # chose; a Python copy of that choice is the drift the manifest exists to prevent. INT8/FP8 is
+    # the row asserted on because it is the one nearest the ported ones, so a port that flips the
+    # manifest without adding the store fails here rather than silently returning a buffer.
+    with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
         mha_v4(
             q,
             q,
             q,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
+            AttentionFormat.INT8,
+            AttentionFormat.INT8,
+            native_fp8_format(),
             return_lse=True,
         )
     with pytest.raises(ValueError, match="matching Q and K formats"):
@@ -1928,7 +1935,7 @@ class _SolAttnRecipe(NamedTuple):
             _Operand(*self.quantize_v(v), v if keep else None),
         )
 
-    def prepare(self, q, k, v, beta, heads, block_tile=None):
+    def prepare(self, q, k, v, beta, heads, block_tile=None, force_block_mask=None):
         """Route and pool. K's scale goes in only when pooling cannot preserve it."""
         packed = self.packed_format
         tile_m, tile_n = self.block_tile() if block_tile is None else block_tile
@@ -1957,6 +1964,7 @@ class _SolAttnRecipe(NamedTuple):
             v_source=v.source,
             k_packed_format=packed,
             v_packed_format=packed,
+            force_block_mask=force_block_mask,
         )
 
     @staticmethod
@@ -2160,6 +2168,8 @@ def _sol_attn_launch(
     block_bitmap=None,
     recipe=None,
     block_tile=None,
+    return_lse=False,
+    sorted_dispatch=None,
 ):
     """Launch the Sol-Attn row over a sol_attn_prepare() plan, overriding tensors if asked."""
     recipe = _FP8_SOL_ATTN_RECIPE if recipe is None else recipe
@@ -2185,6 +2195,8 @@ def _sol_attn_launch(
         mean_k_scale=plan["mean_k_scale"],
         mean_v_scale=plan["mean_v_scale"],
         block_tile=block_tile,
+        return_lse=return_lse,
+        sorted_dispatch=sorted_dispatch,
     )
 
 
@@ -2881,6 +2893,234 @@ def test_sol_attn_prepare_with_pooled_scales_compiles_without_graph_breaks():
     traced = torch.compile(routed, fullgraph=True)(q, k_data, v_data, k_scale)
     for got, want in zip(traced, eager):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+# ---------------------------------------------------------------------------
+# return_lse
+#
+# The LSE exists for ring and context parallelism: a rank holding part of the KV merges its partial
+# output with another's by their log-sum-exps, so what matters is not only that the value is close
+# to a reference but that it describes exactly the mass that rank computed. That is why the sparse
+# cases below score against a logsumexp over the SELECTED blocks rather than over all keys.
+# ---------------------------------------------------------------------------
+
+# (id, Q/K format, V format, dense tolerance in nats). None is this GPU's FP8 encoding, which is
+# gfx-dependent, so it cannot be spelled at module scope.
+_LSE_ROWS = (
+    ("bf16", AttentionFormat.BF16, AttentionFormat.BF16, 0.05),
+    ("bf16fp8", AttentionFormat.BF16, None, 0.05),
+    # The FP8 row's denominator is summed from the same FP8 P that PV consumes, so its LSE is an
+    # order of magnitude looser than the BF16 rows' -- the residual is set by how peaked each
+    # row's softmax is, not by a constant offset.
+    ("fp8", None, None, 0.09),
+)
+
+# Rows whose sorted-sparse code object also carries the store. Not every row with a dense LSE has
+# one: it is a separate build of the source and a separate manifest column.
+_LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8")
+
+
+def _lse_row(row_id):
+    """((q, k, v) formats, tolerance) for an LSE row, resolving None to this GPU's FP8 encoding."""
+    _, qk_format, v_format, tolerance = next(r for r in _LSE_ROWS if r[0] == row_id)
+    fp8 = native_fp8_format()
+    qk = fp8 if qk_format is None else qk_format
+    return (qk, qk, fp8 if v_format is None else v_format), tolerance
+
+
+def _reference_scores(q, k, softmax_scale):
+    qf, kf = (t.float().permute(0, 2, 1, 3) for t in (q, k))
+    return qf @ kf.transpose(-1, -2) * softmax_scale
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+@pytest.mark.parametrize("row_id", [row[0] for row in _LSE_ROWS])
+def test_mha_v4_dense_lse_matches_logsumexp(row_id):
+    """The natural log of the softmax denominator, not log2 and not the raw running max."""
+    torch.manual_seed(23)
+    batch, sequence, heads, head_dim = 2, 512, 3, 128
+    q = torch.randn(
+        (batch, sequence, heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    scale = head_dim**-0.5
+    formats, tolerance = _lse_row(row_id)
+
+    out, lse = mha_v4(q, k, v, *formats, softmax_scale=scale, return_lse=True)
+    torch.cuda.synchronize()
+
+    assert lse.shape == (batch, heads, sequence)
+    assert lse.dtype == torch.float32
+    reference = torch.logsumexp(_reference_scores(q, k, scale), dim=-1)
+    # Absolute, not relative: an LSE is a log, so the scale a relative bound would divide by is
+    # the arbitrary one of the exponent, and a merge consumes the difference between two of them.
+    assert (lse - reference).abs().max() < tolerance
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+@pytest.mark.parametrize("row_id", [row[0] for row in _LSE_ROWS])
+def test_mha_v4_asking_for_the_lse_does_not_change_the_output(row_id):
+    """Bitwise, so the LSE store cannot be paid for by a different softmax path."""
+    torch.manual_seed(29)
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    formats, _ = _lse_row(row_id)
+
+    plain = mha_v4(q, k, v, *formats)
+    with_lse, _ = mha_v4(q, k, v, *formats, return_lse=True)
+    torch.cuda.synchronize()
+    assert torch.equal(plain, with_lse)
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+@pytest.mark.parametrize("row_id", _LSE_SPARSE_IDS)
+def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
+    """The property a ring merge rests on.
+
+    An LSE over all keys would be wrong here in a way no output comparison catches: the outputs
+    would still agree, because O is a ratio in which the unselected mass cancels, while the weights
+    two ranks were merged with would be drawn from different distributions.
+    """
+    torch.manual_seed(31)
+    batch, sequence, heads, head_dim = 2, 1024, 2, 128
+    formats, tolerance = _lse_row(row_id)
+    q = torch.randn(
+        (batch, sequence, heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    scale = head_dim**-0.5
+    q_tile, kv_tile = mha_v4_block_tile(
+        mha_v4_operands(*formats, *scale_modes_for_formats(*formats)),
+        MHA_V4_SPARSE_MODE,
+    )
+
+    mask = torch.zeros(
+        (batch, heads, -(-sequence // q_tile), sequence // kv_tile),
+        dtype=torch.bool,
+        device="cuda",
+    )
+    mask[..., ::2] = True
+    _, lse = mha_v4(
+        q, k, v, *formats, softmax_scale=scale, block_mask=mask, return_lse=True
+    )
+    torch.cuda.synchronize()
+
+    keep = mask[:, :, 0, :].repeat_interleave(kv_tile, dim=-1)
+    scores = _reference_scores(q, k, scale)
+    selected = torch.logsumexp(scores.masked_fill(~keep[:, :, None, :], -math.inf), dim=-1)
+    assert (lse - selected).abs().max() < tolerance
+    # And it is not the all-keys LSE, which the selection makes a strictly larger number.
+    assert (torch.logsumexp(scores, dim=-1) - lse).min() > 0.1
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+@pytest.mark.parametrize(
+    ("recipe_id", "tolerance"),
+    [("bf16", 0.05), ("bf16fp8", 0.05), ("fp8", 0.09)],
+)
+def test_mha_v4_sol_attn_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
+    """It counts the pooled proxy columns as well as the exact ones, which is what makes it merge.
+
+    Checked against the reference's own joint logsumexp rather than against attention over the
+    selected blocks, because those are different numbers here and only the first one composes: a
+    ring merge adds numerators and denominators separately, so the proxy has to be in the
+    denominator for the same reason it is in the numerator. An LSE over the exact columns alone
+    would still look plausible and would silently misweight every merge.
+    """
+    from aiter.test_mha_common import sol_attn_ref
+
+    torch.manual_seed(37)
+    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == recipe_id)
+    heads, sequence = 2, 1024
+    q_tile, kv_tile = recipe.block_tile()
+    operands = recipe.operands(sequence_k=sequence, heads=heads, sequence_q=sequence)
+    plan = recipe.prepare(*operands, beta=1.0, heads=heads)
+    fraction = plan["block_attn_mask"].float().mean().item()
+    assert 0.02 < fraction < 0.9, f"degenerate routing: {fraction}"
+
+    _, lse = _sol_attn_launch(*operands, plan, recipe=recipe, return_lse=True)
+    torch.cuda.synchronize()
+
+    q_op, k_op, v_op = operands
+    _, reference = sol_attn_ref(
+        *recipe.reference_operands(q_op, k_op, v_op),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", k_op),
+        recipe.dequantize_pooled(plan, "mean_v", v_op),
+        BLOCK_M=q_tile,
+        BLOCK_N=kv_tile,
+        softmax_scale=recipe.ref_softmax_scale,
+    )
+    assert lse.shape == reference.shape
+    assert (lse - reference.float()).abs().max() < tolerance
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+def test_mha_v4_sol_attn_refuses_an_lse_on_a_row_without_the_store():
+    """A Sol-Attn row without an LSE store is rejected instead of returning uninitialized data.
+
+    Same manifest guard the dense rows take, reached through a different launch, which is the
+    point: the capability is a property of the code object, not of the mode.
+    """
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    fp8 = native_fp8_format()
+    with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
+        mha_v4_sol_attn(
+            q, q, q, AttentionFormat.INT8, AttentionFormat.INT8, fp8,
+            beta=1.0, return_lse=True,
+        )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
+@pytest.mark.parametrize("recipe_id", ["bf16", "bf16fp8", "fp8"])
+def test_mha_v4_sol_attn_sorted_dispatch_is_bitwise_raster(recipe_id):
+    """Heavy-first dispatch reorders the workgroups, never their work.
+
+    The last query tile of every (batch, head) is forced all-exact, which puts its LUT a full
+    level above the routed rows, so the table genuinely permutes the grid. A decode that got a
+    head or batch field wrong would compute some tile into another's rows and break equality.
+    """
+    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == recipe_id)
+    if not _sol_attn_co_available(recipe.co_name):
+        pytest.skip(f"{recipe.co_name} is not deployed")
+    torch.manual_seed(41)
+    batch, heads, sequence = 2, 4, 1024
+    q_tile, kv_tile = recipe.block_tile()
+    q_tiles, kv_tiles = sequence // q_tile, sequence // kv_tile
+    operands = recipe.operands(
+        sequence_k=sequence, heads=heads, sequence_q=sequence, batch=batch
+    )
+    heavy = torch.zeros((1, 1, q_tiles, kv_tiles), dtype=torch.bool, device="cuda")
+    heavy[..., -1, :] = True
+    plan = recipe.prepare(
+        *operands, beta=1.0, heads=heads, force_block_mask=heavy
+    )
+    counts = plan["lut_count"].view(batch, heads, q_tiles)
+    assert (counts[..., -1] == kv_tiles).all()
+    assert counts[..., :-1].float().mean() < 0.5 * kv_tiles, "degenerate routing"
+
+    raster = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=False)
+    ordered = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=True)
+    default = _sol_attn_launch(*operands, plan, recipe=recipe)
+    assert torch.equal(ordered, raster)
+    assert torch.equal(default, raster)
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+def test_mha_v4_sol_attn_sorted_dispatch_needs_a_row_that_declares_it():
+    """Insisting on sorted dispatch fails loudly where it cannot be honoured."""
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    fp8 = native_fp8_format()
+    with pytest.raises(RuntimeError, match="has no sorted dispatch"):
+        mha_v4_sol_attn(
+            q, q, q, AttentionFormat.INT8, AttentionFormat.INT8, fp8,
+            beta=1.0, sorted_dispatch=True,
+        )
+    bf16, none = AttentionFormat.BF16, AttentionScaleMode.NONE
+    with pytest.raises(ValueError, match="sorted_dispatch orders the Sol-Attn launch"):
+        mha_v4_packed(
+            q, q, q, q, q, q, bf16, bf16, bf16, none, none, none, sorted_dispatch=True
+        )
 
 
 # ---------------------------------------------------------------------------

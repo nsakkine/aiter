@@ -21,7 +21,10 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t q_scale_mode,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
-                 double softmax_scale);
+                 double softmax_scale,
+                 // Per-row log-sum-exp, [batch, nhead_q, seqlen_q] float32 and contiguous, or
+                 // nullopt to write none. Only rows whose manifest lse column is 1 can fill it.
+                 std::optional<at::Tensor> lse = std::nullopt);
 
 // Sorted block-sparse sibling. Same packed operands as fmha_v4_fwd, plus a ragged LUT.
 // Builds the work table internally (identity raster if lut_count is uniform, else LPT).
@@ -46,7 +49,11 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         // kv_tile, so this must match what the caller routed with; gfx950 ships
                         // both a 256x128 and a 64x64 FP8 block-sparse row.
                         int64_t q_tile,
-                        int64_t kv_tile);
+                        int64_t kv_tile,
+                        // As above. The LSE a sparse row writes covers the blocks its LUT
+                        // selected, which is exactly the mass it computed, so ranks holding
+                        // different KV shards can still be merged by it.
+                        std::optional<at::Tensor> lse = std::nullopt);
 
 // Sol-Attn sibling (arXiv 2607.24027): the LUT above still drives an EXACT pass, and a second pass
 // then sweeps the pooled per-block K/V, masking off the blocks the LUT already covered via
@@ -62,9 +69,9 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 // A row may select nothing. lut_count == 0 leaves the exact pass with no running max, and the
 // approximate pass recovers one, so such a row lands on the pooled-only softmax over every block.
 //
-// Dispatches the dense 3-D grid: threshold routing leaves the per-row block counts near uniform
-// (max/mean ~1.1), so sorted dispatch buys ~2-4% of scheduling at more than that in grid overhead,
-// and its work_table slot at 0x2D0 collides with this ABI's pooled pointers anyway.
+// Dispatches the raster 3-D grid, or on a row that declares sorted a 1-D grid ordered by lut_count
+// (see sorted_dispatch). Threshold routing alone keeps per-row block counts near uniform, and ties
+// keep raster order, so the sort mainly moves forced all-exact rows (sink queries) to the front.
 void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           const at::Tensor& k,
                           const at::Tensor& v,
@@ -90,7 +97,25 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           // As above; the pooled K/V and the selection bitmap are also in units of
                           // kv_tile, so all three of routing, pooling and dispatch must agree.
                           int64_t q_tile,
-                          int64_t kv_tile);
+                          int64_t kv_tile,
+                          // The joint softmax's log-sum-exp, over the exact columns AND the pooled
+                          // proxy ones, which is what makes it mergeable: a merge adds numerators
+                          // and denominators separately, so the proxy's contribution cancels in the
+                          // merged ratio exactly as it does in one rank's own. It says nothing
+                          // about WHICH blocks were proxied, and this launch routes from the blocks
+                          // it is handed, so a caller sharding the KV owns that consistency.
+                          std::optional<at::Tensor> lse = std::nullopt,
+                          // Reset the softmax every this many keys inside the one launch, each
+                          // range with its own pooled correction, merged by LSE. 0 is one range.
+                          // Needs a row that declares kv_range and a multiple of 32 blocks.
+                          int64_t kv_range_tokens = 0,
+                          // Per-block population variance of K, mean_k's dtype, shape and block
+                          // stride: adds 0.5 * scale^2 * sum_d q_d^2 * var[d] to each pooled logit.
+                          // Needs a row that declares jensen.
+                          const std::optional<at::Tensor>& mean_k_var = std::nullopt,
+                          // Heavy-first work order from lut_count on a row that declares sorted:
+                          // -1 wherever it applies, 0 raster, 1 required. Bitwise the same output.
+                          int64_t sorted_dispatch = -1);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
 // Reordering a permutation costs only load balance, but the table must stay a permutation: each
