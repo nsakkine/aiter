@@ -373,13 +373,41 @@ def _mha_v4_block_q_tiles_from_manifest() -> tuple[int, ...]:
 
 
 # A row as _mha_v4_block_rows_from_manifest stores it: mha_v4_operands()'s six values, then the
-# geometry. One order for both, so a filter can zip a query against a row's head.
-_ROW_TS_QO, _ROW_TS_KV = 6, 7
+# geometry, then the ragged_kv capability. One order for both, so a filter can zip a query against
+# a row's head.
+_ROW_TS_QO, _ROW_TS_KV, _ROW_RAGGED_KV = 6, 7, 8
+
+
+@torch_compile_guard()
+def _mha_v4_ragged_kv_from_manifest(
+    q_tile: int,
+    kv_tile: int,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    mode: int,
+) -> int:
+    """1 if the `mode` row for these operands and geometry masks a short last KV block, else 0."""
+    head = (
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        q_tile,
+        kv_tile,
+    )
+    rows = _mha_v4_block_rows_from_manifest()[mode]
+    return int(any(row[_ROW_RAGGED_KV] for row in rows if row[:_ROW_RAGGED_KV] == head))
 
 
 @functools.cache
 def _mha_v4_block_rows_from_manifest() -> dict[int, frozenset[tuple[int, ...]]]:
-    """Block-sparse manifest rows per mode, each as mha_v4_operands() + (ts_qo, ts_kv).
+    """Block-sparse manifest rows per mode, each as mha_v4_operands() + (ts_qo, ts_kv, ragged_kv).
 
     The operands are carried because a geometry can be precision-specific; see
     mha_v4_kv_tile_for_q_tile.
@@ -406,7 +434,11 @@ def _mha_v4_block_rows_from_manifest() -> dict[int, frozenset[tuple[int, ...]]]:
                             row["k_scale_mode"],
                             row["v_scale_mode"],
                         )
-                        + (int(row["ts_qo"]), int(row["ts_kv"]))
+                        + (
+                            int(row["ts_qo"]),
+                            int(row["ts_kv"]),
+                            int(row.get("ragged_kv") or 0),
+                        )
                     )
     except FileNotFoundError as error:
         raise ValueError(
@@ -414,10 +446,13 @@ def _mha_v4_block_rows_from_manifest() -> dict[int, frozenset[tuple[int, ...]]]:
             "unavailable on this GPU"
         ) from error
     if not all(by_mode.values()):
+        geometries = {
+            mode: sorted(row[_ROW_TS_QO:_ROW_RAGGED_KV] for row in rows)
+            for mode, rows in by_mode.items()
+        }
         raise ValueError(
             f"{gfx} has no manifest row for every block-sparse mode "
-            f"{MHA_V4_BLOCK_SPARSE_MODES}; per-mode geometries: "
-            f"{ {mode: sorted(row[_ROW_TS_QO:] for row in rows) for mode, rows in by_mode.items()} }"
+            f"{MHA_V4_BLOCK_SPARSE_MODES}; per-mode geometries: {geometries}"
         )
     return {mode: frozenset(rows) for mode, rows in by_mode.items()}
 
@@ -1239,10 +1274,13 @@ def mha_v4_packed(
                 f"{mha_v4_block_tiles(operands, mode)} and the GPU has "
                 f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
             )
-        if k.shape[1] % kv_tile != 0:
+        if k.shape[1] % kv_tile != 0 and not _mha_v4_ragged_kv_from_manifest(
+            q_tile, kv_tile, *operands, mode
+        ):
             raise ValueError(
                 f"{mode_name} MHA v4 requires key length padded to a "
-                f"multiple of {kv_tile}"
+                f"multiple of {kv_tile} for q={q_format.name} k={k_format.name} "
+                f"v={v_format.name} at {q_tile}x{kv_tile}"
             )
         if pooled is None:
             _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse, q_tile, kv_tile)

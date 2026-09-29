@@ -1032,8 +1032,10 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                                   /*mode=*/1,
                                   q_tile,
                                   kv_tile);
-    TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
-                "sorted-sparse MHA v4 requires key length padded to a multiple of ",
+    TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
+                "sorted-sparse MHA v4 row ",
+                cfg.knl_name,
+                " requires key length padded to a multiple of ",
                 cfg.ts_kv);
 
     const int64_t q_tiles  = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
@@ -1173,15 +1175,16 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                                   q_tile,
                                   kv_tile);
     // Matches the sorted-sparse sibling, whose LUT machinery Sol-Attn reuses verbatim for its exact
-    // pass. sol_attn_prepare() does handle a ragged tail (it forces the short last block to be
-    // computed exactly, since the pooled xts_kv factor only holds for a full block), so this can be
-    // relaxed whenever the sparse restriction is.
-    TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
-                "Sol-Attn MHA v4 requires key length padded to a multiple of ",
+    // pass. A short last block is only ever computed there: sol_attn_prepare() forces it exact,
+    // since the pooled xts_kv factor only holds for a full block.
+    TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
+                "Sol-Attn MHA v4 row ",
+                cfg.knl_name,
+                " requires key length padded to a multiple of ",
                 cfg.ts_kv);
 
     const int64_t q_tiles       = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
-    const int64_t kv_tiles      = shapes.seqlen_k / cfg.ts_kv;
+    const int64_t kv_tiles      = (shapes.seqlen_k + cfg.ts_kv - 1) / cfg.ts_kv;
     const int64_t lut_rows      = shapes.batch * shapes.nhead_q * q_tiles;
     check_lut_capacity(cfg, kv_tiles, "Sol-Attn");
     // Ranges are laid end to end and each has to start on a 32-block word of the selection bitmap.
