@@ -225,8 +225,8 @@ def mha_v4_block_tile(operands=None, mode=None) -> tuple[int, int]:
     """Return the default block-sparse (q_tile, kv_tile) for a recipe on the active GPU.
 
     The default is that recipe's geometry at _MHA_V4_Q_TILE. An arch may ship a finer one -- gfx950
-    also has 64x64 FP8 and BF16 rows, for models routed more finely than their Q tile -- and
-    mha_v4_block_tiles() lists every geometry a recipe has.
+    also has 64x64 FP8, BF16 and BF16/FP8 rows, for models routed more finely than their Q tile --
+    and mha_v4_block_tiles() lists every geometry a recipe has.
 
     `operands` is not optional in practice on gfx950, because its rows no longer agree on the KV
     tile at this Q tile: BF16 and BF16/FP8 route on 64 tokens and everything else on 128. Asking
@@ -249,9 +249,9 @@ def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
     operands is what mha_v4_operands() builds -- the three formats and their three scale modes,
     which together are what picks a manifest row. It matters wherever the answer is not the default
     geometry, because an arch need not serve every geometry in every precision: gfx950's 64x64 rows
-    are FP8 and BF16 only, so asking without operands says 64x64 exists and asking with MX ones says
-    it does not. The scale modes are part of it and not an over-specification, since the FP8 and MXFP8 rows
-    take the same three formats and differ only there.
+    are FP8, BF16 and BF16/FP8 only, so asking without operands says 64x64 exists and asking with
+    MX ones says it does not. The scale modes are part of it and not an over-specification, since
+    the FP8 and MXFP8 rows take the same three formats and differ only there.
 
     mode picks one of MHA_V4_BLOCK_SPARSE_MODES instead of answering for all of them. Left None
     the modes are intersected rather than unioned, since a caller shaping a mask has not yet chosen
@@ -1850,7 +1850,7 @@ def mha_v4(
     or ``[B, Qtiles, KVtiles]`` (broadcast heads). Its geometry is ``block_tile``,
     defaulting to the geometry this call's own operands dispatch at: 256x64 on
     gfx950 for BF16 and BF16/FP8, 256x128 there for everything else, 256x64 on
-    gfx942. gfx950 also accepts 64x64 for finer routing, in FP8 and BF16. Ask
+    gfx942. gfx950 also accepts 64x64 for finer routing, in FP8, BF16 and BF16/FP8. Ask
     mha_v4_block_tiles() with this call's operands rather than assuming: a
     geometry need not exist in every precision. Sparse LUT rows are one
     per query head; K/V addressing uses the GQA ratio. A row may select nothing:
@@ -2099,9 +2099,9 @@ def mha_v4_sol_attn(
     ``block_tile`` sets the routing and dispatch geometry, defaulting to the geometry this call's
     own operands dispatch at. A finer tile raises beta's resolution -- the threshold is per query
     tile, so a smaller block has less mass to hide behind -- at the cost of more work per token.
-    BF16 and BF16/FP8 route on a 64-token block by default; FP8 and BF16 also have a 64x64 row,
-    which narrows the query tile too. Routing, pooling and the kernel all read it from here, so
-    they cannot end up disagreeing.
+    BF16 and BF16/FP8 route on a 64-token block by default; FP8, BF16 and BF16/FP8 also have a
+    64x64 row, which narrows the query tile too. Routing, pooling and the kernel all read it from
+    here, so they cannot end up disagreeing.
 
     ``return_lse`` gives the log-sum-exp of the ONE softmax the exact and pooled branches share,
     so it counts the proxy columns too. That merges exactly: a ring merge adds numerators and
