@@ -12,6 +12,12 @@ import torch.nn.functional as F
 from aiter.ops.triton._triton_kernels.attention.block_lut import (
     block_attn_mask_to_lut_kernel,
 )
+from aiter.ops.triton._triton_kernels.attention.sol_attn_pool import (
+    POOL_AUX_NONE,
+    POOL_AUX_SQUARE_MEAN,
+    POOL_AUX_VARIANCE,
+    sol_attn_pool,
+)
 
 # Default tile geometry of the gfx950 Sol-Attn ASM kernels. SOL_ATTN_TS_KV in particular is the
 # pooling block size, which each row fixes rather than reading, so pooling with
@@ -200,6 +206,18 @@ def _sol_attn_pool_reuse_descale(
     asking for it. It keeps the operand's dtype, except that an integer one's is stored as e4m3,
     since an integer cannot hold it.
     """
+    var_dtype = x_quant.dtype if x_quant.dtype.is_floating_point else torch.float8_e4m3fn
+    var_multiplier = 1.0 / SOL_ATTN_FP8_VAR_DIVISOR if x_quant.element_size() == 1 else 1.0
+    if _sol_attn_pool_kernel_ok(x_quant):
+        mean, var = sol_attn_pool(
+            x_quant,
+            BLOCK_N,
+            x_quant.dtype,
+            aux=POOL_AUX_VARIANCE if variance else POOL_AUX_NONE,
+            aux_dtype=var_dtype,
+            aux_multiplier=var_multiplier,
+        )
+        return (mean, var) if variance else mean
     xf = x_quant.float()
     mean = _sol_attn_block_mean(xf, BLOCK_N)
     if not x_quant.dtype.is_floating_point:
@@ -210,11 +228,14 @@ def _sol_attn_pool_reuse_descale(
     mean = mean.to(x_quant.dtype).contiguous()
     if not variance:
         return mean
-    var = _sol_attn_block_variance(xf, BLOCK_N)
-    if x_quant.element_size() == 1:
-        var = var / SOL_ATTN_FP8_VAR_DIVISOR
-    var_dtype = x_quant.dtype if x_quant.dtype.is_floating_point else torch.float8_e4m3fn
+    var = _sol_attn_block_variance(xf, BLOCK_N) * var_multiplier
     return mean, var.to(var_dtype).contiguous()
+
+
+def _sol_attn_pool_kernel_ok(x: torch.Tensor) -> bool:
+    """Whether :func:`sol_attn_pool` covers this pooling; the torch path takes the rest."""
+    head_dim = x.shape[-1]
+    return x.is_cuda and head_dim > 0 and head_dim & (head_dim - 1) == 0
 
 
 def _sol_attn_block_variance(xf: torch.Tensor, BLOCK_N: int) -> torch.Tensor:
@@ -441,6 +462,15 @@ def _sol_attn_pool_q(
 
     `second_moment` also returns the per-tile mean of q^2, same shape; the mean is unaffected.
     """
+    if _sol_attn_pool_kernel_ok(q):
+        mean, sq_mean = sol_attn_pool(
+            q,
+            BLOCK_M,
+            torch.float32,
+            aux=POOL_AUX_SQUARE_MEAN if second_moment else POOL_AUX_NONE,
+            aux_dtype=torch.float32,
+        )
+        return (mean, sq_mean) if second_moment else mean
     batch, seqlen_q, nhead_q, d = q.shape
     num_q_tiles = (seqlen_q + BLOCK_M - 1) // BLOCK_M
     pad = num_q_tiles * BLOCK_M - seqlen_q
