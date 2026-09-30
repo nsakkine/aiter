@@ -601,6 +601,7 @@ def sol_attn_prepare(
     k_variance: bool = False,
     router: str = "mean",
     routing_scale: float | torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """
     Build every host-side input of the gfx950 Sol-Attn kernel (arXiv 2607.24027) from Q and the
@@ -617,6 +618,8 @@ def sol_attn_prepare(
         cannot: its codes are neither element addressable nor even d wide, so pass its
         pre-quantization tensor. Scale invariance is what makes the two interchangeable, and the
         MXFP4 and MXFP8 packers' Hadamard rotation is orthogonal, so it leaves the proxy alone too.
+        An E8M0-scaled Q's codes are addressable but not proportional to Q, since the scale
+        varies per token and channel group; pass its scale as q_scale.
     k_quant: (batch, seqlen_k, nheads_kv, d) already quantized, typically fp8 e4m3.
     v_quant: (batch, seqlen_k, nheads_kv, d_v) already quantized.
     beta: routing threshold, tau = mean_j(proxy) + beta * population_std_j(proxy). Pass this to
@@ -662,13 +665,17 @@ def sol_attn_prepare(
     router: how beta routing scores blocks. "mean" (the default) is the paper's q_mean . k_mean.
         "error" scores each block by its second-order mass times the relative variance of the
         weights inside it, which spends the exact budget where the pooled estimate is least
-        reliable; see _sol_attn_route. It is meant for a kernel that takes mean_k_var. It needs a K
-        pooled in its own dtype, i.e. without k_scale or k_packed_format, since routing_scale is
-        one multiplier. It does not change the default outputs.
+        reliable; see _sol_attn_route. It is meant for a kernel that takes mean_k_var. It needs
+        K's per-block variance, so not a packed K. With k_scale it scores the dequantized pooled
+        mean and variance, as the kernel will load them. It does not change the default outputs.
     routing_scale: required by router="error" and rejected otherwise: the multiplier that turns
-        q . k_quant, as passed here, into the softmax logit in nats. softmax_scale for a BF16 Q/K;
-        softmax_scale * q_descale * k_descale for a per-tensor quantized one. A float or a
+        q . k into the softmax logit in nats, for q as routing sees it (dequantized by q_scale
+        when that is given) and k as k_quant or, with k_scale, dequantized. softmax_scale for a
+        BF16 Q/K; softmax_scale * q_descale * k_descale for a per-tensor quantized one;
+        softmax_scale / m for an MXFP8 Q quantized with the multiplier m folded in. A float or a
         one-element tensor, so a device-side descale needs no host read.
+    q_scale: Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32) uint8, for an
+        MXFP8 Q. Routing then scores Q dequantized; nothing else reads Q.
 
     Returns a dict with:
         mean_k, mean_v: pooled K/V in K's / V's own dtype, BSHD
@@ -759,10 +766,14 @@ def sol_attn_prepare(
             "k_variance needs an element-addressable K: a packed K's codes have no element to "
             "take a variance of"
         )
-    if error_router and (k_scale is not None or k_packed_format is not None):
+    if error_router and k_packed_format is not None:
         raise ValueError(
-            "router='error' needs a K pooled in its own dtype: routing_scale is one multiplier, "
-            "and a block-scaled or packed K has no single unit for it to apply to"
+            "router='error' needs K's per-block variance, and a packed K's codes have no "
+            "element to take a variance of"
+        )
+    if q_scale is not None and (q_scale.dim() != 4 or q_scale.shape[:3] != q.shape[:3]):
+        raise ValueError(
+            "q_scale must be Q's E8M0 1x32 scale image, (batch, seqlen_q, nheads_q, d // 32)"
         )
 
     num_q_tiles = (seqlen_q + BLOCK_M - 1) // BLOCK_M
@@ -790,10 +801,14 @@ def sol_attn_prepare(
     elif k_scale is None:
         mean_k = _sol_attn_pool_reuse_descale(k_quant, BLOCK_N)
         k_routing = mean_k
-    elif k_variance:
-        mean_k, mean_k_scale, k_routing, mean_k_var, mean_k_var_scale = _sol_attn_pool_mx(
+    elif k_variance or error_router:
+        mean_k, mean_k_scale, k_routing, stored_var, stored_var_scale = _sol_attn_pool_mx(
             k_quant, k_scale, BLOCK_N, variance=True
         )
+        if k_variance:
+            mean_k_var, mean_k_var_scale = stored_var, stored_var_scale
+        if error_router:
+            k_routing_var = _e8m0_dequantize(stored_var, stored_var_scale)
     else:
         mean_k, mean_k_scale, k_routing = _sol_attn_pool_mx(k_quant, k_scale, BLOCK_N)
     if v_packed_format is not None:
@@ -805,6 +820,8 @@ def sol_attn_prepare(
 
     partial_tail = seqlen_k % BLOCK_N != 0
     if block_attn_mask is None:
+        if q_scale is not None:
+            q = _e8m0_dequantize(q, q_scale)
         # Route on the pooled values the kernel will actually load, i.e. after the rounding.
         if error_router:
             q_mean, q_sq_mean = _sol_attn_pool_q(q, BLOCK_M, second_moment=True)

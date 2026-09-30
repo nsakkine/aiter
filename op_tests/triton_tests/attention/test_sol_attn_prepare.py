@@ -611,14 +611,82 @@ def _block_variance(x):
     return blocks.var(dim=2, unbiased=False)
 
 
-def test_error_router_rejects_a_supplied_mask_and_a_block_scaled_k():
+def test_error_router_rejects_a_supplied_mask():
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
     mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
     with pytest.raises(ValueError, match="routes from beta"):
         sol_attn_prepare(q, k, v, block_attn_mask=mask, router="error", routing_scale=1.0)
-    k_scale = torch.full((*k.shape[:3], k.shape[3] // 32), 127, dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="pooled in its own dtype"):
-        sol_attn_prepare(q, k, v, BETA, k_scale=k_scale, router="error", routing_scale=1.0)
+
+
+def _e8m0_image(x, low=122, octaves=3):
+    """A random E8M0 1x32 scale image for x: a per-group offset, as a channel group's typical
+    magnitude sets its exponent, plus per-token jitter. Jitter alone averages out over a tile."""
+    groups = x.shape[3] // 32
+    offset = 2 * torch.arange(groups, device="cuda")
+    jitter = torch.randint(0, octaves, (*x.shape[:3], groups), device="cuda")
+    return (low + offset + jitter).to(torch.uint8)
+
+
+def _e8m0_apply(x, scale):
+    return x.float() * torch.exp2(scale.float() - 127.0).repeat_interleave(32, dim=-1)
+
+
+def test_q_scale_routes_as_the_dequantized_q():
+    """An MXFP8 Q's codes are not proportional to Q, so routing has to see it dequantized."""
+    q, k, v = _operands(1, 1024, 2048, 4, 2)
+    q_scale = _e8m0_image(q)
+    with_scale = sol_attn_prepare(q, k, v, BETA, q_scale=q_scale)
+    dequantized = sol_attn_prepare(_e8m0_apply(q, q_scale), k, v, BETA)
+    assert torch.equal(with_scale["block_attn_mask"], dequantized["block_attn_mask"])
+    # A per-group scale that varies really does move the selection, or this proves nothing.
+    codes = sol_attn_prepare(q, k, v, BETA)
+    assert not torch.equal(with_scale["block_attn_mask"], codes["block_attn_mask"])
+    with pytest.raises(ValueError, match="q_scale must be"):
+        sol_attn_prepare(q, k, v, BETA, q_scale=q_scale[:, :-1])
+
+
+def test_error_router_on_a_block_scaled_k_scores_the_dequantized_moments():
+    """With k_scale the proxy is built from what the kernel loads: the requantized pooled mean and
+    variance, dequantized by their own scales, against the dequantized Q."""
+    q, k, v = _operands(1, 1024, 2048, 4, 2)
+    q_scale, k_scale = _e8m0_image(q), _e8m0_image(k)
+    # The top channel group's scales sit near 1, so the code products keep their magnitude.
+    c = ROUTING_SCALE
+    prep = sol_attn_prepare(
+        q, k, v, BETA, k_scale=k_scale, q_scale=q_scale, k_variance=True,
+        router="error", routing_scale=c,
+    )
+
+    g = q.shape[2] // k.shape[2]
+    q_mean, q_var = _tile_moments(_e8m0_apply(q, q_scale), SOL_ATTN_TS_QO)
+    k_mean = _e8m0_apply(prep["mean_k"], prep["mean_k_scale"]).repeat_interleave(g, dim=2)
+    k_var = _e8m0_apply(prep["mean_k_var"], prep["mean_k_var_scale"]).repeat_interleave(g, dim=2)
+    dot = lambda a, b: torch.einsum("bihd,bjhd->bhij", a, b)  # noqa: E731
+    sig2 = c * c * dot(q_var + q_mean * q_mean, k_var)
+    proxy = (
+        c * dot(q_mean, k_mean)
+        + 0.5 * sig2
+        + 0.5 * c * c * dot(q_var, k_mean * k_mean)
+        + torch.log(torch.expm1(sig2.clamp(1e-30, 20.0)))
+    )
+    tau = proxy.mean(-1, keepdim=True) + BETA * proxy.std(-1, unbiased=False, keepdim=True)
+    expected = proxy > tau
+    empty = ~expected.any(dim=-1, keepdim=True)
+    expected = expected | (
+        empty & torch.nn.functional.one_hot(proxy.argmax(-1), proxy.shape[-1]).bool()
+    )
+    mismatched = (prep["block_attn_mask"] != expected).sum().item()
+    assert mismatched <= max(1, expected.numel() // 1000), mismatched
+    assert not torch.equal(
+        prep["block_attn_mask"],
+        sol_attn_prepare(q, k, v, BETA, k_scale=k_scale, q_scale=q_scale)["block_attn_mask"],
+    )
+    # Routing needs the variance whether or not the kernel takes it; the outputs follow k_variance.
+    no_var = sol_attn_prepare(
+        q, k, v, BETA, k_scale=k_scale, q_scale=q_scale, router="error", routing_scale=c
+    )
+    assert torch.equal(no_var["block_attn_mask"], prep["block_attn_mask"])
+    assert no_var["mean_k_var"] is None and no_var["mean_k_var_scale"] is None
 
 
 def test_k_variance_of_an_integer_k_is_its_codes_over_512_in_e4m3():
