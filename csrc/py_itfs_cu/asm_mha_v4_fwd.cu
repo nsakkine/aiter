@@ -155,7 +155,8 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_lut_freeze) == 0x2C0);
 static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 
 // Sol-Attn kernarg: the same sparse LUT prefix, then the pooled K/V of the approximate branch, the
-// selection bitmap, the pooled strides, the pooled SCALES, and an optional work table, 1056 bytes.
+// selection bitmap, the pooled strides, the pooled SCALES, an optional work table, and the
+// block-scaled K's variance pair, 1088 bytes.
 //
 // The sorted-sparse layout's 0x2D0 work-table slot carries s_kv_range_blocks here instead. A row
 // that does not declare kv_range never reads it, and the launcher leaves it 0 for those. Sol-Attn
@@ -170,14 +171,20 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 // that the approximate pass must read instead of K's or V's. Recipes that do not need them leave
 // these slots NULL and keep reading the source scales.
 //
-// A row that declares `jensen` (its K is never E8M0, so the K-scale slot is otherwise idle) reads
-// that slot and its three strides as the optional per-block K variance instead: NULL there is the
-// uncorrected pooled pass, non-NULL adds the second-order term to every pooled logit. On an FP8 K
-// the variance is of the codes divided by 512 (SOL_ATTN_FP8_VAR_DIVISOR), which the kernel undoes.
+// A row that declares `jensen` over a K that is not E8M0, whose K-scale slot is therefore idle,
+// reads that slot and its three strides as the optional per-block K variance instead: NULL there
+// is the uncorrected pooled pass, non-NULL adds the second-order term to every pooled logit. On an
+// FP8 K the variance is of the codes divided by 512 (SOL_ATTN_FP8_VAR_DIVISOR), which the kernel
+// undoes; an int8 K's is the same, stored as FP8 E4M3 FN because an integer cannot hold it.
+//
+// An E8M0 K has no idle scale slot and no single unit for a variance, so its jensen row reads the
+// dequantized variance quantized the way mean_k is: codes at 0x420 with mean_k's strides, E8M0
+// scales at 0x430 with mean_k_scale's. NULL codes is the uncorrected pass, as above.
 //
 // A row that declares `sorted` also reads ptr_work_table at 0x410: non-NULL, the grid is 1-D and
 // each workgroup takes its (q_tile, head, batch) from the table, heaviest LUT row first; NULL is
-// the raster 3-D grid. A row without it declares a 1040-byte kernarg and never sees the slot.
+// the raster 3-D grid. A row without it declares a 1040-byte kernarg and never sees the slot, and
+// a row without the E8M0 variance pair declares at most 1056 bytes and never sees that.
 struct __attribute__((packed)) FmhaV4SolAttnKernarg
 {
     FmhaV4Kernarg dense;
@@ -206,11 +213,15 @@ struct __attribute__((packed)) FmhaV4SolAttnKernarg
     ScalarSlot s_mean_v_scale_Hs;
     ScalarSlot s_mean_v_scale_Bs;
     ConstPointerSlot ptr_work_table;
+    ConstPointerSlot ptr_mean_k_var;
+    ConstPointerSlot ptr_mean_k_var_scale;
 };
 
-static_assert(sizeof(FmhaV4SolAttnKernarg) == 1056,
-              "MHA v4 Sol-Attn kernarg ABI must remain 1056 bytes");
+static_assert(sizeof(FmhaV4SolAttnKernarg) == 1088,
+              "MHA v4 Sol-Attn kernarg ABI must remain 1088 bytes");
 static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_work_table) == 0x410);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k_var) == 0x420);
+static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k_var_scale) == 0x430);
 static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_kv_block_indices) == 0x290);
 static_assert(offsetof(FmhaV4SolAttnKernarg, s_kv_range_blocks) == 0x2D0);
 static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k) == 0x2E0);
@@ -1145,7 +1156,8 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           std::optional<at::Tensor> lse,
                           int64_t kv_range_tokens,
                           const std::optional<at::Tensor>& mean_k_var,
-                          int64_t sorted_dispatch)
+                          int64_t sorted_dispatch,
+                          const std::optional<at::Tensor>& mean_k_var_scale)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -1324,24 +1336,51 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                     "with key_length replaced by num_kv_blocks");
         TORCH_CHECK(vs.is_contiguous(), "mean_v_scale must be contiguous");
     }
+    TORCH_CHECK(!mean_k_var_scale.has_value() || mean_k_var.has_value(),
+                "mean_k_var_scale is mean_k_var's scale; it needs mean_k_var");
     if(mean_k_var.has_value())
     {
-        // The kernel reads the variance with mean_k's block stride; only its base and head/batch
-        // strides are passed separately.
         const auto& kvar = mean_k_var.value();
         TORCH_CHECK(cfg.jensen != 0,
                     "Sol-Attn row ",
                     cfg.knl_name,
                     " has no second-order pooled correction; pass mean_k_var=None");
-        TORCH_CHECK(!k_needs_pooled_scale,
-                    "mean_k_var shares the pooled K-scale slot, so it needs a K without one");
         TORCH_CHECK(kvar.is_cuda() && kvar.device() == q.device(),
                     "mean_k_var must be on the same GPU as Q");
-        TORCH_CHECK(kvar.scalar_type() == mean_k.scalar_type(),
-                    "mean_k_var must have mean_k's dtype");
         TORCH_CHECK(kvar.sizes() == mean_k.sizes(), "mean_k_var must have mean_k's shape");
-        TORCH_CHECK(kvar.stride(3) == 1 && kvar.stride(1) == mean_k.stride(1),
-                    "mean_k_var must have a contiguous last dimension and mean_k's block stride");
+        if(k_needs_pooled_scale)
+        {
+            // The kernel reads both halves through mean_k's and mean_k_scale's addressing, so only
+            // the two bases are passed.
+            TORCH_CHECK(mean_k_var_scale.has_value(),
+                        "an E8M0_PER_1X32 K's mean_k_var is block-scaled; pass mean_k_var_scale");
+            const auto& vs = mean_k_var_scale.value();
+            const auto& ks = mean_k_scale.value();
+            TORCH_CHECK(kvar.scalar_type() == mean_k.scalar_type(),
+                        "mean_k_var must have mean_k's dtype");
+            TORCH_CHECK(kvar.strides() == mean_k.strides(), "mean_k_var must have mean_k's strides");
+            TORCH_CHECK(vs.is_cuda() && vs.device() == q.device(),
+                        "mean_k_var_scale must be on the same GPU as Q");
+            TORCH_CHECK(vs.scalar_type() == at::ScalarType::Byte,
+                        "mean_k_var_scale must be a uint8 E8M0 tensor");
+            TORCH_CHECK(vs.sizes() == ks.sizes() && vs.strides() == ks.strides(),
+                        "mean_k_var_scale must have mean_k_scale's shape and strides");
+        }
+        else
+        {
+            // The kernel reads the variance with mean_k's block stride; only its base and
+            // head/batch strides are passed separately.
+            TORCH_CHECK(!mean_k_var_scale.has_value(),
+                        "mean_k_var_scale is for an E8M0_PER_1X32 K; this K's variance has no scale");
+            const auto var_type = mean_k.scalar_type() == at::ScalarType::Char
+                                      ? at::ScalarType::Float8_e4m3fn
+                                      : mean_k.scalar_type();
+            TORCH_CHECK(kvar.scalar_type() == var_type,
+                        "mean_k_var must have mean_k's dtype, or FP8 E4M3 FN for an int8 K");
+            TORCH_CHECK(kvar.stride(3) == 1 && kvar.stride(1) == mean_k.stride(1),
+                        "mean_k_var must have a contiguous last dimension and mean_k's block "
+                        "stride");
+        }
     }
 
     // -1 sorts wherever the row supports it and the table's packing can address the grid, 0 keeps
@@ -1432,7 +1471,12 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     {
         args.ptr_mean_v_scale.value = mean_v_scale.value().data_ptr();
     }
-    if(mean_k_var.has_value())
+    if(mean_k_var_scale.has_value())
+    {
+        args.ptr_mean_k_var.value       = mean_k_var.value().data_ptr();
+        args.ptr_mean_k_var_scale.value = mean_k_var_scale.value().data_ptr();
+    }
+    else if(mean_k_var.has_value())
     {
         const auto& kvar                = mean_k_var.value();
         args.ptr_mean_k_scale.value     = kvar.data_ptr();

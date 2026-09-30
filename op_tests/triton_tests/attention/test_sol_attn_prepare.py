@@ -605,16 +605,58 @@ def test_error_router_rejects_an_incoherent_request(kwargs, message):
         sol_attn_prepare(q, k, v, BETA, **kwargs)
 
 
-def test_error_router_rejects_a_supplied_mask_and_an_integer_k():
+def _block_variance(x):
+    batch, seqlen, heads, d = x.shape
+    blocks = x.float().reshape(batch, seqlen // SOL_ATTN_TS_KV, SOL_ATTN_TS_KV, heads, d)
+    return blocks.var(dim=2, unbiased=False)
+
+
+def test_error_router_rejects_a_supplied_mask_and_a_block_scaled_k():
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
     mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
     with pytest.raises(ValueError, match="routes from beta"):
         sol_attn_prepare(q, k, v, block_attn_mask=mask, router="error", routing_scale=1.0)
-    k_int = k.float().round().clamp(-127, 127).to(torch.int8)
-    with pytest.raises(ValueError, match="floating-point K"):
-        sol_attn_prepare(q, k_int, v, BETA, router="error", routing_scale=1.0)
-    with pytest.raises(ValueError, match="floating-point K"):
-        sol_attn_prepare(q, k_int, v, BETA, k_variance=True)
+    k_scale = torch.full((*k.shape[:3], k.shape[3] // 32), 127, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="pooled in its own dtype"):
+        sol_attn_prepare(q, k, v, BETA, k_scale=k_scale, router="error", routing_scale=1.0)
+
+
+def test_k_variance_of_an_integer_k_is_its_codes_over_512_in_e4m3():
+    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    k_int = (k.float() / 448.0 * 127.0).round().clamp(-127, 127).to(torch.int8)
+    prep = sol_attn_prepare(q, k_int, v, BETA, k_variance=True)
+    assert prep["mean_k"].dtype == torch.int8
+    assert prep["mean_k_var"].dtype == torch.float8_e4m3fn
+    assert prep["mean_k_var_scale"] is None
+    expected = (_block_variance(k_int) / 512.0).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(prep["mean_k_var"].float(), expected.float(), rtol=0, atol=0)
+    # Asking for the variance leaves the routing and the mean alone.
+    plain = sol_attn_prepare(q, k_int, v, BETA)
+    assert torch.equal(prep["mean_k"], plain["mean_k"])
+    assert torch.equal(prep["block_bitmap"], plain["block_bitmap"])
+
+
+def test_k_variance_of_a_block_scaled_k_is_the_dequantized_block_variance():
+    q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    # Per-token, per-group exponents spread across a few octaves, so pooling really has to dequantize.
+    k_scale = (
+        122 + torch.randint(0, 6, (*k.shape[:3], k.shape[3] // 32), device="cuda")
+    ).to(torch.uint8)
+    prep = sol_attn_prepare(q, k, v, BETA, k_scale=k_scale, k_variance=True)
+    data, scale = prep["mean_k_var"], prep["mean_k_var_scale"]
+    assert data.dtype == k.dtype and data.shape == prep["mean_k"].shape
+    assert scale.dtype == torch.uint8 and scale.shape == prep["mean_k_scale"].shape
+    factor = torch.exp2(scale.float() - 127.0).repeat_interleave(32, dim=-1)
+    dequantized_k = k.float() * torch.exp2(k_scale.float() - 127.0).repeat_interleave(32, dim=-1)
+    expected = _block_variance(dequantized_k)
+    # One e4m3 rounding: within 1/16 of a normal value, and within half the 2^-9 subnormal step of
+    # the group's scale for the small values sharing a group with a large one.
+    bound = expected / 16.0 + factor * 2.0**-10
+    assert ((data.float() * factor - expected).abs() <= bound).all()
+    plain = sol_attn_prepare(q, k, v, BETA, k_scale=k_scale)
+    assert torch.equal(prep["mean_k"], plain["mean_k"])
+    assert torch.equal(prep["mean_k_scale"], plain["mean_k_scale"])
+    assert plain["mean_k_var"] is None and plain["mean_k_var_scale"] is None
 
 
 def test_error_router_compiles_fullgraph_and_matches_eager():

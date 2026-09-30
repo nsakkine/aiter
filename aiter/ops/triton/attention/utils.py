@@ -196,8 +196,9 @@ def _sol_attn_pool_reuse_descale(
     does. Rounding a mean of in-range values back to the source dtype cannot overflow.
 
     `variance` also returns the per-block population variance from the same fp32 copy, in the
-    same dtype and layout, divided by SOL_ATTN_FP8_VAR_DIVISOR for an 8-bit float; the mean is
-    unaffected by asking for it.
+    same layout, divided by SOL_ATTN_FP8_VAR_DIVISOR for an 8-bit operand; the mean is unaffected by
+    asking for it. It keeps the operand's dtype, except that an integer one's is stored as e4m3,
+    since an integer cannot hold it.
     """
     xf = x_quant.float()
     mean = _sol_attn_block_mean(xf, BLOCK_N)
@@ -212,7 +213,8 @@ def _sol_attn_pool_reuse_descale(
     var = _sol_attn_block_variance(xf, BLOCK_N)
     if x_quant.element_size() == 1:
         var = var / SOL_ATTN_FP8_VAR_DIVISOR
-    return mean, var.to(x_quant.dtype).contiguous()
+    var_dtype = x_quant.dtype if x_quant.dtype.is_floating_point else torch.float8_e4m3fn
+    return mean, var.to(var_dtype).contiguous()
 
 
 def _sol_attn_block_variance(xf: torch.Tensor, BLOCK_N: int) -> torch.Tensor:
@@ -254,8 +256,8 @@ def _sol_attn_block_mean(xf: torch.Tensor, BLOCK_N: int) -> torch.Tensor:
 
 
 def _sol_attn_pool_mx(
-    x_quant: torch.Tensor, x_scale: torch.Tensor, BLOCK_N: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_quant: torch.Tensor, x_scale: torch.Tensor, BLOCK_N: int, variance: bool = False
+) -> tuple[torch.Tensor, ...]:
     """Pool an E8M0-scaled operand into one row per KV block, WITH a pooled scale of its own.
 
     Per-tensor and per-channel descales survive pooling untouched, because pooling runs along the
@@ -270,6 +272,10 @@ def _sol_attn_pool_mx(
     for a per-tensor operand the stored codes are proportional to the real values so routing on
     them is scale invariant, but here the scale varies from row to row and from group to group, so
     scoring the raw codes would compare values that are not on a common footing.
+
+    `variance` appends (var_data, var_scale) for the per-block population variance of the
+    dequantized operand, quantized the same way and in the same layouts as the mean. A variance has
+    no single unit here any more than the mean does, so it gets a scale image of its own.
     """
     dequantized = _e8m0_dequantize(x_quant, x_scale)
     pooled = _sol_attn_block_mean(dequantized, BLOCK_N)
@@ -277,7 +283,11 @@ def _sol_attn_pool_mx(
     # Reconstructed from the requantized pair rather than returning `pooled`: the kernel loads the
     # rounded values, and routing has to see exactly what it will load or a block sitting within
     # rounding distance of the threshold can be selected here and skipped there.
-    return mean_data, mean_scale, _e8m0_dequantize(mean_data, mean_scale)
+    result = (mean_data, mean_scale, _e8m0_dequantize(mean_data, mean_scale))
+    if not variance:
+        return result
+    var = _sol_attn_block_variance(dequantized, BLOCK_N)
+    return result + _e8m0_quantize(var, x_quant.dtype)
 
 
 def _e2m3_decode(code: torch.Tensor) -> torch.Tensor:
@@ -617,13 +627,14 @@ def sol_attn_prepare(
     k_source, v_source: that operand's pre-quantization tensor, required exactly when the matching
         *_packed_format is named and rejected otherwise.
     k_variance: also return mean_k_var, for a row whose pooled logits take the second-order term
-        0.5 * scale^2 * sum_d q_d^2 * var_k[d]. Only for a floating-point K pooled in its own
-        dtype, i.e. without k_scale or k_packed_format.
+        0.5 * scale^2 * sum_d q_d^2 * var_k[d]. Not for a packed K, whose codes have no element to
+        take a variance of. With k_scale it also returns mean_k_var_scale.
     router: how beta routing scores blocks. "mean" (the default) is the paper's q_mean . k_mean.
         "error" scores each block by its second-order mass times the relative variance of the
         weights inside it, which spends the exact budget where the pooled estimate is least
-        reliable; see _sol_attn_route. It is meant for a kernel that takes mean_k_var, and has
-        the same K restriction as k_variance. It does not change the default outputs.
+        reliable; see _sol_attn_route. It is meant for a kernel that takes mean_k_var. It needs a K
+        pooled in its own dtype, i.e. without k_scale or k_packed_format, since routing_scale is
+        one multiplier. It does not change the default outputs.
     routing_scale: required by router="error" and rejected otherwise: the multiplier that turns
         q . k_quant, as passed here, into the softmax logit in nats. softmax_scale for a BF16 Q/K;
         softmax_scale * q_descale * k_descale for a per-tensor quantized one. A float or a
@@ -637,9 +648,12 @@ def sol_attn_prepare(
             scale with seqlen_k replaced by num_kv_blocks, or None when the source descale was
             reused. These go in the mode-2 kernarg's pooled scale slots.
         mean_k_var: the per-block population variance of k_quant, in mean_k's dtype and layout,
-            when k_variance is set; otherwise None. For an 8-bit float K it is stored divided by
-            SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes. mha_v4_packed takes it as
-            mean_k_var.
+            when k_variance is set; otherwise None. For an 8-bit K it is stored divided by
+            SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes, and an int8 K's is e4m3. With
+            k_scale it is the dequantized variance, quantized the way mean_k is. mha_v4_packed
+            takes it as mean_k_var.
+        mean_k_var_scale: mean_k_var's E8M0 scale in mean_k_scale's layout when k_variance and
+            k_scale are both set; otherwise None. mha_v4_packed takes it as mean_k_var_scale.
         mean_k_pooled, mean_v_pooled: the pooled operand as the packer saw it, before quantization,
             for a packed operand whose mean_k / mean_v cannot be read back and dequantized. None
             for the addressable recipes, where dequantizing the pooled tensor with its own scale
@@ -710,16 +724,16 @@ def sol_attn_prepare(
             "routing_scale goes with router='error': the error proxy is not scale invariant and "
             "needs it, and the mean proxy is and ignores it"
         )
-    for flag, name in ((k_variance, "k_variance"), (error_router, "router='error'")):
-        if flag and (
-            k_scale is not None
-            or k_packed_format is not None
-            or not k_quant.dtype.is_floating_point
-        ):
-            raise ValueError(
-                f"{name} needs a floating-point K pooled in its own dtype: a block-scaled or "
-                "packed K has no single unit for the variance, and an integer one cannot hold it"
-            )
+    if k_variance and k_packed_format is not None:
+        raise ValueError(
+            "k_variance needs an element-addressable K: a packed K's codes have no element to "
+            "take a variance of"
+        )
+    if error_router and (k_scale is not None or k_packed_format is not None):
+        raise ValueError(
+            "router='error' needs a K pooled in its own dtype: routing_scale is one multiplier, "
+            "and a block-scaled or packed K has no single unit for it to apply to"
+        )
 
     num_q_tiles = (seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (seqlen_k + BLOCK_N - 1) // BLOCK_N
@@ -728,12 +742,12 @@ def sol_attn_prepare(
     # other: mxfp8 has an E8M0 K and a per-tensor V, f8f6 the reverse.
     mean_k_scale = mean_v_scale = None
     mean_k_pooled = mean_v_pooled = None
-    mean_k_var = None
+    mean_k_var = mean_k_var_scale = None
     k_routing_var = None
     if k_packed_format is not None:
         mean_k, mean_k_scale, mean_k_pooled = _sol_attn_pool_mxfp4_k(k_source, BLOCK_N)
         k_routing = mean_k_pooled
-    elif k_variance or error_router:
+    elif k_scale is None and (k_variance or error_router):
         mean_k, stored_var = _sol_attn_pool_reuse_descale(k_quant, BLOCK_N, variance=True)
         k_routing = mean_k
         if k_variance:
@@ -746,6 +760,10 @@ def sol_attn_prepare(
     elif k_scale is None:
         mean_k = _sol_attn_pool_reuse_descale(k_quant, BLOCK_N)
         k_routing = mean_k
+    elif k_variance:
+        mean_k, mean_k_scale, k_routing, mean_k_var, mean_k_var_scale = _sol_attn_pool_mx(
+            k_quant, k_scale, BLOCK_N, variance=True
+        )
     else:
         mean_k, mean_k_scale, k_routing = _sol_attn_pool_mx(k_quant, k_scale, BLOCK_N)
     if v_packed_format is not None:
@@ -844,6 +862,7 @@ def sol_attn_prepare(
         "mean_k_pooled": mean_k_pooled,
         "mean_v_pooled": mean_v_pooled,
         "mean_k_var": mean_k_var,
+        "mean_k_var_scale": mean_k_var_scale,
         "block_bitmap": block_bitmap,
         "kv_block_indices": kv_block_indices,
         "lut_start": lut_start,

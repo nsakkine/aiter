@@ -115,7 +115,10 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           const std::optional<at::Tensor>& mean_k_var = std::nullopt,
                           // Heavy-first work order from lut_count on a row that declares sorted:
                           // -1 wherever it applies, 0 raster, 1 required. Bitwise the same output.
-                          int64_t sorted_dispatch = -1);
+                          int64_t sorted_dispatch = -1,
+                          // mean_k_var's E8M0 scale in mean_k_scale's layout, exactly when K's
+                          // scale mode is E8M0_PER_1X32 and mean_k_var is given.
+                          const std::optional<at::Tensor>& mean_k_var_scale = std::nullopt);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
 // Reordering a permutation costs only load balance, but the table must stay a permutation: each

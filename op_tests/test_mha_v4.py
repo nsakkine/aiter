@@ -633,22 +633,24 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
     # Refused by the manifest's lse column rather than by a blanket rule, because the rows differ:
-    # BF16, BF16/FP8 and FP8 write an LSE and the rest do not. Refusing at all matters more than
-    # where -- a row without the store leaves the buffer as allocated, which reads as a log-sum-exp
-    # rather than as a failure. Checked in the launcher because only it knows which row the dispatch
-    # chose; a Python copy of that choice is the drift the manifest exists to prevent. INT8/FP8 is
-    # the row asserted on because it is the one nearest the ported ones, so a port that flips the
-    # manifest without adding the store fails here rather than silently returning a buffer.
-    with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
-        mha_v4(
-            q,
-            q,
-            q,
-            AttentionFormat.INT8,
-            AttentionFormat.INT8,
-            native_fp8_format(),
-            return_lse=True,
-        )
+    # on gfx950 BF16, BF16/FP8, FP8, INT8/FP8 and MXFP8 write an LSE and the sub-byte rows do not
+    # (every gfx942 row does). Refusing at all matters more than where -- a row without the store
+    # leaves the buffer as allocated, which reads as a log-sum-exp rather than as a failure. Checked
+    # in the launcher because only it knows which row the dispatch chose; a Python copy of that
+    # choice is the drift the manifest exists to prevent. FP8/MXFP6 is the row asserted on because
+    # it is the one nearest the ported ones, so a port that flips the manifest without adding the
+    # store fails here rather than silently returning a buffer.
+    if get_gfx() == "gfx950":
+        with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
+            mha_v4(
+                q,
+                q,
+                q,
+                native_fp8_format(),
+                native_fp8_format(),
+                AttentionFormat.MXFP6,
+                return_lse=True,
+            )
     with pytest.raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
@@ -2913,11 +2915,20 @@ _LSE_ROWS = (
     # order of magnitude looser than the BF16 rows' -- the residual is set by how peaked each
     # row's softmax is, not by a constant offset.
     ("fp8", None, None, 0.09),
+    # INT8 and MXFP8 feed PV the same FP8 P as the FP8 row, and so share its tolerance.
+    ("i8fp8", AttentionFormat.INT8, None, 0.09),
+    ("mxfp8", None, None, 0.09),
 )
 
-# Rows whose sorted-sparse code object also carries the store. Not every row with a dense LSE has
-# one: it is a separate build of the source and a separate manifest column.
-_LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8")
+# Rows whose sorted-sparse code object also carries the store. It is a separate build of the
+# source and a separate manifest column, so it is listed rather than inferred from the dense rows.
+_LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8")
+
+
+def _lse_ids(ids):
+    """MXFP8 is a gfx950 row; every other LSE row exists on both architectures."""
+    gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8")
+    return [pytest.param(i, marks=gfx950) if i == "mxfp8" else i for i in ids]
 
 
 def _lse_row(row_id):
@@ -2928,13 +2939,29 @@ def _lse_row(row_id):
     return (qk, qk, fp8 if v_format is None else v_format), tolerance
 
 
+def _lse_scale_modes(row_id):
+    formats, _ = _lse_row(row_id)
+    if row_id != "mxfp8":
+        return scale_modes_for_formats(*formats)
+    e8m0 = AttentionScaleMode.E8M0_PER_1X32
+    return e8m0, e8m0, AttentionScaleMode.F32_PER_TENSOR
+
+
+def _lse_launch(row_id, q, k, v, **kwargs):
+    """MXFP8 is unreachable through raw mha_v4 (see _EMPTY_ROW_LAUNCHES) and has its own entry."""
+    if row_id == "mxfp8":
+        return mha_v4_mxfp8(q, k, v, **kwargs)
+    formats, _ = _lse_row(row_id)
+    return mha_v4(q, k, v, *formats, **kwargs)
+
+
 def _reference_scores(q, k, softmax_scale):
     qf, kf = (t.float().permute(0, 2, 1, 3) for t in (q, k))
     return qf @ kf.transpose(-1, -2) * softmax_scale
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
-@pytest.mark.parametrize("row_id", [row[0] for row in _LSE_ROWS])
+@pytest.mark.parametrize("row_id", _lse_ids(row[0] for row in _LSE_ROWS))
 def test_mha_v4_dense_lse_matches_logsumexp(row_id):
     """The natural log of the softmax denominator, not log2 and not the raw running max."""
     torch.manual_seed(23)
@@ -2944,9 +2971,9 @@ def test_mha_v4_dense_lse_matches_logsumexp(row_id):
     )
     k, v = torch.randn_like(q), torch.randn_like(q)
     scale = head_dim**-0.5
-    formats, tolerance = _lse_row(row_id)
+    _, tolerance = _lse_row(row_id)
 
-    out, lse = mha_v4(q, k, v, *formats, softmax_scale=scale, return_lse=True)
+    out, lse = _lse_launch(row_id, q, k, v, softmax_scale=scale, return_lse=True)
     torch.cuda.synchronize()
 
     assert lse.shape == (batch, heads, sequence)
@@ -2958,22 +2985,21 @@ def test_mha_v4_dense_lse_matches_logsumexp(row_id):
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
-@pytest.mark.parametrize("row_id", [row[0] for row in _LSE_ROWS])
+@pytest.mark.parametrize("row_id", _lse_ids(row[0] for row in _LSE_ROWS))
 def test_mha_v4_asking_for_the_lse_does_not_change_the_output(row_id):
     """Bitwise, so the LSE store cannot be paid for by a different softmax path."""
     torch.manual_seed(29)
     q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
     k, v = torch.randn_like(q), torch.randn_like(q)
-    formats, _ = _lse_row(row_id)
 
-    plain = mha_v4(q, k, v, *formats)
-    with_lse, _ = mha_v4(q, k, v, *formats, return_lse=True)
+    plain = _lse_launch(row_id, q, k, v)
+    with_lse, _ = _lse_launch(row_id, q, k, v, return_lse=True)
     torch.cuda.synchronize()
     assert torch.equal(plain, with_lse)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
-@pytest.mark.parametrize("row_id", _LSE_SPARSE_IDS)
+@pytest.mark.parametrize("row_id", _lse_ids(_LSE_SPARSE_IDS))
 def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
     """The property a ring merge rests on.
 
@@ -2990,7 +3016,7 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
     k, v = torch.randn_like(q), torch.randn_like(q)
     scale = head_dim**-0.5
     q_tile, kv_tile = mha_v4_block_tile(
-        mha_v4_operands(*formats, *scale_modes_for_formats(*formats)),
+        mha_v4_operands(*formats, *_lse_scale_modes(row_id)),
         MHA_V4_SPARSE_MODE,
     )
 
@@ -3000,8 +3026,8 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
         device="cuda",
     )
     mask[..., ::2] = True
-    _, lse = mha_v4(
-        q, k, v, *formats, softmax_scale=scale, block_mask=mask, return_lse=True
+    _, lse = _lse_launch(
+        row_id, q, k, v, softmax_scale=scale, block_mask=mask, return_lse=True
     )
     torch.cuda.synchronize()
 
@@ -3016,7 +3042,17 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 @pytest.mark.parametrize(
     ("recipe_id", "tolerance"),
-    [("bf16", 0.05), ("bf16fp8", 0.05), ("fp8", 0.09)],
+    [
+        ("bf16", 0.05),
+        ("bf16fp8", 0.05),
+        ("fp8", 0.09),
+        ("i8fp8", 0.09),
+        pytest.param(
+            "mxfp8",
+            0.09,
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8"),
+        ),
+    ],
 )
 def test_mha_v4_sol_attn_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
     """It counts the pooled proxy columns as well as the exact ones, which is what makes it merge.
@@ -3055,24 +3091,30 @@ def test_mha_v4_sol_attn_lse_is_the_joint_softmax_denominator(recipe_id, toleran
     assert (lse - reference.float()).abs().max() < tolerance
 
 
-@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+def _sol_attn_mxfp4_launch(**kwargs):
+    """Launch gfx950's MXFP4 Sol row, which declares none of lse, kv_range, jensen or sorted."""
+    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == "mxfp4")
+    if not _sol_attn_co_available(recipe.co_name):
+        pytest.skip(f"{recipe.co_name} is not deployed")
+    operands = recipe.operands(sequence_k=512, heads=2, sequence_q=512)
+    plan = recipe.prepare(*operands, beta=1.0, heads=2)
+    return _sol_attn_launch(*operands, plan, recipe=recipe, **kwargs)
+
+
+# Every gfx942 row declares an LSE, so only gfx950 has a row to refuse one.
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 has a Sol row without the store")
 def test_mha_v4_sol_attn_refuses_an_lse_on_a_row_without_the_store():
     """A Sol-Attn row without an LSE store is rejected instead of returning uninitialized data.
 
     Same manifest guard the dense rows take, reached through a different launch, which is the
     point: the capability is a property of the code object, not of the mode.
     """
-    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
-    fp8 = native_fp8_format()
     with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
-        mha_v4_sol_attn(
-            q, q, q, AttentionFormat.INT8, AttentionFormat.INT8, fp8,
-            beta=1.0, return_lse=True,
-        )
+        _sol_attn_mxfp4_launch(return_lse=True)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
-@pytest.mark.parametrize("recipe_id", ["bf16", "bf16fp8", "fp8"])
+@pytest.mark.parametrize("recipe_id", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8"])
 def test_mha_v4_sol_attn_sorted_dispatch_is_bitwise_raster(recipe_id):
     """Heavy-first dispatch reorders the workgroups, never their work.
 
@@ -3110,12 +3152,14 @@ def test_mha_v4_sol_attn_sorted_dispatch_is_bitwise_raster(recipe_id):
 def test_mha_v4_sol_attn_sorted_dispatch_needs_a_row_that_declares_it():
     """Insisting on sorted dispatch fails loudly where it cannot be honoured."""
     q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
-    fp8 = native_fp8_format()
     with pytest.raises(RuntimeError, match="has no sorted dispatch"):
-        mha_v4_sol_attn(
-            q, q, q, AttentionFormat.INT8, AttentionFormat.INT8, fp8,
-            beta=1.0, sorted_dispatch=True,
-        )
+        if get_gfx() == "gfx950":
+            _sol_attn_mxfp4_launch(sorted_dispatch=True)
+        else:
+            mha_v4_sol_attn(
+                q, q, q, AttentionFormat.INT8, AttentionFormat.INT8,
+                native_fp8_format(), beta=1.0, sorted_dispatch=True,
+            )
     bf16, none = AttentionFormat.BF16, AttentionScaleMode.NONE
     with pytest.raises(ValueError, match="sorted_dispatch orders the Sol-Attn launch"):
         mha_v4_packed(
@@ -3412,15 +3456,19 @@ def _mha_v4_lut_capacity(mode: int, q_tile: int, kv_tile: int) -> int:
 
 @pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
 def test_mha_v4_sol_attn_rejects_a_key_length_past_the_lut_capacity():
-    """A LUT row past its staging capacity reads back whatever follows it, so this must not launch.
+    """The launcher refuses a key length past the row's lut_max, and accepts one exactly at it.
 
     The boundary is checked from both sides, because the interesting failure is an off-by-one that
     rejects a length the kernel handles: the capacity is exactly reachable, a row may select every
-    block, and the pass at capacity is what says so.
+    block, and the pass at capacity is what says so. This row walks its LUT from memory, so lut_max
+    is the manifest's placeholder rather than a staging capacity, and the pass at it is also the
+    longest walk the row can be handed.
 
     Bounded by the shape rather than by the row's real maximum on purpose -- finding the latter
     means reading lut_count back from the device on every launch -- so a sequence is refused when
-    any row COULD overrun, whatever this particular mask selected.
+    any row COULD overrun, whatever this particular mask selected. That is also why one query tile
+    is enough: the bound is on the key length, and self-attention at the placeholder would build a
+    block mask of 2^32 entries.
     """
     q_tile, kv_tile = _MHA_V4_FINE_TILE
     capacity = _mha_v4_lut_capacity(MHA_V4_SOL_ATTN_MODE, q_tile, kv_tile)
@@ -3429,17 +3477,18 @@ def test_mha_v4_sol_attn_rejects_a_key_length_past_the_lut_capacity():
     fp8 = native_fp8_format()
 
     def run(blocks):
-        q = torch.randn(
+        q = torch.randn((1, q_tile, 1, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(
             (1, blocks * kv_tile, 1, 128), device="cuda", dtype=torch.bfloat16
         )
         try:
             out = mha_v4_sol_attn(
-                q, q, q, fp8, fp8, fp8, beta=1.0, block_tile=_MHA_V4_FINE_TILE
+                q, k, k, fp8, fp8, fp8, beta=1.0, block_tile=_MHA_V4_FINE_TILE
             )
             torch.cuda.synchronize()
             return out
         finally:
-            del q
+            del q, k
             torch.cuda.empty_cache()
 
     assert torch.isfinite(run(capacity)).all(), (

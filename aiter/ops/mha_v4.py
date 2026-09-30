@@ -887,13 +887,14 @@ def _fmha_v4_fwd_sol_attn_fake(
     kv_range_tokens: int = 0,
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
+    mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
     del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale
-    del out, lse, kv_range_tokens, mean_k_var, sorted_dispatch
+    del out, lse, kv_range_tokens, mean_k_var, sorted_dispatch, mean_k_var_scale
 
 
 @compile_ops(
@@ -930,6 +931,7 @@ def _fmha_v4_fwd_sol_attn(
     kv_range_tokens: int = 0,
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
+    mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
 ) -> None: ...
 
 
@@ -965,6 +967,7 @@ def _mha_v4_fwd_sol_attn_launch(
     kv_range_tokens: int = 0,
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
+    mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
     _fmha_v4_fwd_sol_attn(
         q,
@@ -995,6 +998,7 @@ def _mha_v4_fwd_sol_attn_launch(
         kv_range_tokens,
         mean_k_var,
         sorted_dispatch,
+        mean_k_var_scale,
     )
 
 
@@ -1028,13 +1032,14 @@ def _mha_v4_fwd_sol_attn_launch_fake(
     kv_range_tokens: int = 0,
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
+    mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out, lse
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
     del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale, kv_range_tokens, mean_k_var
-    del sorted_dispatch
+    del sorted_dispatch, mean_k_var_scale
 
 
 def _sol_attn_triple(
@@ -1084,6 +1089,7 @@ def mha_v4_packed(
     kv_range_tokens: int = 0,
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: Optional[bool] = None,  # noqa: UP045
+    mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
 ) -> Tensor:
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
@@ -1118,7 +1124,10 @@ def mha_v4_packed(
     block stride, adds the second-order term 0.5 * scale^2 * sum_d q_d^2 * var[d] to
     every pooled logit: the Gaussian estimate of a block's log-mean-exp rather than
     its Jensen lower bound q . mean_k. It needs a row that declares jensen; None is
-    the uncorrected pass on the same code object.
+    the uncorrected pass on the same code object. An int8 K takes it as e4m3, since
+    an integer cannot hold it. A block-scaled (E8M0 1x32) K has no single unit for
+    it, so there it is the dequantized variance quantized the way mean_k is, and
+    mean_k_var_scale carries its scale in mean_k_scale's layout.
 
     sorted_dispatch orders Sol-Attn's workgroups by lut_count, heaviest first in a few
     coarse levels and raster order within each, so the query tiles that compute the most
@@ -1133,6 +1142,8 @@ def mha_v4_packed(
             "mean_k_var corrects the Sol-Attn pooled logits; it needs the pooled triple "
             "(mean_k, mean_v, block_bitmap)"
         )
+    if mean_k_var_scale is not None and mean_k_var is None:
+        raise ValueError("mean_k_var_scale is mean_k_var's scale; it needs mean_k_var")
     if sorted_dispatch and pooled is None:
         raise ValueError(
             "sorted_dispatch orders the Sol-Attn launch; it needs the pooled triple "
@@ -1297,6 +1308,7 @@ def mha_v4_packed(
                 kv_range_tokens,
                 mean_k_var,
                 -1 if sorted_dispatch is None else int(bool(sorted_dispatch)),
+                mean_k_var_scale,
             )
             # The Sol-Attn rows return ln(L) - ln(kv_tile). A constant cancels in a ring merge of
             # Sol-Attn ranks, but merging against a dense row's or flash-attn's LSE would misweight
