@@ -19,7 +19,9 @@ from aiter.ops.mha_v4 import (
     MHA_V4_SOL_ATTN_MODE,
     MHA_V4_SPARSE_MODE,
     AttentionFormat,
+    AttentionPack,
     AttentionScaleMode,
+    _mha_v4_v_pack,
     mha_v4,
     mha_v4_block_tile,
     mha_v4_block_tiles,
@@ -43,8 +45,11 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp6_k,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
+    quantize_mxfp6_q,
     quantize_v_mxfp4,
+    quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
+    quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
@@ -55,6 +60,7 @@ from aiter.ops.triton.attention.utils import (
     _e8m0_dequantize,
     _e8m0_quantize,
     _sol_attn_block_mean,
+    _sol_attn_block_variance,
     _sol_attn_pool_mx,
     _sol_attn_pool_reuse_descale,
     block_attn_mask_to_ragged_lut,
@@ -966,6 +972,7 @@ def test_mha_v4_native_schema_mutates_only_out():
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6_E2M3),
     ],
 )
 def test_mha_v4_raw_compile_parity(q_format, v_format):
@@ -1213,6 +1220,18 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
             native_fp8_format(),
             id="i8fp8",
         ),
+        *(
+            pytest.param(
+                fmt,
+                fmt,
+                marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FP6-P rows"),
+                id=f"{name}_fp6p",
+            )
+            for name, fmt in (
+                ("mxfp4", AttentionFormat.MXFP4),
+                ("mxfp6", AttentionFormat.MXFP6),
+            )
+        ),
     ],
 )
 def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
@@ -1292,6 +1311,18 @@ def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
                 get_gfx() != "gfx950", reason="gfx950 MXFP4 sparse"
             ),
             id="mxfp4",
+        ),
+        *(
+            pytest.param(
+                fmt,
+                fmt,
+                marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FP6-P rows"),
+                id=f"{name}_fp6p",
+            )
+            for name, fmt in (
+                ("mxfp4", AttentionFormat.MXFP4),
+                ("mxfp6", AttentionFormat.MXFP6),
+            )
         ),
     ],
 )
@@ -1677,7 +1708,19 @@ _EMPTY_ROW_LAUNCHES = [
             AttentionFormat.MXFP4,
             block_mask=m,
         ),
-        "f4f4",
+        "mxfp4_fp6p",
+    ),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            block_mask=m,
+        ),
+        "mxfp6_fp6p",
     ),
 ]
 
@@ -1879,6 +1922,10 @@ class _SolAttnRecipe(NamedTuple):
     # Named when the operands' stored codes are sub-byte and permuted, so neither pooling nor a
     # reference can read them back; see SOL_ATTN_PACKED_FORMATS.
     packed_format: str | None = None
+    # V's packed format when it differs from K's, which it does wherever V's name also carries its
+    # layout (the *_fp6_p ones).
+    v_packed_format: str | None = None
+    v_pack: AttentionPack = AttentionPack.DEFAULT
     oracle_floor: float = 0.999
     # How far the corrected oracle has to beat the uncorrected one. Any margin at all proves the
     # correction reaches the output; a row whose exact pass is lossy enough to leave the correction
@@ -1918,6 +1965,7 @@ class _SolAttnRecipe(NamedTuple):
                 self.qk_scale_mode,
                 self.qk_scale_mode,
                 self.v_scale_mode,
+                self.v_pack,
             ),
             MHA_V4_SOL_ATTN_MODE,
         )
@@ -1937,7 +1985,9 @@ class _SolAttnRecipe(NamedTuple):
             _Operand(*self.quantize_v(v), v if keep else None),
         )
 
-    def prepare(self, q, k, v, beta, heads, block_tile=None, force_block_mask=None):
+    def prepare(
+        self, q, k, v, beta, heads, block_tile=None, force_block_mask=None, k_variance=False
+    ):
         """Route and pool. K's scale goes in only when pooling cannot preserve it."""
         packed = self.packed_format
         tile_m, tile_n = self.block_tile() if block_tile is None else block_tile
@@ -1965,8 +2015,11 @@ class _SolAttnRecipe(NamedTuple):
             k_source=k.source,
             v_source=v.source,
             k_packed_format=packed,
-            v_packed_format=packed,
+            v_packed_format=(
+                packed if self.v_packed_format is None else self.v_packed_format
+            ),
             force_block_mask=force_block_mask,
+            k_variance=k_variance,
         )
 
     @staticmethod
@@ -2058,6 +2111,20 @@ def _mxfp4_quantize_v(v):
     return mxfp4_v_view(raw, scale, v.shape[1]), scale
 
 
+def _mxfp4_quantize_v_fp6_p(v):
+    raw, scale = quantize_v_mxfp4_fp6_p(v)
+    return mxfp4_v_view(raw, scale, v.shape[1]), scale
+
+
+def _mxfp6_quantize_q(q):
+    return quantize_mxfp6_q(q, mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE))
+
+
+def _mxfp6_quantize_k(k):
+    raw, scale = quantize_mxfp6_k(k)
+    return mxfp6_k_view(raw, scale, *k.shape[:3])
+
+
 _SOL_ATTN_RECIPES = [
     _FP8_SOL_ATTN_RECIPE,
     # The two BF16 Q/K rows. Neither pools anything it cannot reuse a source scale for -- bf16 has
@@ -2118,11 +2185,51 @@ _SOL_ATTN_RECIPES = [
         oracle_floor=0.97,
         keep_or_drop_margin=0.05,
     ),
+    # The FP6-P rows: all three operands E8M0, P quantized to FP6 and V packed in the token order
+    # that P contracts over, so V names its layout as well as its format. Every one of them
+    # declares LSE, ragged KV, KV ranges, the Jensen term and sorted dispatch.
+    _SolAttnRecipe(
+        id="mxfp4_fp6p",
+        co_name="fwd_hd128_mxfp4_fp6p_sol_attn.co",
+        qk_format=AttentionFormat.MXFP4,
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp4_quantize_q,
+        quantize_k=_mxfp4_quantize_k,
+        quantize_v=_mxfp4_quantize_v_fp6_p,
+        v_format=AttentionFormat.MXFP4,
+        v_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        packed_format="mxfp4",
+        v_packed_format="mxfp4_fp6_p",
+        v_pack=AttentionPack.V_FOR_FP6_P,
+        # The same FP4 operands as the mxfp4 row above, so the same floor and margin.
+        oracle_floor=0.97,
+        keep_or_drop_margin=0.05,
+    ),
+    _SolAttnRecipe(
+        id="mxfp6_fp6p",
+        co_name="fwd_hd128_mxfp6_fp6p_sol_attn.co",
+        qk_format=AttentionFormat.MXFP6,
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp6_quantize_q,
+        quantize_k=_mxfp6_quantize_k,
+        quantize_v=quantize_v_mxfp6_fp6_p,
+        v_format=AttentionFormat.MXFP6,
+        v_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        packed_format="mxfp6",
+        v_packed_format="mxfp6_fp6_p",
+        v_pack=AttentionPack.V_FOR_FP6_P,
+        oracle_floor=0.995,
+        keep_or_drop_margin=0.05,
+    ),
 ]
 
-# mha_v4_sol_attn() quantizes for you, and only knows the per-tensor recipes; the MX rows go
-# through mha_v4_packed with operands the caller quantized.
-_SOL_ATTN_RAW_RECIPES = [r for r in _SOL_ATTN_RECIPES if not r.k_carries_pooled_scale]
+# mha_v4_sol_attn() quantizes for you, and knows the per-tensor recipes and the FP6-P MX ones; the
+# other MX rows go through mha_v4_packed with operands the caller quantized.
+_SOL_ATTN_RAW_RECIPES = [
+    r
+    for r in _SOL_ATTN_RECIPES
+    if not r.k_carries_pooled_scale or r.v_pack == AttentionPack.V_FOR_FP6_P
+]
 
 
 def _sol_attn_co_available(co_name: str = "fwd_hd128_fp8_sol_attn.co") -> bool:
@@ -2149,6 +2256,7 @@ def _default_kv_tile(q_format=None, v_format=None, mode=MHA_V4_SPARSE_MODE):
             q_format,
             v_format,
             *scale_modes_for_formats(q_format, q_format, v_format),
+            _mha_v4_v_pack(q_format, v_format),
         ),
         mode,
     )
@@ -2172,8 +2280,14 @@ def _sol_attn_launch(
     block_tile=None,
     return_lse=False,
     sorted_dispatch=None,
+    kv_range_tokens=0,
+    jensen=False,
 ):
-    """Launch the Sol-Attn row over a sol_attn_prepare() plan, overriding tensors if asked."""
+    """Launch the Sol-Attn row over a sol_attn_prepare() plan, overriding tensors if asked.
+
+    jensen passes the plan's mean_k_var (and its scale), so the plan must have been prepared with
+    k_variance=True.
+    """
     recipe = _FP8_SOL_ATTN_RECIPE if recipe is None else recipe
     return mha_v4_packed(
         q.quantized,
@@ -2199,6 +2313,10 @@ def _sol_attn_launch(
         block_tile=block_tile,
         return_lse=return_lse,
         sorted_dispatch=sorted_dispatch,
+        kv_range_tokens=kv_range_tokens,
+        mean_k_var=plan["mean_k_var"] if jensen else None,
+        mean_k_var_scale=plan["mean_k_var_scale"] if jensen else None,
+        v_pack=recipe.v_pack,
     )
 
 
@@ -2578,10 +2696,11 @@ def test_mha_v4_sol_attn_raw_matches_quantizing_and_routing_by_hand(beta, recipe
         q, k, v, recipe.qk_format, recipe.qk_format, recipe.v_format, beta=beta
     )
 
+    keep = recipe.packed_format is not None
     operands = (
-        _Operand(*recipe.quantize_q(q)),
-        _Operand(*recipe.quantize_k(k)),
-        _Operand(*recipe.quantize_v(v)),
+        _Operand(*recipe.quantize_q(q), q if keep else None),
+        _Operand(*recipe.quantize_k(k), k if keep else None),
+        _Operand(*recipe.quantize_v(v), v if keep else None),
     )
     plan = recipe.prepare(*operands, beta=beta, heads=heads)
     by_hand = _sol_attn_launch(*operands, plan, recipe=recipe)
@@ -2739,6 +2858,7 @@ def test_mha_v4_sol_attn_pooled_scales_must_match_the_scale_modes(recipe):
             mean_k=plan["mean_k"],
             mean_v=plan["mean_v"],
             block_bitmap=plan["block_bitmap"],
+            v_pack=recipe.v_pack,
             **scales,
         )
 
@@ -2757,15 +2877,13 @@ def test_mha_v4_sol_attn_pooled_scales_must_match_the_scale_modes(recipe):
 
 def test_mha_v4_sol_attn_rejects_recipes_without_a_manifest_row():
     dummy = torch.empty((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(
-        NotImplementedError, match="per-tensor FP8, i8fp8, bf16 and bf16fp8 recipes only"
-    ):
+    with pytest.raises(NotImplementedError, match="MXFP4 and MXFP6 recipes only"):
         mha_v4_sol_attn(
             dummy,
             dummy,
             dummy,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
             AttentionFormat.MXFP4,
         )
 
@@ -2918,17 +3036,22 @@ _LSE_ROWS = (
     # INT8 and MXFP8 feed PV the same FP8 P as the FP8 row, and so share its tolerance.
     ("i8fp8", AttentionFormat.INT8, None, 0.09),
     ("mxfp8", None, None, 0.09),
+    # The FP6-P rows, scored against the BF16 sources the way every row here is, so the residual
+    # is mostly their own Q/K rounding: FP4's is the coarsest in the file.
+    ("mxfp4_fp6p", AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.2),
+    ("mxfp6_fp6p", AttentionFormat.MXFP6, AttentionFormat.MXFP6, 0.09),
 )
 
 # Rows whose sorted-sparse code object also carries the store. It is a separate build of the
 # source and a separate manifest column, so it is listed rather than inferred from the dense rows.
-_LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8")
+_LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "mxfp4_fp6p", "mxfp6_fp6p")
+_LSE_GFX950_IDS = ("mxfp8", "mxfp4_fp6p", "mxfp6_fp6p")
 
 
 def _lse_ids(ids):
-    """MXFP8 is a gfx950 row; every other LSE row exists on both architectures."""
-    gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8")
-    return [pytest.param(i, marks=gfx950) if i == "mxfp8" else i for i in ids]
+    """MXFP8 and the FP6-P rows are gfx950's; every other LSE row exists on both architectures."""
+    gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 row")
+    return [pytest.param(i, marks=gfx950) if i in _LSE_GFX950_IDS else i for i in ids]
 
 
 def _lse_row(row_id):
@@ -3016,7 +3139,11 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
     k, v = torch.randn_like(q), torch.randn_like(q)
     scale = head_dim**-0.5
     q_tile, kv_tile = mha_v4_block_tile(
-        mha_v4_operands(*formats, *_lse_scale_modes(row_id)),
+        mha_v4_operands(
+            *formats,
+            *_lse_scale_modes(row_id),
+            _mha_v4_v_pack(formats[0], formats[2]),
+        ),
         MHA_V4_SPARSE_MODE,
     )
 
@@ -3051,6 +3178,17 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
             "mxfp8",
             0.09,
             marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8"),
+        ),
+        # Scored against the BF16 sources, so FP4's own Q/K rounding is in the residual.
+        pytest.param(
+            "mxfp4_fp6p",
+            0.2,
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FP6-P rows"),
+        ),
+        pytest.param(
+            "mxfp6_fp6p",
+            0.09,
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FP6-P rows"),
         ),
     ],
 )
@@ -3114,7 +3252,9 @@ def test_mha_v4_sol_attn_refuses_an_lse_on_a_row_without_the_store():
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
-@pytest.mark.parametrize("recipe_id", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8"])
+@pytest.mark.parametrize(
+    "recipe_id", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "mxfp4_fp6p", "mxfp6_fp6p"]
+)
 def test_mha_v4_sol_attn_sorted_dispatch_is_bitwise_raster(recipe_id):
     """Heavy-first dispatch reorders the workgroups, never their work.
 
@@ -3146,6 +3286,150 @@ def test_mha_v4_sol_attn_sorted_dispatch_is_bitwise_raster(recipe_id):
     default = _sol_attn_launch(*operands, plan, recipe=recipe)
     assert torch.equal(ordered, raster)
     assert torch.equal(default, raster)
+
+
+_FP6_P_SOL_ATTN_RECIPES = [
+    pytest.param(
+        r,
+        marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FP6-P rows"),
+        id=r.id,
+    )
+    for r in _SOL_ATTN_RECIPES
+    if r.v_pack == AttentionPack.V_FOR_FP6_P
+]
+
+
+def _rotated(x):
+    out = torch.empty_like(x)
+    rotate_activation_hd128(out, x.contiguous())
+    return out
+
+
+def _sol_attn_jensen_ref(q, k, v, mask, mean_k, mean_v, block_tile, softmax_scale, jensen):
+    """sol_attn_ref over whole blocks, with the Jensen term on every pooled logit.
+
+    jensen is (q_rot, var_rot): Q and the per-block K variance in the basis the kernel holds them,
+    so the term is 0.5 * softmax_scale^2 * sum_d q_rot_d^2 * var_rot[d]. Returns (out, lse).
+    """
+    from aiter.test_mha_common import block_attn_mask_to_token_mask
+
+    q, k, v, mean_k, mean_v = (t.float() for t in (q, k, v, mean_k, mean_v))
+    block_m, block_n = block_tile
+    sequence_q, sequence_k = q.shape[1], k.shape[1]
+    assert sequence_k % block_n == 0, "whole blocks only"
+    exact = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
+    allowed = block_attn_mask_to_token_mask(
+        mask, sequence_q, sequence_k, block_m, block_n, q.device
+    )
+    exact = exact.masked_fill(~allowed, float("-inf"))
+    q_rot, var_rot = jensen
+    pooled = (
+        torch.einsum("bthd,bjhd->bhtj", q * softmax_scale, mean_k)
+        + math.log(block_n)
+        + 0.5
+        * softmax_scale**2
+        * torch.einsum("bthd,bjhd->bhtj", q_rot.float() ** 2, var_rot.float())
+    )
+    q_tile = torch.arange(sequence_q, device=q.device) // block_m
+    pooled = pooled.masked_fill(mask[:, :, q_tile, :], float("-inf"))
+    joint = torch.cat([exact, pooled], dim=-1)
+    weights = torch.softmax(joint, dim=-1)
+    out = torch.einsum("bhts,bshd->bthd", weights, torch.cat([v, mean_v], dim=1))
+    return out, torch.logsumexp(joint, dim=-1)
+
+
+@pytest.mark.parametrize("recipe", _FP6_P_SOL_ATTN_RECIPES)
+def test_mha_v4_sol_attn_fp6p_kv_ranges_merge_to_the_one_range_answer(recipe):
+    """KV ranges split the softmax, not the result: each range's exact and pooled columns are
+    normalized on their own and merged by LSE, which is the joint softmax again. So the ranged
+    launch has to land on the one-range one, and both on the oracle, with a ragged last range."""
+    from aiter.test_mha_common import sol_attn_ref
+
+    if not _sol_attn_co_available(recipe.co_name):
+        pytest.skip(f"{recipe.co_name} is not deployed")
+    heads = 2
+    q_tile, kv_tile = recipe.block_tile()
+    operands = recipe.operands(
+        sequence_k=80 * kv_tile + 77, heads=heads, sequence_q=512, seed=3
+    )
+    plan = recipe.prepare(*operands, beta=1.0, heads=heads)
+    one, one_lse = _sol_attn_launch(*operands, plan, recipe=recipe, return_lse=True)
+    ranged, ranged_lse = _sol_attn_launch(
+        *operands, plan, recipe=recipe, return_lse=True, kv_range_tokens=32 * kv_tile
+    )
+    torch.cuda.synchronize()
+
+    reference, reference_lse = sol_attn_ref(
+        *recipe.reference_operands(*operands),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", operands[1]),
+        recipe.dequantize_pooled(plan, "mean_v", operands[2]),
+        BLOCK_M=q_tile,
+        BLOCK_N=kv_tile,
+        softmax_scale=recipe.ref_softmax_scale,
+    )
+    assert torch.isfinite(ranged).all() and torch.isfinite(ranged_lse).all()
+    # Not bitwise: each range quantizes its FP6 P against its own running max.
+    assert _cosine(ranged, one) > 0.998
+    assert _cosine(ranged, reference) > recipe.oracle_floor
+    assert (ranged_lse - one_lse).abs().max() < 0.05
+    assert (ranged_lse - reference_lse.float()).abs().max() < 0.2
+
+
+@pytest.mark.parametrize("recipe", _FP6_P_SOL_ATTN_RECIPES)
+def test_mha_v4_sol_attn_fp6p_jensen_term_is_the_rotated_k_variance(recipe):
+    """sol_attn_prepare(k_variance=True) on a packed K hands the kernel the block variance of K in
+    the basis the packer rotates it to. The kernel output has to match the oracle's second-order
+    term at its own weight rather than at none or double it -- which is what a variance taken in
+    the wrong basis, or read through the wrong slot, would look like. All the row's options then
+    go on at once: sorted dispatch and KV ranges must not disturb it."""
+    if not _sol_attn_co_available(recipe.co_name):
+        pytest.skip(f"{recipe.co_name} is not deployed")
+    heads = 2
+    q_tile, kv_tile = recipe.block_tile()
+    operands = recipe.operands(
+        sequence_k=64 * kv_tile, heads=heads, sequence_q=512, seed=4
+    )
+    plan = recipe.prepare(*operands, beta=1.0, heads=heads, k_variance=True)
+    assert plan["mean_k_var"].shape == plan["mean_k"].shape
+    assert plan["mean_k_var_scale"].shape == plan["mean_k_scale"].shape
+
+    plain = _sol_attn_launch(*operands, plan, recipe=recipe)
+    corrected, corrected_lse = _sol_attn_launch(
+        *operands, plan, recipe=recipe, jensen=True, return_lse=True
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(plain, corrected)
+
+    q_source, k_source = operands[0].source, operands[1].source
+    q_rot = _rotated(q_source).float() * mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE)
+    var_rot = _sol_attn_block_variance(_rotated(k_source).float(), kv_tile)
+    ref_args = (
+        *recipe.reference_operands(*operands),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", operands[1]),
+        recipe.dequantize_pooled(plan, "mean_v", operands[2]),
+        (q_tile, kv_tile),
+        recipe.ref_softmax_scale,
+    )
+    cosine = {
+        factor: _cosine(
+            corrected, _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot * factor))[0]
+        )
+        for factor in (0.0, 1.0, 2.0)
+    }
+    assert cosine[1.0] > max(cosine[0.0], cosine[2.0]), cosine
+    assert cosine[1.0] > recipe.oracle_floor, cosine
+    # Half or one and a half times the term already misses by about 0.33 nats.
+    reference_lse = _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot))[1]
+    assert (corrected_lse - reference_lse).abs().max() < 0.15
+
+    everything = dict(jensen=True, return_lse=True, kv_range_tokens=32 * kv_tile)
+    raster = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=False, **everything)
+    ordered = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=True, **everything)
+    torch.cuda.synchronize()
+    assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
+    assert _cosine(ordered[0], corrected) > 0.999
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")

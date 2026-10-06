@@ -24,7 +24,10 @@ void fmha_v4_fwd(const at::Tensor& q,
                  double softmax_scale,
                  // Per-row log-sum-exp, [batch, nhead_q, seqlen_q] float32 and contiguous, or
                  // nullopt to write none. Only rows whose manifest lse column is 1 can fill it.
-                 std::optional<at::Tensor> lse = std::nullopt);
+                 std::optional<at::Tensor> lse = std::nullopt,
+                 // V's layout within its format (AttentionPack): 0 the default packing, 1 the
+                 // token order an FP6 P operand contracts over. Part of the row key.
+                 int64_t v_pack = 0);
 
 // Sorted block-sparse sibling. Same packed operands as fmha_v4_fwd, plus a ragged LUT.
 // Builds the work table internally (identity raster if lut_count is uniform, else LPT).
@@ -53,7 +56,9 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         // As above. The LSE a sparse row writes covers the blocks its LUT
                         // selected, which is exactly the mass it computed, so ranks holding
                         // different KV shards can still be merged by it.
-                        std::optional<at::Tensor> lse = std::nullopt);
+                        std::optional<at::Tensor> lse = std::nullopt,
+                        // As in fmha_v4_fwd.
+                        int64_t v_pack = 0);
 
 // Sol-Attn sibling (arXiv 2607.24027): the LUT above still drives an EXACT pass, and a second pass
 // then sweeps the pooled per-block K/V, masking off the blocks the LUT already covered via
@@ -118,7 +123,9 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           int64_t sorted_dispatch = -1,
                           // mean_k_var's E8M0 scale in mean_k_scale's layout, exactly when K's
                           // scale mode is E8M0_PER_1X32 and mean_k_var is given.
-                          const std::optional<at::Tensor>& mean_k_var_scale = std::nullopt);
+                          const std::optional<at::Tensor>& mean_k_var_scale = std::nullopt,
+                          // As in fmha_v4_fwd; mean_v takes V's packing.
+                          int64_t v_pack = 0);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
 // Reordering a permutation costs only load balance, but the table must stay a permutation: each

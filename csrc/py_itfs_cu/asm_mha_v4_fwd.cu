@@ -53,6 +53,17 @@ enum class AttentionScaleMode : int64_t
 
 constexpr int64_t scale_mode_id(AttentionScaleMode mode) { return static_cast<int64_t>(mode); }
 
+// V's layout within its format, shared with AttentionPack in mha_v4.py and the manifest's v_pack
+// column. Two rows can take the same format and scale mode in different layouts (MXFP4 V in the
+// column-major order or in the order an FP6 P operand contracts over), so it is part of the key.
+enum class AttentionPack : int64_t
+{
+    Default  = 0,
+    VForFp6P = 1,
+};
+
+constexpr int64_t pack_id(AttentionPack pack) { return static_cast<int64_t>(pack); }
+
 constexpr int64_t kHeadDim = 128;
 
 struct PointerSlot
@@ -332,8 +343,18 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      int64_t v_scale_mode,
                                      int64_t mode,
                                      int64_t ts_qo,
-                                     int64_t ts_kv)
+                                     int64_t ts_kv,
+                                     int64_t v_pack)
 {
+    const bool mx_v = v_format == format_id(AttentionFormat::Fp6E2M3) ||
+                      v_format == format_id(AttentionFormat::Fp4E2M1);
+    TORCH_CHECK(v_pack == pack_id(AttentionPack::Default) ||
+                    (v_pack == pack_id(AttentionPack::VForFp6P) && mx_v),
+                "MHA v4 v_pack ",
+                v_pack,
+                " is not a layout of V format ",
+                v_format,
+                " (0=default, 1=V for an FP6 P operand, MXFP6 or MXFP4 V only)");
     // cfg_fmha_v4_fwd is an unordered_map, so "first row that matches" is only well defined when at
     // most one row can match. That holds for dense, but gfx950 now has two block-sparse FP8 rows
     // per mode, so leaving the geometry unnamed there would pick a tile by hash order.
@@ -346,7 +367,7 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
     {
         const auto& cfg = entry.second;
         if(cfg.arch == arch && cfg.q_format == q_format && cfg.k_format == k_format &&
-           cfg.v_format == v_format && cfg.q_scale_mode == q_scale_mode &&
+           cfg.v_format == v_format && cfg.v_pack == v_pack && cfg.q_scale_mode == q_scale_mode &&
            cfg.k_scale_mode == k_scale_mode && cfg.v_scale_mode == v_scale_mode &&
            cfg.o_format == format_id(AttentionFormat::Bf16) &&
            cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
@@ -363,6 +384,8 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 k_format,
                 ", v_format=",
                 v_format,
+                ", v_pack=",
+                v_pack,
                 ", q_scale_mode=",
                 q_scale_mode,
                 ", k_scale_mode=",
@@ -928,7 +951,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
                  double softmax_scale,
-                 std::optional<at::Tensor> lse)
+                 std::optional<at::Tensor> lse,
+                 int64_t v_pack)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -958,7 +982,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                                   v_scale_mode,
                                   /*mode=*/0,
                                   /*ts_qo=*/0,
-                                  /*ts_kv=*/0);
+                                  /*ts_kv=*/0,
+                                  v_pack);
 
     FmhaV4Kernarg args{};
     populate_dense_kernarg(args,
@@ -1011,7 +1036,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         const at::Tensor& lut_count,
                         int64_t q_tile,
                         int64_t kv_tile,
-                        std::optional<at::Tensor> lse)
+                        std::optional<at::Tensor> lse,
+                        int64_t v_pack)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -1042,7 +1068,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                                   v_scale_mode,
                                   /*mode=*/1,
                                   q_tile,
-                                  kv_tile);
+                                  kv_tile,
+                                  v_pack);
     TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
                 "sorted-sparse MHA v4 row ",
                 cfg.knl_name,
@@ -1157,7 +1184,8 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                           int64_t kv_range_tokens,
                           const std::optional<at::Tensor>& mean_k_var,
                           int64_t sorted_dispatch,
-                          const std::optional<at::Tensor>& mean_k_var_scale)
+                          const std::optional<at::Tensor>& mean_k_var_scale,
+                          int64_t v_pack)
 {
     const auto shapes = validate_packed_mha_v4(q,
                                                k,
@@ -1185,7 +1213,8 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
                                   v_scale_mode,
                                   /*mode=*/2,
                                   q_tile,
-                                  kv_tile);
+                                  kv_tile,
+                                  v_pack);
     // Matches the sorted-sparse sibling, whose LUT machinery Sol-Attn reuses verbatim for its exact
     // pass. A short last block is only ever computed there: sol_attn_prepare() forces it exact,
     // since the pooled xts_kv factor only holds for a full block.

@@ -110,6 +110,24 @@ def rotate_activation_mxfp4_quant_k(
     """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order."""
 
 
+@compile_ops("module_mha_v4_quant", develop=True)
+def _quantize_v_mxfp6_fp6_p_hip(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+) -> None:
+    """Pack V in the contraction order required by an FP6 P operand."""
+
+
+@compile_ops("module_mha_v4_quant", develop=True)
+def _quantize_v_mxfp4_fp6_p_hip(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+) -> None:
+    """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
+
+
 def _mha_v4_sparse_work_table_fake(
     lut_count: Tensor,
     batch: int,
@@ -176,6 +194,18 @@ class AttentionScaleMode(IntEnum):
     F32_PER_TOKEN = 3
     F32_PER_CHANNEL = 4
     E8M0_PER_1X32 = 5
+
+
+class AttentionPack(IntEnum):
+    """Stable IDs for V's layout within its format, the manifest's v_pack column.
+
+    A format and scale mode do not pin a V layout: an MXFP4 V can be packed column-major for an
+    FP8 P operand or in the token order an FP6 P operand contracts over, and the kernels taking
+    the two are different rows.
+    """
+
+    DEFAULT = 0
+    V_FOR_FP6_P = 1
 
 
 _FP8_FORMATS = (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3_FNUZ)
@@ -286,12 +316,19 @@ def mha_v4_block_tiles(operands=None, mode=None) -> tuple[tuple[int, int], ...]:
 
 
 def mha_v4_operands(
-    q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode
+    q_format,
+    k_format,
+    v_format,
+    q_scale_mode,
+    k_scale_mode,
+    v_scale_mode,
+    v_pack=AttentionPack.DEFAULT,
 ) -> tuple[int, ...]:
-    """The six values that pick a manifest row, as ints, for the geometry queries above.
+    """The seven values that pick a manifest row, as ints, for the geometry queries above.
 
-    Plain ints rather than the enums so the value is hashable for their caches and carryable
-    through the torch.compile guard the manifest read sits behind.
+    The six formats and scale modes, then V's AttentionPack. Plain ints rather than the enums so
+    the value is hashable for their caches and carryable through the torch.compile guard the
+    manifest read sits behind.
     """
     return (
         int(q_format),
@@ -300,12 +337,13 @@ def mha_v4_operands(
         int(q_scale_mode),
         int(k_scale_mode),
         int(v_scale_mode),
+        int(v_pack),
     )
 
 
-# Wildcards for the queries above, negative because every real format, scale mode and mode is not:
-# 0 is a valid value for all three, so it cannot stand for "unspecified".
-_ANY_OPERANDS = (-1,) * 6
+# Wildcards for the queries above, negative because every real format, scale mode, pack and mode
+# is not: 0 is a valid value for all of them, so it cannot stand for "unspecified".
+_ANY_OPERANDS = (-1,) * 7
 _ANY_MODE = -1
 
 
@@ -323,9 +361,10 @@ def _mha_v4_kv_tile_for_q_tile_from_manifest(
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
+    v_pack: int,
     mode: int,
 ) -> int:
-    wanted = (q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode)
+    wanted = (q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, v_pack)
 
     def serves(row):
         return row[_ROW_TS_QO] == q_tile and all(
@@ -372,10 +411,10 @@ def _mha_v4_block_q_tiles_from_manifest() -> tuple[int, ...]:
     return tuple(sorted({row[_ROW_TS_QO] for rows in by_mode.values() for row in rows}))
 
 
-# A row as _mha_v4_block_rows_from_manifest stores it: mha_v4_operands()'s six values, then the
+# A row as _mha_v4_block_rows_from_manifest stores it: mha_v4_operands()'s seven values, then the
 # geometry, then the ragged_kv capability. One order for both, so a filter can zip a query against
 # a row's head.
-_ROW_TS_QO, _ROW_TS_KV, _ROW_RAGGED_KV = 6, 7, 8
+_ROW_TS_QO, _ROW_TS_KV, _ROW_RAGGED_KV = 7, 8, 9
 
 
 @torch_compile_guard()
@@ -388,6 +427,7 @@ def _mha_v4_ragged_kv_from_manifest(
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
+    v_pack: int,
     mode: int,
 ) -> int:
     """1 if the `mode` row for these operands and geometry masks a short last KV block, else 0."""
@@ -398,6 +438,7 @@ def _mha_v4_ragged_kv_from_manifest(
         q_scale_mode,
         k_scale_mode,
         v_scale_mode,
+        v_pack,
         q_tile,
         kv_tile,
     )
@@ -433,6 +474,7 @@ def _mha_v4_block_rows_from_manifest() -> dict[int, frozenset[tuple[int, ...]]]:
                             row["q_scale_mode"],
                             row["k_scale_mode"],
                             row["v_scale_mode"],
+                            row.get("v_pack") or 0,
                         )
                         + (
                             int(row["ts_qo"]),
@@ -546,6 +588,19 @@ def scale_modes_for_formats(
     )
 
 
+def _mha_v4_v_pack(
+    q_format: AttentionFormat, v_format: AttentionFormat
+) -> AttentionPack:
+    """The V layout mha_v4() packs for a recipe.
+
+    An all-MXFP4 or all-MXFP6 recipe runs the FP6-P rows, which serve every mode and feature;
+    the column-major MXFP4 V rows stay reachable through mha_v4_packed().
+    """
+    if q_format in (AttentionFormat.MXFP4, AttentionFormat.MXFP6) and v_format == q_format:
+        return AttentionPack.V_FOR_FP6_P
+    return AttentionPack.DEFAULT
+
+
 def _packed_lut_triple(
     kv_block_indices: Optional[Tensor],  # noqa: UP045
     lut_start: Optional[Tensor],  # noqa: UP045
@@ -631,11 +686,12 @@ def _fmha_v4_fwd_fake(
     v_scale_mode: int,
     softmax_scale: float,
     lse: Optional[Tensor] = None,
+    v_pack: int = 0,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del out, lse
+    del out, lse, v_pack
 
 
 @compile_ops(
@@ -659,6 +715,7 @@ def _fmha_v4_fwd(
     v_scale_mode: int,
     softmax_scale: float,
     lse: Optional[Tensor] = None,
+    v_pack: int = 0,
 ) -> None: ...
 
 
@@ -679,6 +736,7 @@ def _mha_v4_fwd_launch(
     v_scale_mode: int,
     softmax_scale: float,
     lse: Optional[Tensor],
+    v_pack: int = 0,
 ) -> None:
     _fmha_v4_fwd(
         q,
@@ -696,6 +754,7 @@ def _mha_v4_fwd_launch(
         v_scale_mode,
         softmax_scale,
         lse,
+        v_pack,
     )
 
 
@@ -716,8 +775,9 @@ def _mha_v4_fwd_launch_fake(
     v_scale_mode: int,
     softmax_scale: float,
     lse: Optional[Tensor],
+    v_pack: int = 0,
 ) -> None:
-    del q, k, v, q_descale, k_descale, v_descale, out, lse
+    del q, k, v, q_descale, k_descale, v_descale, out, lse, v_pack
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
 
@@ -743,12 +803,13 @@ def _fmha_v4_fwd_sparse_fake(
     q_tile: int = 0,
     kv_tile: int = 0,
     lse: Optional[Tensor] = None,
+    v_pack: int = 0,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
-    del out, lse
+    del out, lse, v_pack
 
 
 @compile_ops(
@@ -777,6 +838,7 @@ def _fmha_v4_fwd_sparse(
     q_tile: int = 0,
     kv_tile: int = 0,
     lse: Optional[Tensor] = None,
+    v_pack: int = 0,
 ) -> None: ...
 
 
@@ -804,6 +866,7 @@ def _mha_v4_fwd_sparse_launch(
     lse: Optional[Tensor],
     q_tile: int = 0,
     kv_tile: int = 0,
+    v_pack: int = 0,
 ) -> None:
     _fmha_v4_fwd_sparse(
         q,
@@ -826,6 +889,7 @@ def _mha_v4_fwd_sparse_launch(
         q_tile,
         kv_tile,
         lse,
+        v_pack,
     )
 
 
@@ -851,8 +915,9 @@ def _mha_v4_fwd_sparse_launch_fake(
     lse: Optional[Tensor],
     q_tile: int = 0,
     kv_tile: int = 0,
+    v_pack: int = 0,
 ) -> None:
-    del q, k, v, q_descale, k_descale, v_descale, out, lse
+    del q, k, v, q_descale, k_descale, v_descale, out, lse, v_pack
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
@@ -888,6 +953,7 @@ def _fmha_v4_fwd_sol_attn_fake(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    v_pack: int = 0,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format
@@ -895,6 +961,7 @@ def _fmha_v4_fwd_sol_attn_fake(
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
     del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale
     del out, lse, kv_range_tokens, mean_k_var, sorted_dispatch, mean_k_var_scale
+    del v_pack
 
 
 @compile_ops(
@@ -932,6 +999,7 @@ def _fmha_v4_fwd_sol_attn(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    v_pack: int = 0,
 ) -> None: ...
 
 
@@ -968,6 +1036,7 @@ def _mha_v4_fwd_sol_attn_launch(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    v_pack: int = 0,
 ) -> None:
     _fmha_v4_fwd_sol_attn(
         q,
@@ -999,6 +1068,7 @@ def _mha_v4_fwd_sol_attn_launch(
         mean_k_var,
         sorted_dispatch,
         mean_k_var_scale,
+        v_pack,
     )
 
 
@@ -1033,13 +1103,14 @@ def _mha_v4_fwd_sol_attn_launch_fake(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    v_pack: int = 0,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out, lse
     del q_format, k_format, v_format
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
     del mean_k, mean_v, block_bitmap, mean_k_scale, mean_v_scale, kv_range_tokens, mean_k_var
-    del sorted_dispatch, mean_k_var_scale
+    del sorted_dispatch, mean_k_var_scale, v_pack
 
 
 def _sol_attn_triple(
@@ -1090,6 +1161,7 @@ def mha_v4_packed(
     mean_k_var: Optional[Tensor] = None,  # noqa: UP045
     sorted_dispatch: Optional[bool] = None,  # noqa: UP045
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
+    v_pack: AttentionPack = AttentionPack.DEFAULT,
 ) -> Tensor:
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
@@ -1134,6 +1206,11 @@ def mha_v4_packed(
     blocks exactly (a forced sink row, say) start first instead of trailing the grid.
     The output is identical either way. None sorts wherever the row declares sorted,
     False keeps raster order, True requires it.
+
+    v_pack names V's layout within v_format, and mean_v's with it. An MXFP4 or MXFP6 V packed
+    by quantize_v_mxfp4_fp6_p / quantize_v_mxfp6_fp6_p is AttentionPack.V_FOR_FP6_P; those
+    rows take an FP6 P operand and serve LSE, ragged KV, KV ranges, the Jensen term and sorted
+    dispatch in every mode.
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     pooled = _sol_attn_triple(mean_k, mean_v, block_bitmap)
@@ -1262,7 +1339,7 @@ def mha_v4_packed(
         softmax_scale,
     )
     if lut is None:
-        _mha_v4_fwd_launch(*launch_args, lse)
+        _mha_v4_fwd_launch(*launch_args, lse, int(v_pack))
     else:
         mode_name = "Sol-Attn" if pooled is not None else "sorted-sparse"
         # Scalar query, not a membership test against mha_v4_block_tiles(): this sits on the
@@ -1270,7 +1347,7 @@ def mha_v4_packed(
         # operands rather than for any, because a geometry can be precision-specific and the
         # alternative is the launch failing on a missing row naming format codes and no tile.
         operands = mha_v4_operands(
-            q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode
+            q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, v_pack
         )
         mode = MHA_V4_SOL_ATTN_MODE if pooled is not None else MHA_V4_SPARSE_MODE
         q_tile, kv_tile = (
@@ -1294,7 +1371,9 @@ def mha_v4_packed(
                 f"v={v_format.name} at {q_tile}x{kv_tile}"
             )
         if pooled is None:
-            _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse, q_tile, kv_tile)
+            _mha_v4_fwd_sparse_launch(
+                *launch_args, *lut, lse, q_tile, kv_tile, int(v_pack)
+            )
         else:
             _mha_v4_fwd_sol_attn_launch(
                 *launch_args,
@@ -1309,6 +1388,7 @@ def mha_v4_packed(
                 mean_k_var,
                 -1 if sorted_dispatch is None else int(bool(sorted_dispatch)),
                 mean_k_var_scale,
+                int(v_pack),
             )
             # The Sol-Attn rows return ln(L) - ln(kv_tile). A constant cancels in a ring merge of
             # Sol-Attn ranks, but merging against a dense row's or flash-attn's LSE would misweight
@@ -1652,6 +1732,79 @@ def _quantize_v_mxfp6_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     return quantized, input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
 
 
+# The FP6-P kernels gather each V-scale tile one tile ahead through a raw pointer with no record
+# bound, so the last tile of the last (batch, head) reads past the image. These bytes give that
+# read somewhere zeroed to land; shape and strides stay the packer's own.
+MHA_V4_FP6_P_V_SCALE_SLACK_BYTES = 1024
+
+
+def _fp6_p_v_scale(input: Tensor, batch: int, heads: int, tiles: int) -> Tensor:
+    elements = batch * heads * tiles * 512
+    storage = input.new_empty(
+        (elements + MHA_V4_FP6_P_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    storage[elements:].zero_()
+    return storage[:elements].view(batch, heads, tiles * 512)
+
+
+def _mxfp4_fp6_p_v_buffers(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, _ = input.shape
+    tiles = fp4_v_padded_sequence(sequence) // 128
+    raw = input.new_empty(
+        (fp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
+    )
+    return raw, _fp6_p_v_scale(input, batch, heads, tiles)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_raw", mutates_args=())
+def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack MXFP4 V in the token order an FP6 P operand contracts over.
+
+    Same buffers as quantize_v_mxfp4, so mxfp4_v_view reads either; only the token order inside
+    each 64-token half differs.
+    """
+    _validate_bshd_hd128(input, "MXFP4 V-for-FP6-P quantization")
+    raw, scale = _mxfp4_fp6_p_v_buffers(input)
+    _quantize_v_mxfp4_fp6_p_hip(raw, scale, input)
+    return raw, scale
+
+
+@quantize_v_mxfp4_fp6_p.register_fake
+def _quantize_v_mxfp4_fp6_p_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _mxfp4_fp6_p_v_buffers(input)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6_fp6_p", mutates_args=())
+def quantize_v_mxfp6_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack MXFP6 V in the contraction order an FP6 P operand needs.
+
+    Same geometry as quantize_v_mxfp6 (96-byte rows, 12288-byte tiles, 512 scale bytes per tile);
+    the fields inside each tile follow the FP6-P token order instead.
+    """
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(
+        input, "FP6-P MXFP6 V quantization"
+    )
+    tiles = (sequence + 127) // 128
+    head_stride = tiles * 12288
+    raw = input.new_empty((batch * heads * head_stride + 256,), dtype=torch.uint8)
+    scale = _fp6_p_v_scale(input, batch, heads, tiles)
+    _quantize_v_mxfp6_fp6_p_hip(raw, scale, input)
+    quantized = torch.as_strided(
+        raw,
+        (batch, sequence, heads, head_dim),
+        (heads * head_stride, 96, head_stride, 1),
+    )
+    return quantized, scale
+
+
+@quantize_v_mxfp6_fp6_p.register_fake
+def _quantize_v_mxfp6_fp6_p_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    batch, sequence, heads, _ = input.shape
+    tiles = (sequence + 127) // 128
+    quantized, _ = _quantize_v_mxfp6_fake(input)
+    return quantized, _fp6_p_v_scale(input, batch, heads, tiles)
+
+
 def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:
     """Rebuild the logical MXFP4 V view from its contiguous backing buffer."""
     batch, heads, _ = scale.shape
@@ -1910,6 +2063,7 @@ def mha_v4(
     q_scale_mode, k_scale_mode, v_scale_mode = scale_modes_for_formats(
         q_format, k_format, v_format
     )
+    v_pack = _mha_v4_v_pack(q_format, v_format)
 
     lut_indices: Optional[Tensor] = None  # noqa: UP045
     lut_start: Optional[Tensor] = None  # noqa: UP045
@@ -1928,6 +2082,7 @@ def mha_v4(
                         q_scale_mode,
                         k_scale_mode,
                         v_scale_mode,
+                        v_pack,
                     ),
                     MHA_V4_SPARSE_MODE,
                 )
@@ -1940,6 +2095,7 @@ def mha_v4(
         "lut_start": lut_start,
         "lut_count": lut_count,
         "block_tile": block_tile,
+        "v_pack": v_pack,
     }
     if q_format == AttentionFormat.BF16:
         # Q and K pass through unquantized, so their descale arguments are placeholders that the
@@ -1991,8 +2147,8 @@ def mha_v4(
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp4(v)
-        if lut_indices is None:
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
+        if lut_indices is None and v_pack == AttentionPack.DEFAULT:
             if return_lse:
                 raise NotImplementedError(
                     "dense MXFP4 MHA v4 takes the coalesced launch, which is a separate code "
@@ -2038,6 +2194,7 @@ def mha_v4(
     elif q_format == AttentionFormat.MXFP6 and v_format in (
         *_FP8_FORMATS,
         AttentionFormat.MXFP4,
+        AttentionFormat.MXFP6,
     ):
         if softmax_scale is None:
             softmax_scale = 128**-0.5
@@ -2045,9 +2202,11 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp6_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
+        elif v_format == AttentionFormat.MXFP6:
+            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
-        if lut_indices is None:
+        if lut_indices is None and v_pack == AttentionPack.DEFAULT:
             _launch_mxfp6(
                 q_quantized,
                 q_descale,
@@ -2067,7 +2226,7 @@ def mha_v4(
         )
         v_view = (
             v_quantized
-            if _is_fp8_format(v_format)
+            if v_format != AttentionFormat.MXFP4
             else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
         )
         return mha_v4_packed(
@@ -2141,10 +2300,11 @@ def mha_v4_sol_attn(
     has to see the quantized K that the kernel will read. Everything here is traceable, so this
     composes under torch.compile(fullgraph=True).
 
-    Only recipes with a mode-2 manifest row are supported: the pooled K/V are pooled in the source
-    dtype and reuse the source descales, which holds for per-tensor scales and for the BF16 rows
-    that have no descale at all, but not for the block-granular MX ones, which would need pooled
-    scales of their own.
+    Only recipes with a mode-2 manifest row are supported. The per-tensor and BF16 ones pool K/V in
+    the source dtype and reuse the source descales. All-MXFP4 and all-MXFP6 run the FP6-P rows:
+    their codes are not element addressable, so K/V are pooled from the BF16 inputs and quantized
+    again with pooled scales of their own, and routing scores those BF16 means, which the
+    packers' shared Q/K rotation leaves unchanged.
 
     ``block_tile`` sets the routing and dispatch geometry, defaulting to the geometry this call's
     own operands dispatch at. A finer tile raises beta's resolution -- the threshold is per query
@@ -2184,17 +2344,47 @@ def mha_v4_sol_attn(
         and _is_fp8_format(v_format)
     )
     is_bf16_qk_recipe = q_format == AttentionFormat.BF16 and k_format == q_format
-    if not (is_fp8_recipe or is_i8fp8_recipe or is_bf16_qk_recipe):
+    is_mx_recipe = (
+        q_format in (AttentionFormat.MXFP4, AttentionFormat.MXFP6)
+        and k_format == q_format
+        and v_format == q_format
+    )
+    if not (is_fp8_recipe or is_i8fp8_recipe or is_bf16_qk_recipe or is_mx_recipe):
         raise NotImplementedError(
-            "Sol-Attn MHA v4 currently has manifest rows for the per-tensor FP8, i8fp8, bf16 "
-            f"and bf16fp8 recipes only; got Q={q_format.name}, K={k_format.name}, "
-            f"V={v_format.name}"
+            "Sol-Attn MHA v4 currently has manifest rows for the per-tensor FP8, i8fp8, bf16, "
+            "bf16fp8, MXFP4 and MXFP6 recipes only; got "
+            f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
         )
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_sol_attn")
     q_scale_mode, k_scale_mode, v_scale_mode = scale_modes_for_formats(
         q_format, k_format, v_format
     )
+    v_pack = _mha_v4_v_pack(q_format, v_format)
+    tile_m, tile_n = (
+        mha_v4_block_tile(
+            mha_v4_operands(
+                q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, v_pack
+            ),
+            MHA_V4_SOL_ATTN_MODE,
+        )
+        if block_tile is None
+        else block_tile
+    )
 
+    if is_mx_recipe:
+        return _mha_v4_sol_attn_mx(
+            q,
+            k,
+            v,
+            q_format,
+            beta,
+            softmax_scale,
+            out,
+            return_lse,
+            (tile_m, tile_n),
+            kv_range_tokens,
+            sorted_dispatch,
+        )
     if is_bf16_qk_recipe:
         # Nothing to quantize on the Q/K side, so the descales are placeholders the NONE scale
         # mode makes the kernel ignore, exactly as in mha_v4().
@@ -2213,16 +2403,6 @@ def mha_v4_sol_attn(
     # Routed from the quantized K/V, not the BF16 inputs: the proxy scores have to be the ones the
     # kernel's exact pass will reproduce, or a block sitting within rounding distance of the
     # threshold can be selected here and skipped there.
-    tile_m, tile_n = (
-        mha_v4_block_tile(
-            mha_v4_operands(
-                q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode
-            ),
-            MHA_V4_SOL_ATTN_MODE,
-        )
-        if block_tile is None
-        else block_tile
-    )
     plan = sol_attn_prepare(
         q_quantized,
         k_quantized,
@@ -2258,4 +2438,81 @@ def mha_v4_sol_attn(
         block_tile=(tile_m, tile_n),
         kv_range_tokens=kv_range_tokens,
         sorted_dispatch=sorted_dispatch,
+    )
+
+
+def _mha_v4_sol_attn_mx(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    format: AttentionFormat,
+    beta: float,
+    softmax_scale: Optional[float],  # noqa: UP045
+    out: Tensor,
+    return_lse: bool,
+    block_tile: tuple[int, int],
+    kv_range_tokens: int,
+    sorted_dispatch: Optional[bool],  # noqa: UP045
+) -> Tensor:
+    """mha_v4_sol_attn for an all-MXFP4 or all-MXFP6 recipe, on its FP6-P rows."""
+    if softmax_scale is None:
+        softmax_scale = 128**-0.5
+    multiplier = mha_v4_q_multiplier(softmax_scale)
+    if format == AttentionFormat.MXFP4:
+        q_quantized, q_descale = quantize_mxfp4_q(q, multiplier)
+        k_raw, k_descale = quantize_mxfp4_k(k)
+        k_quantized = mxfp4_k_view(k_raw, k_descale)
+        v_raw, v_descale = quantize_v_mxfp4_fp6_p(v)
+        v_quantized = mxfp4_v_view(v_raw, v_descale, k.shape[1])
+    else:
+        q_quantized, q_descale = quantize_mxfp6_q(q, multiplier)
+        k_raw, k_descale_raw = quantize_mxfp6_k(k)
+        k_quantized, k_descale = mxfp6_k_view(
+            k_raw, k_descale_raw, k.shape[0], k.shape[1], k.shape[2]
+        )
+        v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+    name = "mxfp4" if format == AttentionFormat.MXFP4 else "mxfp6"
+    tile_m, tile_n = block_tile
+    plan = sol_attn_prepare(
+        q,
+        k_quantized,
+        v_quantized,
+        beta=beta,
+        BLOCK_M=tile_m,
+        BLOCK_N=tile_n,
+        num_heads=q.shape[2],
+        k_source=k,
+        v_source=v,
+        k_packed_format=name,
+        v_packed_format=f"{name}_fp6_p",
+    )
+    scale_mode = AttentionScaleMode.E8M0_PER_1X32
+    return mha_v4_packed(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        format,
+        format,
+        format,
+        scale_mode,
+        scale_mode,
+        scale_mode,
+        softmax_scale=softmax_scale,
+        out=out,
+        return_lse=return_lse,
+        kv_block_indices=plan["kv_block_indices"],
+        lut_start=plan["lut_start"],
+        lut_count=plan["lut_count"],
+        mean_k=plan["mean_k"],
+        mean_v=plan["mean_v"],
+        block_bitmap=plan["block_bitmap"],
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+        block_tile=block_tile,
+        kv_range_tokens=kv_range_tokens,
+        sorted_dispatch=sorted_dispatch,
+        v_pack=AttentionPack.V_FOR_FP6_P,
     )

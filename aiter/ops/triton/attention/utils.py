@@ -35,8 +35,15 @@ _E8M0_MAX_CODE = 254
 _E8M0_GROUP = 32
 
 # Packed formats whose stored codes are not element addressable, so a pooled operand has to be
-# built from the tensor the packer was given rather than from the codes it produced.
-SOL_ATTN_PACKED_FORMATS = ("mxfp4",)
+# built from the tensor the packer was given rather than from the codes it produced. The name says
+# which packer the pooled operand goes through, so it has to be the one the row reads: a V named
+# *_fp6_p is packed in the token order an FP6 P operand contracts over (AttentionPack.V_FOR_FP6_P),
+# and plain "mxfp4" V is the column-major packing.
+SOL_ATTN_PACKED_K_FORMATS = ("mxfp4", "mxfp6")
+SOL_ATTN_PACKED_V_FORMATS = ("mxfp4", "mxfp4_fp6_p", "mxfp6_fp6_p")
+SOL_ATTN_PACKED_FORMATS = tuple(
+    dict.fromkeys(SOL_ATTN_PACKED_K_FORMATS + SOL_ATTN_PACKED_V_FORMATS)
+)
 
 # Landing zone for the V-scale gather's one-tile-ahead over-read; see _sol_attn_pool_mxfp4_v.
 _FP4_V_SCALE_SLACK_BYTES = 512
@@ -452,6 +459,88 @@ def _sol_attn_pool_mxfp4_v(
     return mxfp4_v_view(raw, scale, blocks), slack_scale, pooled
 
 
+def _sol_attn_pack_k(
+    x: torch.Tensor, fmt: str, BLOCK_N: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a pooled-height BSHD tensor through `fmt`'s K packer, zero-padded to a whole tile.
+
+    Returns (view, scale): the view presents the real pooled height, the scale keeps the padded
+    one, for the reason :func:`_sol_attn_pool_mxfp4_k` gives.
+    """
+    from aiter.ops.mha_v4 import (
+        mxfp4_k_view,
+        mxfp6_k_view,
+        quantize_mxfp4_k,
+        quantize_mxfp6_k,
+    )
+
+    blocks = x.shape[1]
+    padded = _sol_attn_pad_to_tile(x, BLOCK_N)
+    if fmt == "mxfp4":
+        raw, scale = quantize_mxfp4_k(padded)
+        return mxfp4_k_view(raw, scale[:, :blocks]), scale
+    raw, scale_raw = quantize_mxfp6_k(padded)
+    view, scale = mxfp6_k_view(
+        raw, scale_raw, padded.shape[0], padded.shape[1], padded.shape[2]
+    )
+    return view[:, :blocks], scale
+
+
+def _sol_attn_pool_packed_k(
+    k_source: torch.Tensor, fmt: str, BLOCK_N: int, variance: bool = False
+) -> tuple[torch.Tensor, ...]:
+    """Pool a packed (MXFP4 or MXFP6) K into one row per KV block, WITH a pooled E8M0 scale.
+
+    Source-side pooling as in :func:`_sol_attn_pool_mxfp4_k`. Returns (mean_data, mean_scale,
+    mean_pooled), and with `variance` also (var_data, var_scale) in mean_k's layouts.
+
+    The variance is the one the kernel's Jensen term needs, which is of K as the kernel holds it:
+    in the basis the packer's Hadamard rotation moves it to, where q_d^2 * var[d] is summed. A
+    variance is not linear, so it cannot be taken unrotated and left to the packer the way the mean
+    can. It is taken in the rotated basis and rotated back before packing, so the packer's own
+    rotation lands it where the kernel reads it; the normalized Hadamard is its own inverse.
+    """
+    pooled = _sol_attn_block_mean(k_source.float(), BLOCK_N).to(torch.bfloat16)
+    result = (*_sol_attn_pack_k(pooled, fmt, BLOCK_N), pooled)
+    if not variance:
+        return result
+    from aiter.ops.mha_v4 import rotate_activation_hd128
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        rotate_activation_hd128(out, x)
+        return out
+
+    rotated_var = _sol_attn_block_variance(rotate(k_source.contiguous()).float(), BLOCK_N)
+    return result + _sol_attn_pack_k(
+        rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N
+    )
+
+
+def _sol_attn_pool_fp6_p_v(
+    v_source: torch.Tensor, fmt: str, BLOCK_N: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool an MXFP4 or MXFP6 V for the FP6-P rows into one row per KV block, with its own scale.
+
+    Source-side pooling as in :func:`_sol_attn_pool_mxfp4_v`, through the FP6-P V packers, whose
+    scale already carries the slack the one-tile-ahead scale gather needs.
+    """
+    from aiter.ops.mha_v4 import (
+        mxfp4_v_view,
+        quantize_v_mxfp4_fp6_p,
+        quantize_v_mxfp6_fp6_p,
+    )
+
+    pooled = _sol_attn_block_mean(v_source.float(), BLOCK_N).to(torch.bfloat16)
+    blocks = pooled.shape[1]
+    padded = _sol_attn_pad_to_tile(pooled, BLOCK_N)
+    if fmt == "mxfp4_fp6_p":
+        raw, scale = quantize_v_mxfp4_fp6_p(padded)
+        return mxfp4_v_view(raw, scale, blocks), scale, pooled
+    view, scale = quantize_v_mxfp6_fp6_p(padded)
+    return view[:, :blocks], scale, pooled
+
+
 def _sol_attn_pool_q(
     q: torch.Tensor, BLOCK_M: int, second_moment: bool = False
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -651,8 +740,10 @@ def sol_attn_prepare(
         vary along the sequence axis that pooling reduces) and must be left as None so the pooled
         operand reuses it. Supplying one switches that operand to pooling in dequantized space and
         returns a pooled scale for it.
-    k_packed_format, v_packed_format: name a format in SOL_ATTN_PACKED_FORMATS when that operand's
-        stored codes are not element addressable, i.e. sub-byte codes stored in a permuted order.
+    k_packed_format, v_packed_format: name a format in SOL_ATTN_PACKED_K_FORMATS /
+        SOL_ATTN_PACKED_V_FORMATS when that operand's stored codes are not element addressable,
+        i.e. sub-byte codes stored in a permuted order. A V format names the packing as well,
+        and must be the one the dispatched row reads: *_fp6_p for the FP6-P rows.
         Such an operand cannot be pooled from k_quant / v_quant at all, so the matching
         k_source / v_source must carry the tensor the packer was given and the operand's own
         *_scale must be left as None -- there is nothing to pool it from. k_quant / v_quant are
@@ -660,8 +751,9 @@ def sol_attn_prepare(
     k_source, v_source: that operand's pre-quantization tensor, required exactly when the matching
         *_packed_format is named and rejected otherwise.
     k_variance: also return mean_k_var, for a row whose pooled logits take the second-order term
-        0.5 * scale^2 * sum_d q_d^2 * var_k[d]. Not for a packed K, whose codes have no element to
-        take a variance of. With k_scale it also returns mean_k_var_scale.
+        0.5 * scale^2 * sum_d q_d^2 * var_k[d]. With k_scale or a packed K it also returns
+        mean_k_var_scale; a packed K's variance is taken from k_source in the basis its packer
+        rotates to, which is the one the kernel sums over.
     router: how beta routing scores blocks. "mean" (the default) is the paper's q_mean . k_mean.
         "error" scores each block by its second-order mass times the relative variance of the
         weights inside it, which spends the exact budget where the pooled estimate is least
@@ -689,8 +781,8 @@ def sol_attn_prepare(
             SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes, and an int8 K's is e4m3. With
             k_scale it is the dequantized variance, quantized the way mean_k is. mha_v4_packed
             takes it as mean_k_var.
-        mean_k_var_scale: mean_k_var's E8M0 scale in mean_k_scale's layout when k_variance and
-            k_scale are both set; otherwise None. mha_v4_packed takes it as mean_k_var_scale.
+        mean_k_var_scale: mean_k_var's E8M0 scale in mean_k_scale's layout when k_variance is set
+            and K is block-scaled (k_scale given, or packed); otherwise None. mha_v4_packed takes it as mean_k_var_scale.
         mean_k_pooled, mean_v_pooled: the pooled operand as the packer saw it, before quantization,
             for a packed operand whose mean_k / mean_v cannot be read back and dequantized. None
             for the addressable recipes, where dequantizing the pooled tensor with its own scale
@@ -725,14 +817,12 @@ def sol_attn_prepare(
         raise ValueError("nheads_q must be a multiple of nheads_kv")
     if num_heads is not None and num_heads != nhead_q:
         raise ValueError(f"num_heads {num_heads} does not match q's {nhead_q}")
-    for name, fmt, source, scale in (
-        ("k", k_packed_format, k_source, k_scale),
-        ("v", v_packed_format, v_source, v_scale),
+    for name, fmt, source, scale, formats in (
+        ("k", k_packed_format, k_source, k_scale, SOL_ATTN_PACKED_K_FORMATS),
+        ("v", v_packed_format, v_source, v_scale, SOL_ATTN_PACKED_V_FORMATS),
     ):
-        if fmt is not None and fmt not in SOL_ATTN_PACKED_FORMATS:
-            raise ValueError(
-                f"{name}_packed_format {fmt!r} is not one of {SOL_ATTN_PACKED_FORMATS}"
-            )
+        if fmt is not None and fmt not in formats:
+            raise ValueError(f"{name}_packed_format {fmt!r} is not one of {formats}")
         if (fmt is None) != (source is None):
             raise ValueError(
                 f"{name}_source and {name}_packed_format go together: a packed operand's codes "
@@ -761,11 +851,6 @@ def sol_attn_prepare(
             "routing_scale goes with router='error': the error proxy is not scale invariant and "
             "needs it, and the mean proxy is and ignores it"
         )
-    if k_variance and k_packed_format is not None:
-        raise ValueError(
-            "k_variance needs an element-addressable K: a packed K's codes have no element to "
-            "take a variance of"
-        )
     if error_router and k_packed_format is not None:
         raise ValueError(
             "router='error' needs K's per-block variance, and a packed K's codes have no "
@@ -786,7 +871,12 @@ def sol_attn_prepare(
     mean_k_var = mean_k_var_scale = None
     k_routing_var = None
     if k_packed_format is not None:
-        mean_k, mean_k_scale, mean_k_pooled = _sol_attn_pool_mxfp4_k(k_source, BLOCK_N)
+        pooled_k = _sol_attn_pool_packed_k(
+            k_source, k_packed_format, BLOCK_N, variance=k_variance
+        )
+        mean_k, mean_k_scale, mean_k_pooled = pooled_k[:3]
+        if k_variance:
+            mean_k_var, mean_k_var_scale = pooled_k[3:]
         k_routing = mean_k_pooled
     elif k_scale is None and (k_variance or error_router):
         mean_k, stored_var = _sol_attn_pool_reuse_descale(k_quant, BLOCK_N, variance=True)
@@ -811,8 +901,12 @@ def sol_attn_prepare(
             k_routing_var = _e8m0_dequantize(stored_var, stored_var_scale)
     else:
         mean_k, mean_k_scale, k_routing = _sol_attn_pool_mx(k_quant, k_scale, BLOCK_N)
-    if v_packed_format is not None:
+    if v_packed_format == "mxfp4":
         mean_v, mean_v_scale, mean_v_pooled = _sol_attn_pool_mxfp4_v(v_source, BLOCK_N)
+    elif v_packed_format is not None:
+        mean_v, mean_v_scale, mean_v_pooled = _sol_attn_pool_fp6_p_v(
+            v_source, v_packed_format, BLOCK_N
+        )
     elif v_scale is None:
         mean_v = _sol_attn_pool_reuse_descale(v_quant, BLOCK_N)
     else:

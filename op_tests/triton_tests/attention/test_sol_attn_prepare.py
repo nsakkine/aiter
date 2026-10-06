@@ -340,23 +340,35 @@ def test_no_graph_breaks_and_routing_is_in_the_graph():
 
 
 @pytest.mark.skipif(
-    get_gfx() != "gfx950", reason="the MXFP4 packers are gfx950 kernels"
+    get_gfx() != "gfx950", reason="the MXFP4 and MXFP6 packers are gfx950 kernels"
 )
-def test_packed_path_compiles_fullgraph_and_matches_eager():
+@pytest.mark.parametrize(
+    "k_format, v_format, k_variance",
+    [
+        ("mxfp4", "mxfp4", False),
+        ("mxfp4", "mxfp4_fp6_p", True),
+        ("mxfp6", "mxfp6_fp6_p", True),
+    ],
+)
+def test_packed_path_compiles_fullgraph_and_matches_eager(k_format, v_format, k_variance):
     """The packed path reaches production packers and rebuilds strided views over raw buffers.
 
     None of that is obviously traceable -- it calls out to custom ops and lands on torch.as_strided
     for both the K/V views and the V-scale slack -- so the same fullgraph requirement the rest of
     this suite pins for the ordinary path is pinned here. Strides are compared as well as values,
     because a view rebuilt with the right contents and the wrong stride would still feed the kernel
-    a wrong descriptor.
+    a wrong descriptor. A packed K's variance goes through the same K packer, so it is pinned too.
     """
     batch, seqlen_k, nhead = 1, 16 * SOL_ATTN_TS_KV, 2
     q = torch.randn(batch, 512, nhead, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(batch, seqlen_k, nhead, 128, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     kwargs = dict(
-        k_source=k, v_source=v, k_packed_format="mxfp4", v_packed_format="mxfp4"
+        k_source=k,
+        v_source=v,
+        k_packed_format=k_format,
+        v_packed_format=v_format,
+        k_variance=k_variance,
     )
 
     eager = sol_attn_prepare(q, k, v, BETA, **kwargs)
@@ -364,7 +376,13 @@ def test_packed_path_compiles_fullgraph_and_matches_eager():
         q, k, v, BETA, **kwargs
     )
 
-    for name in ("mean_k", "mean_v", "mean_k_scale", "mean_v_scale"):
+    names = ["mean_k", "mean_v", "mean_k_scale", "mean_v_scale"]
+    if k_variance:
+        names += ["mean_k_var", "mean_k_var_scale"]
+        assert eager["mean_k_var"].shape == eager["mean_k"].shape
+        assert eager["mean_k_var"].stride() == eager["mean_k"].stride()
+        assert eager["mean_k_var_scale"].shape == eager["mean_k_scale"].shape
+    for name in names:
         assert eager[name] is not None, name
         assert compiled[name].shape == eager[name].shape, name
         assert compiled[name].stride() == eager[name].stride(), name
@@ -382,6 +400,9 @@ def test_packed_path_compiles_fullgraph_and_matches_eager():
         (dict(k_packed_format="mxfp4"), "k_source and k_packed_format go together"),
         (dict(v_source="v"), "v_source and v_packed_format go together"),
         (dict(k_packed_format="fp3", k_source="k"), "is not one of"),
+        # The FP6-P names describe a V layout, and plain MXFP6 has no V packing of its own here.
+        (dict(k_packed_format="mxfp4_fp6_p", k_source="k"), "is not one of"),
+        (dict(v_packed_format="mxfp6", v_source="v"), "is not one of"),
     ],
 )
 def test_packed_path_rejects_an_incoherent_request(kwargs, message):
