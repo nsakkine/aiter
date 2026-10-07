@@ -447,6 +447,30 @@ constexpr int32_t kWorkTableWave = 64;
 // (sink) row first, which is the straggler the table is for; 2 to 8 levels measured alike.
 constexpr int64_t kSolSortLevels = 4;
 
+// Work-table order. LPT is the global longest-first order the table was built for. HEAD_LOCAL
+// keeps heads in raster order and sorts longest-first within each one, so the work items in
+// flight share a head's K/V in L2 while every head still starts its heavy tiles first. RASTER is
+// the identity. AITER_MHA_V4_WORK_ORDER=lpt|head|raster selects it per call.
+enum class WorkOrder : int32_t
+{
+    Lpt       = 0,
+    HeadLocal = 1,
+    Raster    = 2,
+};
+
+WorkOrder work_order()
+{
+    const char* value = std::getenv("AITER_MHA_V4_WORK_ORDER");
+    if(value == nullptr || value[0] == '\0' || std::strcmp(value, "lpt") == 0)
+        return WorkOrder::Lpt;
+    if(std::strcmp(value, "head") == 0)
+        return WorkOrder::HeadLocal;
+    if(std::strcmp(value, "raster") == 0)
+        return WorkOrder::Raster;
+    TORCH_CHECK(false, "AITER_MHA_V4_WORK_ORDER must be lpt, head or raster, got ", value);
+    return WorkOrder::Lpt;
+}
+
 // Order and pack in a single launch, by counting each entry's rank rather than moving entries past
 // each other. The key carries the whole ordering: the count (divided by bucket, 1 for an exact
 // order) is complemented into the high half so longer LUTs come first, and the slot index sits in
@@ -470,15 +494,27 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
                                                 const int32_t total,
                                                 const int32_t q_tiles,
                                                 const int32_t nhead,
-                                                const int32_t bucket)
+                                                const int32_t bucket,
+                                                const int32_t order)
 {
     __shared__ uint64_t keys[kWorkTableFusedMax];
 
     for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
     {
         const uint32_t level = static_cast<uint32_t>(lut_count[slot] / bucket);
-        keys[slot] = (static_cast<uint64_t>(~level) << 32) |
-                     static_cast<uint32_t>(slot);
+        if(order == static_cast<int32_t>(WorkOrder::HeadLocal))
+        {
+            // (batch, head) in the top 16 bits, the complemented level below it; batch < 256 and
+            // heads < 256 keep the group in range, and a LUT is never longer than 65536.
+            const uint64_t group = static_cast<uint32_t>(slot / q_tiles);
+            const uint64_t rank  = 0xFFFFu - (level < 0xFFFFu ? level : 0xFFFFu);
+            keys[slot] = (group << 48) | (rank << 32) | static_cast<uint32_t>(slot);
+        }
+        else if(order == static_cast<int32_t>(WorkOrder::Raster))
+            keys[slot] = static_cast<uint32_t>(slot);
+        else
+            keys[slot] = (static_cast<uint64_t>(~level) << 32) |
+                         static_cast<uint32_t>(slot);
     }
     __syncthreads();
 
@@ -525,6 +561,10 @@ build_sorted_work_table(const at::Tensor& lut_count,
     // ATen ops, whose launch overhead on a few hundred entries dwarfs the arithmetic.
     auto table               = at::empty({total}, flat.options().dtype(at::kInt));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const WorkOrder order    = work_order();
+    // Within one head the coarse levels only existed to stop the sort from scattering heads.
+    if(order == WorkOrder::HeadLocal)
+        bucket = 1;
 
     if(total <= kWorkTableFusedMax)
     {
@@ -538,20 +578,31 @@ build_sorted_work_table(const at::Tensor& lut_count,
             static_cast<int32_t>(total),
             static_cast<int32_t>(q_tiles),
             static_cast<int32_t>(nhead),
-            static_cast<int32_t>(bucket));
+            static_cast<int32_t>(bucket),
+            static_cast<int32_t>(order));
         return table;
     }
 
     // Past the LDS staging limit, defer the sort to ATen and pack separately. A stable sort keeps
     // the tie behaviour identical to the fused path.
-    const auto order = at::argsort(bucket > 1 ? at::floor_divide(flat, bucket) : flat,
-                                   /*stable=*/true,
-                                   /*dim=*/0,
-                                   /*descending=*/true);
+    at::Tensor permutation;
+    if(order == WorkOrder::Raster)
+        permutation = at::arange(total, flat.options().dtype(at::kLong));
+    else if(order == WorkOrder::HeadLocal)
+    {
+        const auto group = at::floor_divide(at::arange(total, flat.options().dtype(at::kLong)), q_tiles);
+        const auto key   = group * 65536 + (65535 - flat.to(at::kLong).clamp_max(65535));
+        permutation      = at::argsort(key, /*stable=*/true, /*dim=*/0, /*descending=*/false);
+    }
+    else
+        permutation = at::argsort(bucket > 1 ? at::floor_divide(flat, bucket) : flat,
+                                  /*stable=*/true,
+                                  /*dim=*/0,
+                                  /*descending=*/true);
     constexpr int32_t block_size = 256;
     const dim3 grid(static_cast<uint32_t>((total + block_size - 1) / block_size));
     pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(table.data_ptr<int32_t>(),
-                                                                  order.data_ptr<int64_t>(),
+                                                                  permutation.data_ptr<int64_t>(),
                                                                   static_cast<int32_t>(total),
                                                                   static_cast<int32_t>(q_tiles),
                                                                   static_cast<int32_t>(nhead));

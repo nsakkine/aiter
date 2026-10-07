@@ -593,10 +593,11 @@ def _mha_v4_v_pack(
 ) -> AttentionPack:
     """The V layout mha_v4() packs for a recipe.
 
-    An all-MXFP4 or all-MXFP6 recipe runs the FP6-P rows, which serve every mode and feature;
-    the column-major MXFP4 V rows stay reachable through mha_v4_packed().
+    Every recipe with an MX V (MXFP4, MXFP6, f8f6, f6f4) runs the FP6-P rows, which serve every
+    mode and feature; the default-packed MX V rows stay reachable through mha_v4_packed().
     """
-    if q_format in (AttentionFormat.MXFP4, AttentionFormat.MXFP6) and v_format == q_format:
+    del q_format
+    if v_format in (AttentionFormat.MXFP4, AttentionFormat.MXFP6):
         return AttentionPack.V_FOR_FP6_P
     return AttentionPack.DEFAULT
 
@@ -2135,7 +2136,7 @@ def mha_v4(
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp6(v)
+            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
     elif q_format == AttentionFormat.MXFP4 and v_format in (
         *_FP8_FORMATS,
         AttentionFormat.MXFP4,
@@ -2205,7 +2206,7 @@ def mha_v4(
         elif v_format == AttentionFormat.MXFP6:
             v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp4(v)
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         if lut_indices is None and v_pack == AttentionPack.DEFAULT:
             _launch_mxfp6(
                 q_quantized,
@@ -2301,10 +2302,11 @@ def mha_v4_sol_attn(
     composes under torch.compile(fullgraph=True).
 
     Only recipes with a mode-2 manifest row are supported. The per-tensor and BF16 ones pool K/V in
-    the source dtype and reuse the source descales. All-MXFP4 and all-MXFP6 run the FP6-P rows:
-    their codes are not element addressable, so K/V are pooled from the BF16 inputs and quantized
-    again with pooled scales of their own, and routing scores those BF16 means, which the
-    packers' shared Q/K rotation leaves unchanged.
+    the source dtype and reuse the source descales. Every recipe with an MX V (MXFP4, MXFP6, f8f6,
+    f6f4) runs the FP6-P rows. An MX operand's codes are not element addressable, so it is pooled
+    from its BF16 input and quantized again with pooled scales of its own, and an MX Q/K routes on
+    those BF16 means, which the packers' shared Q/K rotation leaves unchanged. f8f6's FP8 Q/K
+    routes and pools on its codes, as the per-tensor recipes do.
 
     ``block_tile`` sets the routing and dispatch geometry, defaulting to the geometry this call's
     own operands dispatch at. A finer tile raises beta's resolution -- the threshold is per query
@@ -2344,15 +2346,17 @@ def mha_v4_sol_attn(
         and _is_fp8_format(v_format)
     )
     is_bf16_qk_recipe = q_format == AttentionFormat.BF16 and k_format == q_format
-    is_mx_recipe = (
-        q_format in (AttentionFormat.MXFP4, AttentionFormat.MXFP6)
-        and k_format == q_format
-        and v_format == q_format
+    # The FP6-P rows: MXFP4, MXFP6, f8f6 and f6f4.
+    is_mx_recipe = k_format == q_format and (q_format, v_format) in (
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+        (AttentionFormat.FP8, AttentionFormat.MXFP6),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP4),
     )
     if not (is_fp8_recipe or is_i8fp8_recipe or is_bf16_qk_recipe or is_mx_recipe):
         raise NotImplementedError(
             "Sol-Attn MHA v4 currently has manifest rows for the per-tensor FP8, i8fp8, bf16, "
-            "bf16fp8, MXFP4 and MXFP6 recipes only; got "
+            "bf16fp8, MXFP4, MXFP6, f8f6 and f6f4 recipes only; got "
             f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
         )
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_sol_attn")
@@ -2377,6 +2381,7 @@ def mha_v4_sol_attn(
             k,
             v,
             q_format,
+            v_format,
             beta,
             softmax_scale,
             out,
@@ -2445,7 +2450,8 @@ def _mha_v4_sol_attn_mx(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    format: AttentionFormat,
+    qk_format: AttentionFormat,
+    v_format: AttentionFormat,
     beta: float,
     softmax_scale: Optional[float],  # noqa: UP045
     out: Tensor,
@@ -2454,39 +2460,51 @@ def _mha_v4_sol_attn_mx(
     kv_range_tokens: int,
     sorted_dispatch: Optional[bool],  # noqa: UP045
 ) -> Tensor:
-    """mha_v4_sol_attn for an all-MXFP4 or all-MXFP6 recipe, on its FP6-P rows."""
+    """mha_v4_sol_attn for a recipe with an MX V, on its FP6-P rows.
+
+    A packed MX Q/K routes on the BF16 Q and pools K from its source; an FP8 Q/K is addressable,
+    so it routes and pools on the stored codes as the per-tensor recipes do. V is always packed.
+    """
     if softmax_scale is None:
         softmax_scale = 128**-0.5
     multiplier = mha_v4_q_multiplier(softmax_scale)
-    if format == AttentionFormat.MXFP4:
+    if qk_format == AttentionFormat.MXFP4:
         q_quantized, q_descale = quantize_mxfp4_q(q, multiplier)
         k_raw, k_descale = quantize_mxfp4_k(k)
         k_quantized = mxfp4_k_view(k_raw, k_descale)
-        v_raw, v_descale = quantize_v_mxfp4_fp6_p(v)
-        v_quantized = mxfp4_v_view(v_raw, v_descale, k.shape[1])
-    else:
+        q_routing, k_source, k_packed_format = q, k, "mxfp4"
+    elif qk_format == AttentionFormat.MXFP6:
         q_quantized, q_descale = quantize_mxfp6_q(q, multiplier)
         k_raw, k_descale_raw = quantize_mxfp6_k(k)
         k_quantized, k_descale = mxfp6_k_view(
             k_raw, k_descale_raw, k.shape[0], k.shape[1], k.shape[2]
         )
+        q_routing, k_source, k_packed_format = q, k, "mxfp6"
+    else:
+        q_quantized, q_descale = quantize_fp8_rotated(q)
+        k_quantized, k_descale = quantize_fp8_rotated(k)
+        q_routing, k_source, k_packed_format = q_quantized, None, None
+    if v_format == AttentionFormat.MXFP4:
+        v_raw, v_descale = quantize_v_mxfp4_fp6_p(v)
+        v_quantized = mxfp4_v_view(v_raw, v_descale, k.shape[1])
+        v_packed_format = "mxfp4_fp6_p"
+    else:
         v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
-    name = "mxfp4" if format == AttentionFormat.MXFP4 else "mxfp6"
+        v_packed_format = "mxfp6_fp6_p"
     tile_m, tile_n = block_tile
     plan = sol_attn_prepare(
-        q,
+        q_routing,
         k_quantized,
         v_quantized,
         beta=beta,
         BLOCK_M=tile_m,
         BLOCK_N=tile_n,
         num_heads=q.shape[2],
-        k_source=k,
+        k_source=k_source,
         v_source=v,
-        k_packed_format=name,
-        v_packed_format=f"{name}_fp6_p",
+        k_packed_format=k_packed_format,
+        v_packed_format=v_packed_format,
     )
-    scale_mode = AttentionScaleMode.E8M0_PER_1X32
     return mha_v4_packed(
         q_quantized,
         k_quantized,
@@ -2494,12 +2512,10 @@ def _mha_v4_sol_attn_mx(
         q_descale,
         k_descale,
         v_descale,
-        format,
-        format,
-        format,
-        scale_mode,
-        scale_mode,
-        scale_mode,
+        qk_format,
+        qk_format,
+        v_format,
+        *scale_modes_for_formats(qk_format, qk_format, v_format),
         softmax_scale=softmax_scale,
         out=out,
         return_lse=return_lse,
