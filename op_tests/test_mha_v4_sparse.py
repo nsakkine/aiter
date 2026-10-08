@@ -10,6 +10,7 @@ one contiguous block of it. Absorbs the former test_mha_v4_sparse_tile_scaling.p
 
 import argparse
 import csv
+import functools
 import glob
 import itertools
 import math
@@ -141,6 +142,11 @@ SPARSE_RECIPES = {
 
 # Every sparse row exists on gfx950; gfx942 ships the two per-tensor ones.
 _GFX942_SPARSE_RECIPES = ("fp8", "i8fp8")
+
+# The finer geometry, which gfx950 serves for these recipes in both the sparse and Sol-Attn modes.
+_MHA_V4_FINE_TILE = (64, 64)
+_FINE_TILE_RECIPES = ("fp8", "bf16", "bf16fp8")
+_FINE_TILE_MARK = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 64x64 rows")
 
 
 def _sparse_recipe_params(names=None):
@@ -382,8 +388,17 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format, kwargs):
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
 @pytest.mark.parametrize("tail", [44, 5])
-@pytest.mark.parametrize(("q_format", "v_format", "kwargs"), _sparse_recipe_params())
-def test_mha_v4_sparse_masks_a_ragged_last_block(q_format, v_format, kwargs, tail):
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "kwargs", "block_tile"),
+    [pytest.param(*p.values, None, marks=p.marks, id=p.id) for p in _sparse_recipe_params()]
+    + [
+        pytest.param(*p.values, _MHA_V4_FINE_TILE, marks=_FINE_TILE_MARK, id=f"{p.id}-64x64")
+        for p in _sparse_recipe_params(_FINE_TILE_RECIPES)
+    ],
+)
+def test_mha_v4_sparse_masks_a_ragged_last_block(
+    q_format, v_format, kwargs, block_tile, tail
+):
     """A selected short last block attends to the keys it has and to none past seqlen_k.
 
     The dense row masks its own tail, so it is the reference over exactly the selected keys. The
@@ -400,16 +415,20 @@ def test_mha_v4_sparse_masks_a_ragged_last_block(q_format, v_format, kwargs, tai
         sparse=True,
     )
     operands = mha_v4_operands(*formats, *recipe.scale_modes, recipe.v_pack)
-    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
-    kv_tile = _default_kv_tile(q_format, v_format)
+    if block_tile is None:
+        block_tile = mha_v4_block_tile(operands, MHA_V4_SPARSE_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE, block_tile)
+    q_tile, kv_tile = block_tile
     blocks = 4
+    sequence_q = 511
     sequence_k = (blocks - 1) * kv_tile + tail
-    q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((1, sequence_q, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, sequence_k, 5, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     tail_keys = torch.arange((blocks - 1) * kv_tile, sequence_k, device="cuda")
+    q_tiles = -(-sequence_q // q_tile)
     for selected in ([0, 2, 3], [3], [0, 1, 2, 3]):
-        mask = torch.zeros((1, 5, 2, blocks), device="cuda", dtype=torch.bool)
+        mask = torch.zeros((1, 5, q_tiles, blocks), device="cuda", dtype=torch.bool)
         mask[..., selected] = True
         keys = torch.cat(
             [
@@ -419,7 +438,9 @@ def test_mha_v4_sparse_masks_a_ragged_last_block(q_format, v_format, kwargs, tai
             + [tail_keys]
         )
         dense = mha_v4(q, k[:, keys], v[:, keys], *formats, **kwargs)
-        sparse = mha_v4(q, k, v, *formats, block_mask=mask, **kwargs)
+        sparse = mha_v4(
+            q, k, v, *formats, block_mask=mask, block_tile=block_tile, **kwargs
+        )
         torch.cuda.synchronize()
         _assert_sparse_matches_dense(sparse, dense, f"blocks {selected}")
 
@@ -1530,6 +1551,17 @@ _SOL_ATTN_RECIPES = [
 ]
 
 
+def _sol_attn_geometry_params(ids=None):
+    """(recipe, block_tile) params: each recipe at its default geometry (None), then at 64x64
+    where it has a row there."""
+    recipes = [r for r in _SOL_ATTN_RECIPES if ids is None or r.id in ids]
+    return [pytest.param(r, None, id=r.id) for r in recipes] + [
+        pytest.param(r, _MHA_V4_FINE_TILE, marks=_FINE_TILE_MARK, id=f"{r.id}-64x64")
+        for r in recipes
+        if r.id in _FINE_TILE_RECIPES
+    ]
+
+
 # mha_v4_sol() quantizes for you, and knows the per-tensor recipes and the FP6-P MX ones; the
 # other MX rows go through mha_v4_packed with operands the caller quantized.
 _SOL_ATTN_RAW_RECIPES = [
@@ -1740,31 +1772,35 @@ def test_mha_v4_sol_select_all_is_no_less_accurate_than_the_sparse_row():
 
 
 @pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
-@pytest.mark.parametrize("recipe", _SOL_ATTN_RECIPES, ids=lambda r: r.id)
+@pytest.mark.parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
+@pytest.mark.parametrize("tail", [0, 37])
 @pytest.mark.parametrize("beta", [0.4, 1.0])
-def test_mha_v4_sol_matches_the_oracle_and_beats_keep_or_drop(beta, recipe):
+def test_mha_v4_sol_matches_the_oracle_and_beats_keep_or_drop(
+    beta, tail, recipe, block_tile
+):
     """The correction has to both track the oracle and be worth having.
 
     sol_attn_ref on the SAME routed mask is the accuracy target; the same oracle with
     correction=False is plain block-sparse attention over that mask, which is what Sol-Attn is
     supposed to improve on. Checking only the first would pass on a kernel that quietly dropped
-    the correction, since a well-routed mask is already close on its own.
+    the correction, since a well-routed mask is already close on its own. A nonzero tail leaves
+    the last KV block short, which the exact and pooled passes both have to bound.
     """
     if not _sol_attn_co_available(recipe.co_stem):
         pytest.skip(f"{recipe.co_stem} is not deployed")
     from aiter.test_mha_common import sol_attn_ref
 
     heads, batch = 2, 1
-    kv_tile = recipe.kv_tile()
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
     kv_tiles = 16
     q, k, v = recipe.operands(
-        sequence_k=kv_tiles * kv_tile, heads=heads, sequence_q=512, batch=batch
+        sequence_k=kv_tiles * kv_tile + tail, heads=heads, sequence_q=512, batch=batch
     )
-    plan = recipe.prepare(q, k, v, beta=beta, heads=heads)
+    plan = recipe.prepare(q, k, v, beta=beta, heads=heads, block_tile=block_tile)
     fraction = plan["block_attn_mask"].float().mean().item()
     assert 0.02 < fraction < 0.9, f"degenerate routing at beta={beta}: {fraction}"
 
-    sol = _sol_attn_launch(q, k, v, plan, recipe=recipe)
+    sol = _sol_attn_launch(q, k, v, plan, recipe=recipe, block_tile=block_tile)
     torch.cuda.synchronize()
 
     # Score the oracle on the very values the kernel was handed, pooled tensors included: a
@@ -1777,7 +1813,7 @@ def test_mha_v4_sol_matches_the_oracle_and_beats_keep_or_drop(beta, recipe):
         recipe.dequantize_pooled(plan, "mean_v", v),
     )
     ref_kwargs = dict(
-        BLOCK_M=SOL_ATTN_TS_QO,
+        BLOCK_M=q_tile,
         BLOCK_N=kv_tile,
         softmax_scale=recipe.ref_softmax_scale,
     )
@@ -2510,22 +2546,21 @@ def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
-@pytest.mark.parametrize(
-    "recipe_id", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", *_LSE_FP6_P_IDS]
-)
-def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe_id):
+@pytest.mark.parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
+def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe, block_tile):
     """Heavy-first dispatch reorders the workgroups, never their work.
 
     The last query tile of every (batch, head) is forced all-exact, which puts its LUT a full
     level above the routed rows, so the table genuinely permutes the grid. A decode that got a
     head or batch field wrong would compute some tile into another's rows and break equality.
+    The raster launch is the one an XCD-swizzling row relabels, so this also pins the table
+    decode against the swizzle it bypasses.
     """
-    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == recipe_id)
     if not _sol_attn_co_available(recipe.co_stem):
         pytest.skip(f"{recipe.co_stem} is not deployed")
     torch.manual_seed(41)
     batch, heads, sequence = 2, 4, 1024
-    q_tile, kv_tile = recipe.block_tile()
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
     q_tiles, kv_tiles = sequence // q_tile, sequence // kv_tile
     operands = recipe.operands(
         sequence_k=sequence, heads=heads, sequence_q=sequence, batch=batch
@@ -2533,28 +2568,67 @@ def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe_id):
     heavy = torch.zeros((1, 1, q_tiles, kv_tiles), dtype=torch.bool, device="cuda")
     heavy[..., -1, :] = True
     plan = recipe.prepare(
-        *operands, beta=1.0, heads=heads, force_block_mask=heavy
+        *operands, beta=1.0, heads=heads, block_tile=block_tile, force_block_mask=heavy
     )
     counts = plan["lut_count"].view(batch, heads, q_tiles)
     assert (counts[..., -1] == kv_tiles).all()
     assert counts[..., :-1].float().mean() < 0.5 * kv_tiles, "degenerate routing"
 
-    raster = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=False)
-    ordered = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=True)
-    default = _sol_attn_launch(*operands, plan, recipe=recipe)
-    assert torch.equal(ordered, raster)
-    assert torch.equal(default, raster)
-
-
-_FP6_P_SOL_ATTN_RECIPES = [
-    pytest.param(
-        r,
-        marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FP6-P rows"),
-        id=r.id,
+    launch = functools.partial(
+        _sol_attn_launch,
+        *operands,
+        plan,
+        recipe=recipe,
+        block_tile=block_tile,
+        return_lse=True,
     )
-    for r in _SOL_ATTN_RECIPES
-    if r.v_pack == AttentionPack.V_FOR_FP6_P
+    raster = launch(sorted_dispatch=False)
+    ordered = launch(sorted_dispatch=True)
+    default = launch()
+    for launched in (ordered, default):
+        assert torch.equal(launched[0], raster[0])
+        assert torch.equal(launched[1], raster[1])
+
+
+# Every gfx950 Sol row declares the Jensen term, and all but the BF16 ones take KV ranges.
+_SOL_ATTN_GFX950_PARAMS = [
+    pytest.param(
+        *p.values,
+        marks=[*p.marks, pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 Sol rows")],
+        id=p.id,
+    )
+    for p in _sol_attn_geometry_params()
 ]
+
+
+def _sol_attn_row_declares(recipe, block_tile, capability: str) -> bool:
+    """Whether the Sol-Attn row `recipe` dispatches at `block_tile` declares a manifest column.
+
+    Read from the CSV for the reason _mha_v4_lut_capacity gives: the launcher enforces these
+    capabilities, and there is no Python accessor to ask.
+    """
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    manifest = os.path.join(asm_dir, get_gfx(), "fmha_v4_fwd", "fmha_v4_fwd.csv")
+    wanted = {
+        "q_format": recipe.qk_format,
+        "k_format": recipe.qk_format,
+        "v_format": recipe.v_format,
+        "v_pack": recipe.v_pack,
+        "q_scale_mode": recipe.qk_scale_mode,
+        "k_scale_mode": recipe.qk_scale_mode,
+        "v_scale_mode": recipe.v_scale_mode,
+        "mode": MHA_V4_SOL_MODE,
+        "ts_qo": q_tile,
+        "ts_kv": kv_tile,
+    }
+    with open(manifest, newline="") as handle:
+        for row in csv.DictReader(
+            filter(lambda line: not line.startswith("#"), handle)
+        ):
+            if all(int(row[column]) == int(value) for column, value in wanted.items()):
+                return bool(int(row[capability]))
+    raise LookupError(f"no Sol-Attn row for {recipe.id} at {q_tile}x{kv_tile}")
 
 
 def _rotated(x):
@@ -2596,25 +2670,31 @@ def _sol_attn_jensen_ref(q, k, v, mask, mean_k, mean_v, block_tile, softmax_scal
     return out, torch.logsumexp(joint, dim=-1)
 
 
-@pytest.mark.parametrize("recipe", _FP6_P_SOL_ATTN_RECIPES)
-def test_mha_v4_sol_fp6p_kv_ranges_merge_to_the_one_range_answer(recipe):
+@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
     """KV ranges split the softmax, not the result: each range's exact and pooled columns are
     normalized on their own and merged by LSE, which is the joint softmax again. So the ranged
-    launch has to land on the one-range one, and both on the oracle, with a ragged last range."""
+    launch has to land on the one-range one, and both on the oracle, with a ragged last range.
+    A row that does not declare ranges has to refuse one rather than run unsplit."""
     from aiter.test_mha_common import sol_attn_ref
 
     if not _sol_attn_co_available(recipe.co_stem):
         pytest.skip(f"{recipe.co_stem} is not deployed")
     heads = 2
-    q_tile, kv_tile = recipe.block_tile()
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
     operands = recipe.operands(
-        sequence_k=80 * kv_tile + 77, heads=heads, sequence_q=512, seed=3
+        sequence_k=80 * kv_tile + 37, heads=heads, sequence_q=512, seed=3
     )
-    plan = recipe.prepare(*operands, beta=1.0, heads=heads)
-    one, one_lse = _sol_attn_launch(*operands, plan, recipe=recipe, return_lse=True)
-    ranged, ranged_lse = _sol_attn_launch(
-        *operands, plan, recipe=recipe, return_lse=True, kv_range_tokens=32 * kv_tile
+    plan = recipe.prepare(*operands, beta=1.0, heads=heads, block_tile=block_tile)
+    launch = functools.partial(
+        _sol_attn_launch, *operands, plan, recipe=recipe, block_tile=block_tile
     )
+    if not _sol_attn_row_declares(recipe, block_tile, "kv_range"):
+        with pytest.raises(RuntimeError, match="has no in-kernel KV range reset"):
+            launch(kv_range_tokens=32 * kv_tile)
+        return
+    one, one_lse = launch(return_lse=True)
+    ranged, ranged_lse = launch(return_lse=True, kv_range_tokens=32 * kv_tile)
     torch.cuda.synchronize()
 
     reference, reference_lse = sol_attn_ref(
@@ -2627,49 +2707,55 @@ def test_mha_v4_sol_fp6p_kv_ranges_merge_to_the_one_range_answer(recipe):
         softmax_scale=recipe.ref_softmax_scale,
     )
     assert torch.isfinite(ranged).all() and torch.isfinite(ranged_lse).all()
-    # Not bitwise: each range quantizes its FP6 P against its own running max.
+    # Not bitwise: each range quantizes its P against its own running max.
     assert _cosine(ranged, one) > 0.998
     assert _cosine(ranged, reference) > recipe.oracle_floor
     assert (ranged_lse - one_lse).abs().max() < 0.05
     assert (ranged_lse - reference_lse.float()).abs().max() < 0.2
 
 
-@pytest.mark.parametrize("recipe", _FP6_P_SOL_ATTN_RECIPES)
-def test_mha_v4_sol_fp6p_jensen_term_is_the_rotated_k_variance(recipe):
-    """sol_prepare(k_variance=True) on a packed K hands the kernel the block variance of K in
-    the basis the packer rotates it to. The kernel output has to match the oracle's second-order
-    term at its own weight rather than at none or double it -- which is what a variance taken in
-    the wrong basis, or read through the wrong slot, would look like. All the row's options then
-    go on at once: sorted dispatch and KV ranges must not disturb it."""
+@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
+    """sol_prepare(k_variance=True) hands the kernel the block variance of K in the basis the
+    kernel holds K in: rotated for the FP8 and MX recipes, as stored for BF16 and INT8. The kernel
+    output has to match the oracle's second-order term at its own weight rather than at none or
+    double it -- which is what a variance taken in the wrong basis, or read through the wrong
+    slot, would look like. All the row's options then go on at once: sorted dispatch and, where
+    the row takes them, KV ranges must not disturb it."""
     if not _sol_attn_co_available(recipe.co_stem):
         pytest.skip(f"{recipe.co_stem} is not deployed")
     heads = 2
-    q_tile, kv_tile = recipe.block_tile()
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
     operands = recipe.operands(
         sequence_k=64 * kv_tile, heads=heads, sequence_q=512, seed=4
     )
-    plan = recipe.prepare(*operands, beta=1.0, heads=heads, k_variance=True)
-    assert plan["mean_k_var"].shape == plan["mean_k"].shape
-
-    plain = _sol_attn_launch(*operands, plan, recipe=recipe)
-    corrected, corrected_lse = _sol_attn_launch(
-        *operands, plan, recipe=recipe, jensen=True, return_lse=True
+    plan = recipe.prepare(
+        *operands, beta=1.0, heads=heads, block_tile=block_tile, k_variance=True
     )
+    assert plan["mean_k_var"].shape == plan["mean_k"].shape
+    if recipe.k_carries_pooled_scale:
+        assert plan["mean_k_var_scale"].shape == plan["mean_k_scale"].shape
+    else:
+        assert plan["mean_k_var_scale"] is None
+    launch = functools.partial(
+        _sol_attn_launch, *operands, plan, recipe=recipe, block_tile=block_tile
+    )
+
+    plain = launch()
+    corrected, corrected_lse = launch(jensen=True, return_lse=True)
     torch.cuda.synchronize()
     assert not torch.equal(plain, corrected)
 
     if recipe.packed_format is None:
-        # f8f6's FP8 Q/K are stored rotated and per-tensor scaled, so the variance is of K's own
-        # dequantized codes and takes no scale of its own.
-        assert plan["mean_k_var_scale"] is None
+        # Addressable codes dequantize straight into the kernel's basis, along with any multiplier
+        # the quantizer folded into Q, which ref_softmax_scale then divides back out.
         q_op, k_op = operands[0], operands[1]
         q_rot = recipe.dequantize(q_op.quantized, q_op.descale)
         var_rot = _sol_attn_block_variance(
             recipe.dequantize(k_op.quantized, k_op.descale), kv_tile
         )
-        softmax_scale = _SOL_ATTN_SOFTMAX_SCALE
+        softmax_scale = recipe.ref_softmax_scale or _SOL_ATTN_SOFTMAX_SCALE
     else:
-        assert plan["mean_k_var_scale"].shape == plan["mean_k_scale"].shape
         q_source, k_source = operands[0].source, operands[1].source
         q_rot = _rotated(q_source).float() * mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE)
         var_rot = _sol_attn_block_variance(_rotated(k_source).float(), kv_tile)
@@ -2694,9 +2780,11 @@ def test_mha_v4_sol_fp6p_jensen_term_is_the_rotated_k_variance(recipe):
     reference_lse = _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot))[1]
     assert (corrected_lse - reference_lse).abs().max() < 0.15
 
-    everything = dict(jensen=True, return_lse=True, kv_range_tokens=32 * kv_tile)
-    raster = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=False, **everything)
-    ordered = _sol_attn_launch(*operands, plan, recipe=recipe, sorted_dispatch=True, **everything)
+    everything = dict(jensen=True, return_lse=True)
+    if _sol_attn_row_declares(recipe, block_tile, "kv_range"):
+        everything["kv_range_tokens"] = 32 * kv_tile
+    raster = launch(sorted_dispatch=False, **everything)
+    ordered = launch(sorted_dispatch=True, **everything)
     torch.cuda.synchronize()
     assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
     assert _cosine(ordered[0], corrected) > 0.999
@@ -2720,9 +2808,6 @@ def test_mha_v4_sol_sorted_dispatch_needs_a_row_that_declares_it():
         mha_v4_packed(
             q, q, q, q, q, q, bf16, bf16, bf16, none, none, none, sorted_dispatch=True
         )
-
-
-_MHA_V4_FINE_TILE = (64, 64)
 
 
 def _mha_v4_fine_tile_available() -> bool:
@@ -2929,59 +3014,6 @@ def test_mha_v4_sol_64x64_select_all_matches_dense():
     torch.cuda.synchronize()
     assert torch.isfinite(sol).all()
     assert _cosine(sol, dense) > 0.999
-
-
-@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
-@pytest.mark.parametrize("beta", [0.4, 1.0])
-def test_mha_v4_sol_64x64_beats_keep_or_drop(beta):
-    """The 64x64 sibling of the oracle test: the correction has to survive the finer geometry.
-
-    Scored against sol_attn_ref on the mask the kernel was routed with, not against dense, for the
-    reason the raw test spells out -- on Gaussian operands the absolute cosine to dense measures
-    the data. What is specific to 64x64 is that the pooled tensors, the bitmap and the kernel's
-    folded block-size factor all have to agree on 64: get any one of them wrong and the correction
-    lands with the wrong weight, which the uncorrected comparison below detects.
-    """
-    from aiter.test_mha_common import sol_attn_ref
-
-    recipe = _FP8_SOL_ATTN_RECIPE
-    tile_m, tile_n = _MHA_V4_FINE_TILE
-    heads, batch = 2, 1
-    operands = recipe.operands(
-        sequence_k=16 * tile_n, heads=heads, sequence_q=512, batch=batch
-    )
-    plan = recipe.prepare(
-        *operands, beta=beta, heads=heads, block_tile=_MHA_V4_FINE_TILE
-    )
-    fraction = plan["block_attn_mask"].float().mean().item()
-    assert 0.02 < fraction < 0.9, f"degenerate routing at beta={beta}: {fraction}"
-
-    sol = _sol_attn_launch(
-        *operands, plan, recipe=recipe, block_tile=_MHA_V4_FINE_TILE
-    )
-    torch.cuda.synchronize()
-
-    ref_args = (
-        *recipe.reference_operands(*operands),
-        plan["block_attn_mask"],
-        recipe.dequantize_pooled(plan, "mean_k", operands[1]),
-        recipe.dequantize_pooled(plan, "mean_v", operands[2]),
-    )
-    ref_kwargs = dict(
-        BLOCK_M=tile_m,
-        BLOCK_N=tile_n,
-        softmax_scale=recipe.ref_softmax_scale,
-    )
-    reference, _ = sol_attn_ref(*ref_args, **ref_kwargs)
-    keep_or_drop, _ = sol_attn_ref(*ref_args, **ref_kwargs, correction=False)
-
-    to_reference = _cosine(sol, reference)
-    to_keep_or_drop = _cosine(sol, keep_or_drop)
-    assert torch.isfinite(sol).all()
-    assert to_reference > recipe.oracle_floor, f"cosine to oracle {to_reference}"
-    assert to_reference > to_keep_or_drop + recipe.keep_or_drop_margin, (
-        f"correction not observable: {to_reference} vs {to_keep_or_drop}"
-    )
 
 
 @pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
