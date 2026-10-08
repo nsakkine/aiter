@@ -46,7 +46,7 @@ from aiter.ops.mha_v4_quant import (
 )
 from aiter.ops.triton.attention.utils import (
     block_attn_mask_to_ragged_lut,
-    sol_attn_prepare,
+    sol_prepare,
 )
 
 __all__ = (
@@ -55,7 +55,7 @@ __all__ = (
     "AttentionPack",
     "AttentionScaleMode",
     "MHA_V4_BLOCK_SPARSE_MODES",
-    "MHA_V4_SOL_ATTN_MODE",
+    "MHA_V4_SOL_MODE",
     "MHA_V4_SPARSE_MODE",
     "mha_v4",
     "mha_v4_block_tile",
@@ -66,7 +66,7 @@ __all__ = (
     "mha_v4_operands",
     "mha_v4_packed",
     "mha_v4_q_multiplier",
-    "mha_v4_sol_attn",
+    "mha_v4_sol",
     "mha_v4_sparse_work_table",
     "mxfp4_k_view",
     "mxfp4_v_view",
@@ -208,8 +208,8 @@ _MHA_V4_Q_TILE = 256
 MHA_V4_SPARSE_MODE = 1
 # mode=2 selects the Sol-Attn rows, which run the same block-sparse exact pass and then correct it
 # with a pooled approximate pass, so they share the sparse modes' block geometry.
-MHA_V4_SOL_ATTN_MODE = 2
-MHA_V4_BLOCK_SPARSE_MODES = (MHA_V4_SPARSE_MODE, MHA_V4_SOL_ATTN_MODE)
+MHA_V4_SOL_MODE = 2
+MHA_V4_BLOCK_SPARSE_MODES = (MHA_V4_SPARSE_MODE, MHA_V4_SOL_MODE)
 
 # Shared-K component, relative to a typical K row, above which removing it improves quantization.
 # Real video models run to 0.67 (HunyuanVideo 1.5) and 0.76 (Wan) at the extreme, and on the one
@@ -1017,7 +1017,7 @@ def _mha_v4_fwd_sparse_launch_fake(
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
 
 
-def _fmha_v4_fwd_sol_attn_fake(
+def _fmha_v4_fwd_sol_fake(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1059,10 +1059,10 @@ def _fmha_v4_fwd_sol_attn_fake(
 
 @compile_ops(
     "module_fmha_v4_fwd",
-    fc_name="fmha_v4_fwd_sol_attn",
-    gen_fake=_fmha_v4_fwd_sol_attn_fake,
+    fc_name="fmha_v4_fwd_sol",
+    gen_fake=_fmha_v4_fwd_sol_fake,
 )
-def _fmha_v4_fwd_sol_attn(
+def _fmha_v4_fwd_sol(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1096,10 +1096,8 @@ def _fmha_v4_fwd_sol_attn(
 ) -> None: ...
 
 
-@torch.library.custom_op(
-    "aiter::mha_v4_fwd_sol_attn_launch", mutates_args=("out", "lse")
-)
-def _mha_v4_fwd_sol_attn_launch(
+@torch.library.custom_op("aiter::mha_v4_fwd_sol_launch", mutates_args=("out", "lse"))
+def _mha_v4_fwd_sol_launch(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1131,7 +1129,7 @@ def _mha_v4_fwd_sol_attn_launch(
     sorted_dispatch: int = -1,
     mean_k_var_scale: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
-    _fmha_v4_fwd_sol_attn(
+    _fmha_v4_fwd_sol(
         q,
         k,
         v,
@@ -1165,8 +1163,8 @@ def _mha_v4_fwd_sol_attn_launch(
     )
 
 
-@_mha_v4_fwd_sol_attn_launch.register_fake
-def _mha_v4_fwd_sol_attn_launch_fake(
+@_mha_v4_fwd_sol_launch.register_fake
+def _mha_v4_fwd_sol_launch_fake(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1335,11 +1333,11 @@ def mha_v4_packed(
 
     Adding the pooled triple (mean_k, mean_v, block_bitmap) on top of the LUT
     selects Sol-Attn instead, which corrects the blocks the LUT dropped rather
-    than discarding them; aiter.ops.triton's sol_attn_prepare() builds all six
+    than discarding them; aiter.ops.triton's sol_prepare() builds all six
     tensors from one mask. A row that selects nothing falls back to the
     pooled-only softmax over every block instead of to a zero tile.
     A block-granular operand also needs its pooled scale (mean_k_scale,
-    mean_v_scale), which sol_attn_prepare() returns for exactly the operands
+    mean_v_scale), which sol_prepare() returns for exactly the operands
     whose source scale could not survive pooling.
 
     block_tile names the (q_tile, kv_tile) geometry the LUT and pooled tensors
@@ -1499,7 +1497,7 @@ def mha_v4_packed(
         operands = mha_v4_operands(
             q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, v_pack
         )
-        mode = MHA_V4_SOL_ATTN_MODE if pooled is not None else MHA_V4_SPARSE_MODE
+        mode = MHA_V4_SOL_MODE if pooled is not None else MHA_V4_SPARSE_MODE
         q_tile, kv_tile = (
             mha_v4_block_tile(operands, mode)
             if block_tile is None
@@ -1523,7 +1521,7 @@ def mha_v4_packed(
         if pooled is None:
             _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse, q_tile, kv_tile)
         else:
-            _mha_v4_fwd_sol_attn_launch(
+            _mha_v4_fwd_sol_launch(
                 *launch_args,
                 *lut,
                 *pooled,
@@ -2003,7 +2001,7 @@ def mha_v4(
     return result
 
 
-def mha_v4_sol_attn(
+def mha_v4_sol(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -2090,7 +2088,7 @@ def mha_v4_sol_attn(
         )
     if return_lse:
         _check_lse_capable()
-    out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_sol_attn")
+    out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_sol")
     recipe = _resolve_raw_recipe(
         q_format, k_format, v_format, None, None, None, sparse=True
     )
@@ -2101,14 +2099,14 @@ def mha_v4_sol_attn(
             mha_v4_operands(
                 q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, v_pack
             ),
-            MHA_V4_SOL_ATTN_MODE,
+            MHA_V4_SOL_MODE,
         )
         if block_tile is None
         else block_tile
     )
 
     if is_mx_recipe:
-        return _mha_v4_sol_attn_mx(
+        return _mha_v4_sol_mx(
             q,
             k,
             v,
@@ -2140,7 +2138,7 @@ def mha_v4_sol_attn(
     # Routed from the quantized K/V, not the BF16 inputs: the proxy scores have to be the ones the
     # kernel's exact pass will reproduce, or a block sitting within rounding distance of the
     # threshold can be selected here and skipped there.
-    plan = sol_attn_prepare(
+    plan = sol_prepare(
         q_quantized,
         k_quantized,
         v_quantized,
@@ -2178,7 +2176,7 @@ def mha_v4_sol_attn(
     )
 
 
-def _mha_v4_sol_attn_mx(
+def _mha_v4_sol_mx(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -2192,7 +2190,7 @@ def _mha_v4_sol_attn_mx(
     kv_range_tokens: int,
     sorted_dispatch: Optional[bool],  # noqa: UP045
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
-    """mha_v4_sol_attn for a recipe with an MX V, on its FP6-P rows.
+    """mha_v4_sol for a recipe with an MX V, on its FP6-P rows.
 
     A packed MX Q/K routes on the BF16 Q and pools K from its source; an FP8 Q/K is addressable,
     so it routes and pools on the stored codes as the per-tensor recipes do. V is always packed.
@@ -2224,7 +2222,7 @@ def _mha_v4_sol_attn_mx(
         v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
         v_packed_format = "mxfp6_fp6_p"
     tile_m, tile_n = block_tile
-    plan = sol_attn_prepare(
+    plan = sol_prepare(
         q_routing,
         k_quantized,
         v_quantized,

@@ -22,7 +22,7 @@ from aiter.ops.mha import (
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
-    MHA_V4_SOL_ATTN_MODE,
+    MHA_V4_SOL_MODE,
     MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
@@ -68,7 +68,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import (
     block_attn_mask_to_ragged_lut,
-    sol_attn_prepare,
+    sol_prepare,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
@@ -239,24 +239,24 @@ KERNEL_SPECS = {
 # mxfp4 maps to f4f4's quantization: both stage the same MXFP4 operands, and f4f4
 # names the all-MXFP4 recipe the mode-2 row is. That row consumes the FP6-P V
 # order, so its pooled V has to be packed in that order too.
-SOL_ATTN_KERNELS: dict[str, tuple[str, bool, str | None, str | None]] = {
-    "mha4_fp8_sol_attn": ("mha4_fp8", False, None, None),
-    "mha4_i8fp8_sol_attn": ("mha4_i8fp8", False, None, None),
-    "mha4_mxfp8_sol_attn": ("mha4_mxfp8", True, None, None),
-    "mha4_mxfp4_sol_attn": ("mha4_f4f4", True, "mxfp4", "mxfp4_fp6_p"),
+SOL_KERNELS: dict[str, tuple[str, bool, str | None, str | None]] = {
+    "mha4_fp8_sol": ("mha4_fp8", False, None, None),
+    "mha4_i8fp8_sol": ("mha4_i8fp8", False, None, None),
+    "mha4_mxfp8_sol": ("mha4_mxfp8", True, None, None),
+    "mha4_mxfp4_sol": ("mha4_f4f4", True, "mxfp4", "mxfp4_fp6_p"),
 }
 
 # Sol-Attn last, so the table reads as "dense rows, then the same recipes routed".
 # Their accuracy column is legitimately lower against a full-attention reference:
 # this table is where that tradeoff gets priced. A fixed mask replaces the routed
 # selection, which is what makes a Sol-Attn row and a sparse row comparable.
-for _sol_kernel, (_base_kernel, *_) in SOL_ATTN_KERNELS.items():
+for _sol_kernel, (_base_kernel, *_) in SOL_KERNELS.items():
     KERNEL_SPECS[_sol_kernel] = KERNEL_SPECS[_base_kernel]
 
 
 def base_kernel_name(kernel: str) -> str:
     """The kernel whose quantization a Sol-Attn row reuses, or the kernel itself."""
-    spec = SOL_ATTN_KERNELS.get(kernel)
+    spec = SOL_KERNELS.get(kernel)
     return spec[0] if spec is not None else kernel
 
 ALL_KERNELS = tuple(
@@ -836,7 +836,7 @@ def kernel_block_sizes(kernel: str) -> tuple[int, int]:
         }.get(kernel, (fp8, fp8, fp8))
         return 256, mha_v4_kv_tile(
             mha_v4_operands(*formats, *scale_modes_for_formats(*formats)),
-            MHA_V4_SOL_ATTN_MODE if kernel in SOL_ATTN_KERNELS else MHA_V4_SPARSE_MODE,
+            MHA_V4_SOL_MODE if kernel in SOL_KERNELS else MHA_V4_SPARSE_MODE,
         )
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
@@ -934,7 +934,7 @@ def sparse_flops_from_lut(
     return sparse_flops, total_dense_flops
 
 
-def sol_attn_flops_from_lut(
+def sol_flops_from_lut(
     kernel: str,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     shape: ShapeSpec,
@@ -1136,7 +1136,7 @@ def _mha_v4_packed_sparse_kwargs(
     }
 
 
-def _sol_attn_packed_kwargs(
+def _sol_packed_kwargs(
     kernel: str,
     tensors: tuple[torch.Tensor, ...],
     sources: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1159,10 +1159,10 @@ def _sol_attn_packed_kwargs(
     nor pooled from what the kernel reads.
     """
     quant_q, quant_k, quant_v, _, k_descale, _ = tensors[:6]
-    _, k_needs_pooled_scale, packed_format, v_packed_format = SOL_ATTN_KERNELS[kernel]
+    _, k_needs_pooled_scale, packed_format, v_packed_format = SOL_KERNELS[kernel]
     q_source, k_source, v_source = sources
 
-    plan = sol_attn_prepare(
+    plan = sol_prepare(
         q_source if packed_format is not None else quant_q,
         quant_k,
         quant_v,
@@ -1194,7 +1194,7 @@ def make_kernel_runner(
     v: torch.Tensor,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     block_mask: torch.Tensor | None = None,
-    sol_attn_out: dict[str, Any] | None = None,
+    sol_out: dict[str, Any] | None = None,
 ) -> Any:
     """Build the timed callable, with any one-off setup already paid.
 
@@ -1204,9 +1204,9 @@ def make_kernel_runner(
     materialized here rather than left to be discovered inside the measurement.
     """
     fn = _make_kernel_runner_impl(
-        args, q, k, v, block_lut, block_mask=block_mask, sol_attn_out=sol_attn_out
+        args, q, k, v, block_lut, block_mask=block_mask, sol_out=sol_out
     )
-    if args.kernel in SOL_ATTN_KERNELS:
+    if args.kernel in SOL_KERNELS:
         fn()
         torch.cuda.synchronize()
     return fn
@@ -1219,7 +1219,7 @@ def _make_kernel_runner_impl(
     v: torch.Tensor,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     block_mask: torch.Tensor | None = None,
-    sol_attn_out: dict[str, Any] | None = None,
+    sol_out: dict[str, Any] | None = None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -1243,28 +1243,28 @@ def _make_kernel_runner_impl(
 
     # A Sol-Attn kernel reuses another row's quantization wholesale and differs only in what is
     # appended to the launch, so the branches below dispatch on the base name.
-    sol_attn_kernel = args.kernel if args.kernel in SOL_ATTN_KERNELS else None
+    sol_kernel = args.kernel if args.kernel in SOL_KERNELS else None
     base_kernel = base_kernel_name(args.kernel)
     # Routing and pooling depend on the quantized operands, which each branch builds for itself, so
     # the plan is built on the first launch and reused. do_bench warms up before it measures, so
     # that first call is not one of the timed ones.
-    sol_attn_cache: dict[str, Any] = {}
+    sol_cache: dict[str, Any] = {}
 
     def launch_mha_v4_packed(*tensors, **kwargs):
-        if sol_attn_kernel is None:
+        if sol_kernel is None:
             return mha_v4_packed(*tensors, **packed_sparse, **kwargs)
-        extra = sol_attn_cache.get("kwargs")
+        extra = sol_cache.get("kwargs")
         if extra is None:
-            extra = _sol_attn_packed_kwargs(
-                sol_attn_kernel,
+            extra = _sol_packed_kwargs(
+                sol_kernel,
                 tensors,
                 (q_bshd, k_bshd, v_bshd),
                 args.beta,
                 block_mask,
             )
-            sol_attn_cache["kwargs"] = extra
-            if sol_attn_out is not None:
-                sol_attn_out["block_lut"] = (
+            sol_cache["kwargs"] = extra
+            if sol_out is not None:
+                sol_out["block_lut"] = (
                     extra["kv_block_indices"],
                     extra["lut_start"],
                     extra["lut_count"],
@@ -1274,8 +1274,8 @@ def _make_kernel_runner_impl(
     def launch_mha_v4(*tensors, **kwargs):
         # mha_v4 quantizes for the dense and sparse rows only, so a Sol-Attn row routed through
         # it would silently time one of those instead.
-        if sol_attn_kernel is not None:
-            raise ValueError(f"{sol_attn_kernel} does not support --e2e")
+        if sol_kernel is not None:
+            raise ValueError(f"{sol_kernel} does not support --e2e")
         return mha_v4(*tensors, **raw_sparse, **kwargs)
 
     if base_kernel == "sage_fp8":
@@ -1964,7 +1964,7 @@ def benchmark_single_case(
     )
 
     # Sol-Attn routes its own mask, so its LUT comes back out of the runner rather than going in.
-    sol_attn_out: dict[str, Any] | None = {} if args.kernel in SOL_ATTN_KERNELS else None
+    sol_out: dict[str, Any] | None = {} if args.kernel in SOL_KERNELS else None
     fn = make_kernel_runner(
         args,
         q,
@@ -1972,7 +1972,7 @@ def benchmark_single_case(
         v,
         block_lut=block_lut,
         block_mask=block_attn_mask,
-        sol_attn_out=sol_attn_out,
+        sol_out=sol_out,
     )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
@@ -1997,10 +1997,8 @@ def benchmark_single_case(
     )
 
     sparse_flops = None
-    if sol_attn_out is not None and "block_lut" in sol_attn_out:
-        sparse_flops, _ = sol_attn_flops_from_lut(
-            args.kernel, sol_attn_out["block_lut"], shape
-        )
+    if sol_out is not None and "block_lut" in sol_out:
+        sparse_flops, _ = sol_flops_from_lut(args.kernel, sol_out["block_lut"], shape)
     elif block_lut is not None:
         sparse_flops, _ = sparse_flops_from_lut(args.kernel, block_lut, shape)
 
@@ -2027,7 +2025,7 @@ def has_sparse_metric(args: argparse.Namespace) -> bool:
     return (
         args.block_sparsity is not None
         or args.block_mask_file is not None
-        or args.kernel in SOL_ATTN_KERNELS
+        or args.kernel in SOL_KERNELS
     )
 
 
@@ -2053,7 +2051,7 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> list[
     if args.metric == "sparseput" and not include_sparse_metric:
         raise ValueError(
             "sparse_throughput requires --block-sparsity, --block-mask-file, "
-            "or a *_sol_attn kernel"
+            "or a *_sol kernel"
         )
 
     if args.metric not in metric_map:
@@ -2218,7 +2216,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.n_repetitions is not None and args.n_repetitions <= 0:
         raise ValueError("--n-repetitions must be positive")
 
-    if args.kernel in SOL_ATTN_KERNELS and args.e2e:
+    if args.kernel in SOL_KERNELS and args.e2e:
         raise ValueError(f"{args.kernel} does not support --e2e")
 
     if args.e2e and spec is not None and not spec.quantized:
@@ -2659,7 +2657,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Sol-Attn routing threshold: a KV block is computed exactly when its pooled proxy "
             "exceeds mean + beta * std over that query tile's blocks. Higher beta selects fewer "
-            "blocks. Used by the *_sol_attn kernels when no mask is supplied; --block-sparsity "
+            "blocks. Used by the *_sol kernels when no mask is supplied; --block-sparsity "
             "or --block-mask-file overrides it with a fixed selection, which is what makes a "
             "Sol-Attn row and a sparse row comparable at one density."
         ),

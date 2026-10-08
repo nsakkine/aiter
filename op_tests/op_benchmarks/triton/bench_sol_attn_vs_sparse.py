@@ -39,7 +39,7 @@ import torch
 import triton
 
 from aiter.ops.mha_v4 import (
-    MHA_V4_SOL_ATTN_MODE,
+    MHA_V4_SOL_MODE,
     AttentionFormat,
     AttentionScaleMode,
     mha_v4_kv_tile,
@@ -56,7 +56,7 @@ from aiter.ops.mha_v4 import (
 from aiter.ops.triton.attention.utils import (
     SOL_ATTN_TS_QO,
     block_attn_mask_to_ragged_lut,
-    sol_attn_prepare,
+    sol_prepare,
 )
 
 # Wan 2.2 A14B transformer.
@@ -120,7 +120,7 @@ def recipe_kv_tile(recipe: str) -> int:
     """
     formats, scale_modes = recipe_formats(recipe)
     return mha_v4_kv_tile(
-        mha_v4_operands(*formats, *scale_modes), MHA_V4_SOL_ATTN_MODE
+        mha_v4_operands(*formats, *scale_modes), MHA_V4_SOL_MODE
     )
 
 
@@ -176,7 +176,7 @@ def build_operands(seqlen: int, heads: int, recipe: str, device="cuda"):
 def time_pair(operands, mask, warmup, rep):
     """Time the sparse and Sol-Attn launches over one selection.
 
-    sol_attn_prepare owns the mask it returns -- it forces a short tail block onto the
+    sol_prepare owns the mask it returns -- it forces a short tail block onto the
     exact pass, which the approximate branch's constant full-block factor cannot
     represent -- so the sparse LUT is built from THAT mask, not the one handed in.
     Otherwise the two kernels would be timed over selections differing by one block.
@@ -186,7 +186,7 @@ def time_pair(operands, mask, warmup, rep):
     launch_args = (*tensors, *operands["formats"], *operands["scale_modes"])
     softmax_scale = operands["softmax_scale"]
 
-    plan = sol_attn_prepare(
+    plan = sol_prepare(
         q_quant,
         k_quant,
         v_quant,

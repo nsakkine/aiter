@@ -46,7 +46,7 @@ MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 - raw recipe selection and validation;
 - dense/sparse/Sol-Attn manifest dispatch and the geometry queries (`mha_v4_block_tile`,
   `mha_v4_block_tiles`, `mha_v4_kv_tile`, `mha_v4_operands`);
-- `mha_v4`, `mha_v4_sol_attn`, and `mha_v4_packed`;
+- `mha_v4`, `mha_v4_sol`, and `mha_v4_packed`;
 - final launch wrappers that rebuild packed views.
 
 `aiter.ops.mha_v4_quant` owns:
@@ -171,13 +171,13 @@ Sol-Attn (arXiv 2607.24027) is manifest `mode=2`. It runs the same block-sparse 
 covered, so a below-threshold block contributes its zeroth-order term instead of nothing. Both
 passes share one online-softmax state, and `return_lse` reports that one softmax.
 
-Raw API: `mha_v4_sol_attn(..., beta=0.4)`. It takes no selection, because routing has to see the
+Raw API: `mha_v4_sol(..., beta=0.4)`. It takes no selection, because routing has to see the
 quantized K the kernel will read; `beta` sets the per-query-tile threshold at
 `mean_j(proxy) + beta * std_j(proxy)`, so it selects a block density rather than a block count.
 It always uses the canonical scale modes and does not apply `mha_v4`'s K-mean smoothing.
 
 Packed API: the LUT triple plus `mean_k`, `mean_v`, and `block_bitmap`, all set or all omitted, and
-rejected without a LUT triple. `aiter.ops.triton.attention.utils.sol_attn_prepare()` produces all
+rejected without a LUT triple. `aiter.ops.triton.attention.utils.sol_prepare()` produces all
 of them from one selection, either routed from `beta` or supplied as `block_attn_mask`, so the
 bitmap and the LUT cannot disagree. A supplied mask changes only the LUT and the bitmap; the
 unselected blocks are still swept from the pooled K/V, which is what separates Sol-Attn from a
@@ -210,7 +210,7 @@ splits the softmax into LSE-merged key ranges on rows declaring `kv_range`.
 ## Validation
 
 Run `pytest op_tests/test_mha_v4.py op_tests/test_mha_v4_sparse.py` for entrypoint changes, and
-`op_tests/triton_tests/attention/test_sol_attn_prepare.py` for Sol-Attn routing or pooling. Quantizer/layout changes additionally
+`op_tests/triton_tests/attention/test_sol_prepare.py` for Sol-Attn routing or pooling. Quantizer/layout changes additionally
 require byte-level checks at aligned and ragged sequence lengths, eager/fullgraph parity, allocator
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.

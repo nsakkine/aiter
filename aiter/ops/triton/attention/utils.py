@@ -23,7 +23,7 @@ from aiter.ops.triton._triton_kernels.attention.sol_attn_pool import (
 # pooling block size, which each row fixes rather than reading, so pooling with
 # any other value is silently wrong rather than an error -- which is why BLOCK_M/BLOCK_N below must
 # name the geometry of the row that will actually be dispatched, not a preference. gfx950 also ships
-# a 64x64 FP8 row; mha_v4_sol_attn(block_tile=...) drives routing and dispatch from one value so the
+# a 64x64 FP8 row; mha_v4_sol(block_tile=...) drives routing and dispatch from one value so the
 # two cannot drift apart.
 SOL_ATTN_TS_QO = 256
 SOL_ATTN_TS_KV = 128
@@ -674,7 +674,7 @@ def _sol_attn_route(
     return selected | (empty & F.one_hot(proxy.argmax(dim=-1), proxy.shape[-1]).bool())
 
 
-def sol_attn_prepare(
+def sol_prepare(
     q: torch.Tensor,
     k_quant: torch.Tensor,
     v_quant: torch.Tensor,

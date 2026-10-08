@@ -570,7 +570,7 @@ def sol_attn_ref(
     masked OUT of the approximate branch so their mass is not counted twice.
 
     q, k, v: (batch, seqlen, nheads, head_dim) bshd, DEQUANTIZED. So are k_mean and v_mean, which
-        are (batch, num_kv_blocks, nheads_kv, head_dim) as produced by sol_attn_prepare.
+        are (batch, num_kv_blocks, nheads_kv, head_dim) as produced by sol_prepare.
     block_attn_mask: (batch, nheads_q, num_q_tiles, num_kv_blocks) bool, True == computed exactly.
         Required, and deliberately not re-routed here: routing is scale invariant in real arithmetic
         but not in fp32, so an oracle that re-derived the mask from beta would disagree with the

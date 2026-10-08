@@ -207,7 +207,7 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 // each workgroup takes its (q_tile, head, batch) from the table, heaviest LUT row first; NULL is
 // the raster 3-D grid. A row without it declares a 1040-byte kernarg and never sees the slot, and
 // a row without the E8M0 variance pair declares at most 1056 bytes and never sees that.
-struct __attribute__((packed)) FmhaV4SolAttnKernarg
+struct __attribute__((packed)) FmhaV4SolKernarg
 {
     FmhaV4Kernarg dense;
     ConstPointerSlot ptr_kv_block_indices;
@@ -239,24 +239,24 @@ struct __attribute__((packed)) FmhaV4SolAttnKernarg
     ConstPointerSlot ptr_mean_k_var_scale;
 };
 
-static_assert(sizeof(FmhaV4SolAttnKernarg) == 1088,
+static_assert(sizeof(FmhaV4SolKernarg) == 1088,
               "MHA v4 Sol-Attn kernarg ABI must remain 1088 bytes");
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_work_table) == 0x410);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k_var) == 0x420);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k_var_scale) == 0x430);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_kv_block_indices) == 0x290);
-static_assert(offsetof(FmhaV4SolAttnKernarg, s_kv_range_blocks) == 0x2D0);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k) == 0x2E0);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_v) == 0x2F0);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_block_bitmap) == 0x300);
-static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_k_Seqs) == 0x310);
-static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_v_Seqs) == 0x340);
-static_assert(offsetof(FmhaV4SolAttnKernarg, s_num_kv_blocks) == 0x370);
-static_assert(offsetof(FmhaV4SolAttnKernarg, s_bitmap_Ds) == 0x380);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_k_scale) == 0x390);
-static_assert(offsetof(FmhaV4SolAttnKernarg, ptr_mean_v_scale) == 0x3A0);
-static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_k_scale_Seqs) == 0x3B0);
-static_assert(offsetof(FmhaV4SolAttnKernarg, s_mean_v_scale_Seqs) == 0x3E0);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_work_table) == 0x410);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_mean_k_var) == 0x420);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_mean_k_var_scale) == 0x430);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_kv_block_indices) == 0x290);
+static_assert(offsetof(FmhaV4SolKernarg, s_kv_range_blocks) == 0x2D0);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_mean_k) == 0x2E0);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_mean_v) == 0x2F0);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_block_bitmap) == 0x300);
+static_assert(offsetof(FmhaV4SolKernarg, s_mean_k_Seqs) == 0x310);
+static_assert(offsetof(FmhaV4SolKernarg, s_mean_v_Seqs) == 0x340);
+static_assert(offsetof(FmhaV4SolKernarg, s_num_kv_blocks) == 0x370);
+static_assert(offsetof(FmhaV4SolKernarg, s_bitmap_Ds) == 0x380);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_mean_k_scale) == 0x390);
+static_assert(offsetof(FmhaV4SolKernarg, ptr_mean_v_scale) == 0x3A0);
+static_assert(offsetof(FmhaV4SolKernarg, s_mean_k_scale_Seqs) == 0x3B0);
+static_assert(offsetof(FmhaV4SolKernarg, s_mean_v_scale_Seqs) == 0x3E0);
 
 void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* name)
 {
@@ -1306,36 +1306,36 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, workgroup_size_for(cfg), 1, 1, stream});
 }
 
-void fmha_v4_fwd_sol_attn(const at::Tensor& q,
-                          const at::Tensor& k,
-                          const at::Tensor& v,
-                          const at::Tensor& q_descale,
-                          const at::Tensor& k_descale,
-                          const at::Tensor& v_descale,
-                          at::Tensor out,
-                          int64_t q_format,
-                          int64_t k_format,
-                          int64_t v_format,
-                          int64_t v_pack,
-                          int64_t q_scale_mode,
-                          int64_t k_scale_mode,
-                          int64_t v_scale_mode,
-                          double softmax_scale,
-                          const at::Tensor& kv_block_indices,
-                          const at::Tensor& lut_start,
-                          const at::Tensor& lut_count,
-                          const at::Tensor& mean_k,
-                          const at::Tensor& mean_v,
-                          const at::Tensor& block_bitmap,
-                          const std::optional<at::Tensor>& mean_k_scale,
-                          const std::optional<at::Tensor>& mean_v_scale,
-                          int64_t q_tile,
-                          int64_t kv_tile,
-                          std::optional<at::Tensor> lse,
-                          int64_t kv_range_tokens,
-                          const std::optional<at::Tensor>& mean_k_var,
-                          int64_t sorted_dispatch,
-                          const std::optional<at::Tensor>& mean_k_var_scale)
+void fmha_v4_fwd_sol(const at::Tensor& q,
+                     const at::Tensor& k,
+                     const at::Tensor& v,
+                     const at::Tensor& q_descale,
+                     const at::Tensor& k_descale,
+                     const at::Tensor& v_descale,
+                     at::Tensor out,
+                     int64_t q_format,
+                     int64_t k_format,
+                     int64_t v_format,
+                     int64_t v_pack,
+                     int64_t q_scale_mode,
+                     int64_t k_scale_mode,
+                     int64_t v_scale_mode,
+                     double softmax_scale,
+                     const at::Tensor& kv_block_indices,
+                     const at::Tensor& lut_start,
+                     const at::Tensor& lut_count,
+                     const at::Tensor& mean_k,
+                     const at::Tensor& mean_v,
+                     const at::Tensor& block_bitmap,
+                     const std::optional<at::Tensor>& mean_k_scale,
+                     const std::optional<at::Tensor>& mean_v_scale,
+                     int64_t q_tile,
+                     int64_t kv_tile,
+                     std::optional<at::Tensor> lse,
+                     int64_t kv_range_tokens,
+                     const std::optional<at::Tensor>& mean_k_var,
+                     int64_t sorted_dispatch,
+                     const std::optional<at::Tensor>& mean_k_var_scale)
 {
     const MhaV4Recipe recipe{q_format,
                              k_format,
@@ -1358,7 +1358,7 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     const auto arch = get_gpu_arch();
     const auto& cfg = find_config(arch, recipe, /*mode=*/2, q_tile, kv_tile);
     // Matches the sorted-sparse sibling, whose LUT machinery Sol-Attn reuses verbatim for its exact
-    // pass. A short last block is only ever computed there: sol_attn_prepare() forces it exact,
+    // pass. A short last block is only ever computed there: sol_prepare() forces it exact,
     // since the pooled xts_kv factor only holds for a full block.
     TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
                 "Sol-Attn MHA v4 row ",
@@ -1582,7 +1582,7 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
         work_table = build_sorted_work_table(count, shapes.batch, shapes.nhead_q, q_tiles, bucket);
     }
 
-    FmhaV4SolAttnKernarg args{};
+    FmhaV4SolKernarg args{};
     populate_dense_kernarg(args.dense,
                            q,
                            k,
@@ -1603,7 +1603,7 @@ void fmha_v4_fwd_sol_attn(const at::Tensor& q,
     // merge by, and it merges exactly, because a merge adds numerators and denominators separately
     // and the proxy sits in both. What it does not carry is which blocks were proxied: that is
     // decided from the blocks a caller hands this launch, so a caller splitting the KV across ranks
-    // owns keeping the routing consistent. See the note on mha_v4_sol_attn.
+    // owns keeping the routing consistent. See the note on mha_v4_sol.
     set_lse_kernarg(args.dense,
                     lse,
                     cfg,

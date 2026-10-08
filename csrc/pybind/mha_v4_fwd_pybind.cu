@@ -54,8 +54,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("q_tile")  = 0,
           py::arg("kv_tile") = 0,
           py::arg("lse")     = std::nullopt);
-    m.def("fmha_v4_fwd_sol_attn",
-          &aiter::torch_itfs::fmha_v4_fwd_sol_attn,
+    m.def("fmha_v4_fwd_sol",
+          &aiter::torch_itfs::fmha_v4_fwd_sol,
           py::arg("q"),
           py::arg("k"),
           py::arg("v"),

@@ -4,7 +4,7 @@
 """
 Sol-Attn routing/preprocessing: kernel ABI contract and torch.compile traceability.
 
-sol_attn_prepare must be traceable under torch.compile(fullgraph=True). That is a hard requirement
+sol_prepare must be traceable under torch.compile(fullgraph=True). That is a hard requirement
 of the entrypoint design, not a nice-to-have: a caller compiling an attention layer around Sol-Attn
 must be able to trace straight through the routing, rather than hiding it in an opaque custom op of
 its own. Two properties are what make it possible, and both are tested here rather than assumed:
@@ -30,7 +30,7 @@ from aiter.ops.triton.attention.utils import (
     SOL_ATTN_TS_QO,
     _sol_attn_pool_q,
     _sol_attn_route,
-    sol_attn_prepare,
+    sol_prepare,
 )
 
 BETA = 0.5
@@ -109,7 +109,7 @@ SHAPES = [
 def test_output_contract(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv):
     """Shapes and dtypes the kernarg ABI depends on, at aligned and ragged sequence lengths."""
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    prep = sol_attn_prepare(q, k, v, BETA)
+    prep = sol_prepare(q, k, v, BETA)
 
     for name, (shape, dtype) in _expected_shapes(
         batch, seqlen_q, seqlen_k, nhead_q, nhead_kv
@@ -132,8 +132,8 @@ def test_shapes_do_not_depend_on_values(batch, seqlen_q, seqlen_k, nhead_q, nhea
     block and beta=4 almost none, so any output whose size tracked the selection would differ.
     """
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    dense = sol_attn_prepare(q, k, v, -4.0)
-    sparse = sol_attn_prepare(q, k, v, 4.0)
+    dense = sol_prepare(q, k, v, -4.0)
+    sparse = sol_prepare(q, k, v, 4.0)
 
     assert dense["block_attn_mask"].sum() > sparse["block_attn_mask"].sum(), (
         "beta did not change the selection, so this test proves nothing"
@@ -152,7 +152,7 @@ def test_lut_and_bitmap_agree_with_mask(batch, seqlen_q, seqlen_k, nhead_q, nhea
     approximate pass. A disagreement would double-count or drop a block's mass rather than fail.
     """
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    prep = sol_attn_prepare(q, k, v, BETA)
+    prep = sol_prepare(q, k, v, BETA)
     mask = prep["block_attn_mask"]
     num_kv_blocks = mask.shape[-1]
     flat = mask.reshape(-1, num_kv_blocks)
@@ -195,7 +195,7 @@ def test_pooled_kv_matches_an_independent_block_mean(
     while leaving every shape, dtype and contiguity check green.
     """
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    prep = sol_attn_prepare(q, k, v, BETA)
+    prep = sol_prepare(q, k, v, BETA)
     num_kv_blocks = -(-seqlen_k // SOL_ATTN_TS_KV)
 
     for name, source in (("mean_k", k), ("mean_v", v)):
@@ -218,7 +218,7 @@ def test_every_work_item_selects_at_least_one_block(
 ):
     """Kernel ABI invariant: the sparse prologue preloads LUT[0] unconditionally."""
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    prep = sol_attn_prepare(q, k, v, 8.0)  # threshold high enough to clear a row
+    prep = sol_prepare(q, k, v, 8.0)  # threshold high enough to clear a row
     assert int(prep["lut_count"].min()) >= 1
 
 
@@ -270,7 +270,7 @@ def test_partial_tail_rule_matches_the_device_side_count(seqlen_k):
     )
 
     q, k, v = _operands(1, 512, seqlen_k, 4, 4)
-    mask = sol_attn_prepare(q, k, v, 8.0)["block_attn_mask"]
+    mask = sol_prepare(q, k, v, 8.0)["block_attn_mask"]
     if seqlen_k % SOL_ATTN_TS_KV:
         assert bool(mask[..., -1].all()), (
             "a partial tail block must be computed exactly"
@@ -283,7 +283,7 @@ def test_routing_matches_reference_threshold(
 ):
     """tau = mean_j(proxy) + beta * population_std_j(proxy), against an independent computation."""
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    prep = sol_attn_prepare(q, k, v, BETA)
+    prep = sol_prepare(q, k, v, BETA)
 
     q_mean = _sol_attn_pool_q(q, SOL_ATTN_TS_QO)
     k_rep = prep["mean_k"].float().repeat_interleave(nhead_q // nhead_kv, dim=2)
@@ -311,10 +311,8 @@ def test_compiles_fullgraph_and_matches_eager(
     would only show up much later as an accuracy regression.
     """
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    eager = sol_attn_prepare(q, k, v, BETA)
-    compiled = torch.compile(sol_attn_prepare, fullgraph=True, dynamic=False)(
-        q, k, v, BETA
-    )
+    eager = sol_prepare(q, k, v, BETA)
+    compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(q, k, v, BETA)
 
     for name, value in eager.items():
         if isinstance(value, torch.Tensor):
@@ -332,7 +330,7 @@ def test_compiles_fullgraph_and_matches_eager(
 def test_no_graph_breaks_and_routing_is_in_the_graph():
     """Explicit break accounting, so a regression names the break instead of failing obscurely."""
     q, k, v = _operands(1, 4096, 4096, 8, 8)
-    explained = torch._dynamo.explain(sol_attn_prepare)(q, k, v, BETA)
+    explained = torch._dynamo.explain(sol_prepare)(q, k, v, BETA)
     assert explained.graph_break_count == 0, (
         f"graph breaks: {[str(r) for r in explained.break_reasons]}"
     )
@@ -371,8 +369,8 @@ def test_packed_path_compiles_fullgraph_and_matches_eager(k_format, v_format, k_
         k_variance=k_variance,
     )
 
-    eager = sol_attn_prepare(q, k, v, BETA, **kwargs)
-    compiled = torch.compile(sol_attn_prepare, fullgraph=True, dynamic=False)(
+    eager = sol_prepare(q, k, v, BETA, **kwargs)
+    compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(
         q, k, v, BETA, **kwargs
     )
 
@@ -412,7 +410,7 @@ def test_packed_path_rejects_an_incoherent_request(kwargs, message):
         key: {"k": k, "v": v}.get(value, value) for key, value in kwargs.items()
     }
     with pytest.raises(ValueError, match=message):
-        sol_attn_prepare(q, k, v, BETA, **resolved)
+        sol_prepare(q, k, v, BETA, **resolved)
 
 
 @pytest.mark.skipif(
@@ -433,9 +431,7 @@ def test_packed_path_rejects_a_stored_scale_it_cannot_pool():
     )
 
     with pytest.raises(ValueError, match="k_scale does not apply to a packed operand"):
-        sol_attn_prepare(
-            q, k, v, BETA, k_scale=scale, k_source=k, k_packed_format="mxfp4"
-        )
+        sol_prepare(q, k, v, BETA, k_scale=scale, k_source=k, k_packed_format="mxfp4")
 
 
 @pytest.mark.parametrize("batch, seqlen_q, seqlen_k, nhead_q, nhead_kv", SHAPES)
@@ -451,14 +447,14 @@ def test_a_supplied_mask_replaces_routing_and_leaves_pooling_alone(
     pooled operands than the routed path builds.
     """
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    routed = sol_attn_prepare(q, k, v, BETA)
+    routed = sol_prepare(q, k, v, BETA)
     num_q_tiles, num_kv_blocks = routed["num_q_tiles"], routed["num_kv_blocks"]
 
     torch.manual_seed(7)
     supplied = (
         torch.rand(batch, nhead_q, num_q_tiles, num_kv_blocks, device="cuda") > 0.5
     )
-    prep = sol_attn_prepare(q, k, v, block_attn_mask=supplied)
+    prep = sol_prepare(q, k, v, block_attn_mask=supplied)
 
     for name in ("mean_k", "mean_v"):
         assert torch.equal(prep[name], routed[name]), f"{name} depends on the selection"
@@ -495,9 +491,9 @@ def test_a_supplied_mask_and_beta_are_exclusive():
     mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
 
     with pytest.raises(ValueError, match="exactly one of beta"):
-        sol_attn_prepare(q, k, v, BETA, block_attn_mask=mask)
+        sol_prepare(q, k, v, BETA, block_attn_mask=mask)
     with pytest.raises(ValueError, match="exactly one of beta"):
-        sol_attn_prepare(q, k, v)
+        sol_prepare(q, k, v)
 
 
 @pytest.mark.parametrize(
@@ -517,7 +513,7 @@ def test_a_supplied_mask_is_shape_and_dtype_checked(mask, message):
     """
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
     with pytest.raises(ValueError, match=message):
-        sol_attn_prepare(q, k, v, block_attn_mask=mask.cuda())
+        sol_prepare(q, k, v, block_attn_mask=mask.cuda())
 
 
 def test_a_supplied_mask_stays_fullgraph_traceable():
@@ -525,8 +521,8 @@ def test_a_supplied_mask_stays_fullgraph_traceable():
     q, k, v = _operands(1, 512, 4 * SOL_ATTN_TS_KV, 2, 2)
     mask = torch.rand(1, 2, 2, 4, device="cuda") > 0.5
 
-    eager = sol_attn_prepare(q, k, v, block_attn_mask=mask)
-    compiled = torch.compile(sol_attn_prepare, fullgraph=True, dynamic=False)(
+    eager = sol_prepare(q, k, v, block_attn_mask=mask)
+    compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(
         q, k, v, block_attn_mask=mask
     )
     for name in ("mean_k", "mean_v", "block_bitmap", "lut_start", "lut_count"):
@@ -552,7 +548,7 @@ def _tile_moments(q, block_m):
 def test_error_router_matches_reference(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv):
     """The error proxy against an independent computation from tile moments and the stored var_k."""
     q, k, v = _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv)
-    prep = sol_attn_prepare(
+    prep = sol_prepare(
         q, k, v, BETA, k_variance=True, router="error", routing_scale=ROUTING_SCALE
     )
 
@@ -583,16 +579,16 @@ def test_error_router_matches_reference(batch, seqlen_q, seqlen_k, nhead_q, nhea
     assert mismatched <= max(1, expected.numel() // 1000), mismatched
 
     # And it is a different selection from the mean router, or this test proves nothing.
-    mean_mask = sol_attn_prepare(q, k, v, BETA)["block_attn_mask"]
+    mean_mask = sol_prepare(q, k, v, BETA)["block_attn_mask"]
     assert not torch.equal(prep["block_attn_mask"], mean_mask)
 
 
 def test_error_router_leaves_the_default_and_the_pooled_operands_alone():
     q, k, v = _operands(1, 1024, 2048, 4, 2)
-    default = sol_attn_prepare(q, k, v, BETA)
-    explicit = sol_attn_prepare(q, k, v, BETA, router="mean")
-    with_var = sol_attn_prepare(q, k, v, BETA, k_variance=True)
-    error = sol_attn_prepare(q, k, v, BETA, router="error", routing_scale=ROUTING_SCALE)
+    default = sol_prepare(q, k, v, BETA)
+    explicit = sol_prepare(q, k, v, BETA, router="mean")
+    with_var = sol_prepare(q, k, v, BETA, k_variance=True)
+    error = sol_prepare(q, k, v, BETA, router="error", routing_scale=ROUTING_SCALE)
     for name in ("mean_k", "mean_v", "block_bitmap", "block_attn_mask"):
         assert torch.equal(explicit[name], default[name]), name
         assert torch.equal(with_var[name], default[name]), name
@@ -604,8 +600,8 @@ def test_error_router_leaves_the_default_and_the_pooled_operands_alone():
 def test_error_router_takes_a_device_scale():
     """A per-tensor descale lives on the device; passing it must not need a host read."""
     q, k, v = _operands(1, 1024, 2048, 4, 2)
-    as_float = sol_attn_prepare(q, k, v, BETA, router="error", routing_scale=ROUTING_SCALE)
-    as_tensor = sol_attn_prepare(
+    as_float = sol_prepare(q, k, v, BETA, router="error", routing_scale=ROUTING_SCALE)
+    as_tensor = sol_prepare(
         q, k, v, BETA, router="error",
         routing_scale=torch.tensor([ROUTING_SCALE], device="cuda"),
     )
@@ -623,7 +619,7 @@ def test_error_router_takes_a_device_scale():
 def test_error_router_rejects_an_incoherent_request(kwargs, message):
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
     with pytest.raises(ValueError, match=message):
-        sol_attn_prepare(q, k, v, BETA, **kwargs)
+        sol_prepare(q, k, v, BETA, **kwargs)
 
 
 def _block_variance(x):
@@ -636,7 +632,7 @@ def test_error_router_rejects_a_supplied_mask():
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
     mask = torch.ones(1, 2, 2, 2, dtype=torch.bool, device="cuda")
     with pytest.raises(ValueError, match="routes from beta"):
-        sol_attn_prepare(q, k, v, block_attn_mask=mask, router="error", routing_scale=1.0)
+        sol_prepare(q, k, v, block_attn_mask=mask, router="error", routing_scale=1.0)
 
 
 def _e8m0_image(x, low=122, octaves=3):
@@ -656,14 +652,14 @@ def test_q_scale_routes_as_the_dequantized_q():
     """An MXFP8 Q's codes are not proportional to Q, so routing has to see it dequantized."""
     q, k, v = _operands(1, 1024, 2048, 4, 2)
     q_scale = _e8m0_image(q)
-    with_scale = sol_attn_prepare(q, k, v, BETA, q_scale=q_scale)
-    dequantized = sol_attn_prepare(_e8m0_apply(q, q_scale), k, v, BETA)
+    with_scale = sol_prepare(q, k, v, BETA, q_scale=q_scale)
+    dequantized = sol_prepare(_e8m0_apply(q, q_scale), k, v, BETA)
     assert torch.equal(with_scale["block_attn_mask"], dequantized["block_attn_mask"])
     # A per-group scale that varies really does move the selection, or this proves nothing.
-    codes = sol_attn_prepare(q, k, v, BETA)
+    codes = sol_prepare(q, k, v, BETA)
     assert not torch.equal(with_scale["block_attn_mask"], codes["block_attn_mask"])
     with pytest.raises(ValueError, match="q_scale must be"):
-        sol_attn_prepare(q, k, v, BETA, q_scale=q_scale[:, :-1])
+        sol_prepare(q, k, v, BETA, q_scale=q_scale[:, :-1])
 
 
 def test_error_router_on_a_block_scaled_k_scores_the_dequantized_moments():
@@ -673,7 +669,7 @@ def test_error_router_on_a_block_scaled_k_scores_the_dequantized_moments():
     q_scale, k_scale = _e8m0_image(q), _e8m0_image(k)
     # The top channel group's scales sit near 1, so the code products keep their magnitude.
     c = ROUTING_SCALE
-    prep = sol_attn_prepare(
+    prep = sol_prepare(
         q, k, v, BETA, k_scale=k_scale, q_scale=q_scale, k_variance=True,
         router="error", routing_scale=c,
     )
@@ -700,10 +696,10 @@ def test_error_router_on_a_block_scaled_k_scores_the_dequantized_moments():
     assert mismatched <= max(1, expected.numel() // 1000), mismatched
     assert not torch.equal(
         prep["block_attn_mask"],
-        sol_attn_prepare(q, k, v, BETA, k_scale=k_scale, q_scale=q_scale)["block_attn_mask"],
+        sol_prepare(q, k, v, BETA, k_scale=k_scale, q_scale=q_scale)["block_attn_mask"],
     )
     # Routing needs the variance whether or not the kernel takes it; the outputs follow k_variance.
-    no_var = sol_attn_prepare(
+    no_var = sol_prepare(
         q, k, v, BETA, k_scale=k_scale, q_scale=q_scale, router="error", routing_scale=c
     )
     assert torch.equal(no_var["block_attn_mask"], prep["block_attn_mask"])
@@ -713,14 +709,14 @@ def test_error_router_on_a_block_scaled_k_scores_the_dequantized_moments():
 def test_k_variance_of_an_integer_k_is_its_codes_over_512_in_e4m3():
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
     k_int = (k.float() / 448.0 * 127.0).round().clamp(-127, 127).to(torch.int8)
-    prep = sol_attn_prepare(q, k_int, v, BETA, k_variance=True)
+    prep = sol_prepare(q, k_int, v, BETA, k_variance=True)
     assert prep["mean_k"].dtype == torch.int8
     assert prep["mean_k_var"].dtype == torch.float8_e4m3fn
     assert prep["mean_k_var_scale"] is None
     expected = (_block_variance(k_int) / 512.0).to(torch.float8_e4m3fn)
     torch.testing.assert_close(prep["mean_k_var"].float(), expected.float(), rtol=0, atol=0)
     # Asking for the variance leaves the routing and the mean alone.
-    plain = sol_attn_prepare(q, k_int, v, BETA)
+    plain = sol_prepare(q, k_int, v, BETA)
     assert torch.equal(prep["mean_k"], plain["mean_k"])
     assert torch.equal(prep["block_bitmap"], plain["block_bitmap"])
 
@@ -731,7 +727,7 @@ def test_k_variance_of_a_block_scaled_k_is_the_dequantized_block_variance():
     k_scale = (
         122 + torch.randint(0, 6, (*k.shape[:3], k.shape[3] // 32), device="cuda")
     ).to(torch.uint8)
-    prep = sol_attn_prepare(q, k, v, BETA, k_scale=k_scale, k_variance=True)
+    prep = sol_prepare(q, k, v, BETA, k_scale=k_scale, k_variance=True)
     data, scale = prep["mean_k_var"], prep["mean_k_var_scale"]
     assert data.dtype == k.dtype and data.shape == prep["mean_k"].shape
     assert scale.dtype == torch.uint8 and scale.shape == prep["mean_k_scale"].shape
@@ -742,7 +738,7 @@ def test_k_variance_of_a_block_scaled_k_is_the_dequantized_block_variance():
     # the group's scale for the small values sharing a group with a large one.
     bound = expected / 16.0 + factor * 2.0**-10
     assert ((data.float() * factor - expected).abs() <= bound).all()
-    plain = sol_attn_prepare(q, k, v, BETA, k_scale=k_scale)
+    plain = sol_prepare(q, k, v, BETA, k_scale=k_scale)
     assert torch.equal(prep["mean_k"], plain["mean_k"])
     assert torch.equal(prep["mean_k_scale"], plain["mean_k_scale"])
     assert plain["mean_k_var"] is None and plain["mean_k_var_scale"] is None
@@ -752,8 +748,8 @@ def test_error_router_compiles_fullgraph_and_matches_eager():
     q, k, v = _operands(1, 9419, 9419, 5, 5)
     scale = torch.tensor([ROUTING_SCALE], device="cuda")
     kwargs = dict(k_variance=True, router="error", routing_scale=scale)
-    eager = sol_attn_prepare(q, k, v, BETA, **kwargs)
-    compiled = torch.compile(sol_attn_prepare, fullgraph=True, dynamic=False)(
+    eager = sol_prepare(q, k, v, BETA, **kwargs)
+    compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(
         q, k, v, BETA, **kwargs
     )
     for name in ("mean_k", "mean_v", "block_attn_mask", "block_bitmap", "lut_start", "lut_count"):
