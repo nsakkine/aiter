@@ -343,7 +343,7 @@ def test_no_graph_breaks_and_routing_is_in_the_graph():
 @pytest.mark.parametrize(
     "k_format, v_format, k_variance",
     [
-        ("mxfp4", "mxfp4", False),
+        ("mxfp4", "mxfp4_fp6_p", False),
         ("mxfp4", "mxfp4_fp6_p", True),
         ("mxfp6", "mxfp6_fp6_p", True),
     ],
@@ -401,6 +401,8 @@ def test_packed_path_compiles_fullgraph_and_matches_eager(k_format, v_format, k_
         # The FP6-P names describe a V layout, and plain MXFP6 has no V packing of its own here.
         (dict(k_packed_format="mxfp4_fp6_p", k_source="k"), "is not one of"),
         (dict(v_packed_format="mxfp6", v_source="v"), "is not one of"),
+        # No Sol-Attn row reads a column-major MXFP4 V.
+        (dict(v_packed_format="mxfp4", v_source="v"), "is not one of"),
     ],
 )
 def test_packed_path_rejects_an_incoherent_request(kwargs, message):

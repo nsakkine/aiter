@@ -627,8 +627,8 @@ def _mxfp4_v_buffers(
 def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
     """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers (v_pack 0).
 
-    Only the v_pack 0 MXFP4 Sol-Attn row reads this order; every other MXFP4 V row takes
-    quantize_v_mxfp4_fp6_p. Same buffers, so mxfp4_v_view reads either.
+    No mha_v4 row reads this order: every MXFP4 V row takes quantize_v_mxfp4_fp6_p. Same
+    buffers, so mxfp4_v_view reads either.
     """
     batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP4 V quantization")
     raw, scale = _mxfp4_v_buffers(input, batch, sequence, heads)

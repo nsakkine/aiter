@@ -66,6 +66,7 @@ __all__ = (
     "mha_v4_operands",
     "mha_v4_packed",
     "mha_v4_q_multiplier",
+    "mha_v4_ragged_kv",
     "mha_v4_sol",
     "mha_v4_sparse_work_table",
     "mxfp4_k_view",
@@ -278,7 +279,7 @@ def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
     the modes are intersected rather than unioned, since a caller shaping a mask has not yet chosen
     how to route it and a geometry is only safe when either mode can serve it. That intersection is
     only meaningful across whole modes, though: the modes need not agree on operands at a given
-    geometry (mxfp4 routes sorted-sparse with an FP8 V and Sol-Attn with an MXFP4 one), so a caller
+    geometry (MXFP6 Q/K with an FP8 V has a sorted-sparse row and no Sol-Attn one), so a caller
     narrowing by operands has committed to one mode and should name it.
     """
     return _mha_v4_kv_tile_for_q_tile_from_manifest(
@@ -395,6 +396,27 @@ def mha_v4_block_tiles_in_any_precision(mode: int) -> tuple[tuple[int, int], ...
     """
     rows = _mha_v4_block_rows_from_manifest()[mode]
     return tuple(sorted({(row[_ROW_TS_QO], row[_ROW_TS_KV]) for row in rows}))
+
+
+@functools.cache
+def mha_v4_ragged_kv(operands, mode, block_tile=None) -> bool:
+    """Whether the `mode` row for `operands` takes a key length that is not a multiple of its tile.
+
+    A ragged row masks the keys past the end of a short last block itself, so a caller hands it
+    the true key length; anything else needs K/V padded to a whole number of blocks, which
+    mha_v4_packed() checks and refuses. This is the answer a caller wants before deciding to pad,
+    since padding with zero keys is not free -- each one draws softmax weight exp(-max) rather
+    than none -- and the ragged rows make it unnecessary.
+
+    operands is what mha_v4_operands() builds and mode one of MHA_V4_BLOCK_SPARSE_MODES. Neither
+    is optional, because the capability belongs to one row: every gfx950 block-sparse and Sol-Attn
+    row is ragged, and gfx942 has no ragged row at all. block_tile defaults to the
+    geometry these operands dispatch at, as mha_v4_block_tile() answers it.
+    """
+    q_tile, kv_tile = (
+        mha_v4_block_tile(operands, mode) if block_tile is None else tuple(block_tile)
+    )
+    return bool(_mha_v4_ragged_kv_from_manifest(q_tile, kv_tile, *operands, int(mode)))
 
 
 def _mha_v4_block_q_tiles_from_manifest() -> tuple[int, ...]:

@@ -38,15 +38,12 @@ _E8M0_GROUP = 32
 # built from the tensor the packer was given rather than from the codes it produced. The name says
 # which packer the pooled operand goes through, so it has to be the one the row reads: a V named
 # *_fp6_p is packed in the token order an FP6 P operand contracts over (AttentionPack.V_FOR_FP6_P),
-# and plain "mxfp4" V is the column-major packing.
+# which is the only packed V order a Sol-Attn row reads.
 SOL_ATTN_PACKED_K_FORMATS = ("mxfp4", "mxfp6")
-SOL_ATTN_PACKED_V_FORMATS = ("mxfp4", "mxfp4_fp6_p", "mxfp6_fp6_p")
+SOL_ATTN_PACKED_V_FORMATS = ("mxfp4_fp6_p", "mxfp6_fp6_p")
 SOL_ATTN_PACKED_FORMATS = tuple(
     dict.fromkeys(SOL_ATTN_PACKED_K_FORMATS + SOL_ATTN_PACKED_V_FORMATS)
 )
-
-# Landing zone for the V-scale gather's one-tile-ahead over-read; see _sol_attn_pool_mxfp4_v.
-_FP4_V_SCALE_SLACK_BYTES = 512
 
 
 def _e8m0_dequantize(data: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -433,35 +430,6 @@ def _sol_attn_pool_mxfp4_k(
     return mxfp4_k_view(raw, scale[:, :blocks]), scale, pooled
 
 
-def _sol_attn_pool_mxfp4_v(
-    v_source: torch.Tensor, BLOCK_N: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pool an MXFP4 V into one row per KV block, WITH a pooled E8M0 scale of its own.
-
-    Same source-side pooling as :func:`_sol_attn_pool_mxfp4_k`, and V is the worse of the two to
-    read back: its logical view carries 128 elements over a 64-byte row stride, so it is an aliased
-    descriptor rather than an indexable tensor, and its scale is a permuted per-tile 512-byte image.
-
-    The returned scale is backed by 512 bytes of slack, because the V scale may be read past the end
-    of the image. That is harmless for a full-length V sitting inside a large allocation but not for
-    a pooled image, where the over-read can leave the allocation entirely. Only the storage grows;
-    shape and strides are the packer's own.
-    """
-    from aiter.ops.mha_v4_quant import mxfp4_v_view, quantize_v_mxfp4
-
-    pooled = _sol_attn_block_mean(v_source.float(), BLOCK_N).to(torch.bfloat16)
-    blocks = pooled.shape[1]
-    raw, scale = quantize_v_mxfp4(_sol_attn_pad_to_tile(pooled, BLOCK_N))
-
-    backing = scale.new_zeros((scale.numel() + _FP4_V_SCALE_SLACK_BYTES,))
-    backing[: scale.numel()] = scale.reshape(-1)
-    slack_scale = torch.as_strided(backing, scale.shape, scale.stride())
-
-    # mxfp4_v_view rounds the sequence up to the same 128-token tile the packer padded to, so the
-    # view geometry is identical whether it is given the pooled height or the padded one.
-    return mxfp4_v_view(raw, scale, blocks), slack_scale, pooled
-
-
 def _sol_attn_pack_k(
     x: torch.Tensor, fmt: str, BLOCK_N: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -525,7 +493,7 @@ def _sol_attn_pool_fp6_p_v(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pool an MXFP4 or MXFP6 V for the FP6-P rows into one row per KV block, with its own scale.
 
-    Source-side pooling as in :func:`_sol_attn_pool_mxfp4_v`, through the FP6-P V packers, whose
+    Source-side pooling as in :func:`_sol_attn_pool_mxfp4_k`, through the FP6-P V packers, whose
     scale already carries the slack the one-tile-ahead scale gather needs.
     """
     from aiter.ops.mha_v4_quant import (
@@ -904,9 +872,7 @@ def sol_prepare(
             k_routing_var = _e8m0_dequantize(stored_var, stored_var_scale)
     else:
         mean_k, mean_k_scale, k_routing = _sol_attn_pool_mx(k_quant, k_scale, BLOCK_N)
-    if v_packed_format == "mxfp4":
-        mean_v, mean_v_scale, mean_v_pooled = _sol_attn_pool_mxfp4_v(v_source, BLOCK_N)
-    elif v_packed_format is not None:
+    if v_packed_format is not None:
         mean_v, mean_v_scale, mean_v_pooled = _sol_attn_pool_fp6_p_v(
             v_source, v_packed_format, BLOCK_N
         )

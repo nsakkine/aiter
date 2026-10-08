@@ -42,6 +42,7 @@ from aiter.ops.mha_v4 import (
     mha_v4_kv_tile_for_q_tile,
     mha_v4_operands,
     mha_v4_packed,
+    mha_v4_ragged_kv,
     mha_v4_sol,
     mha_v4_sparse_work_table,
     native_fp8_format,
@@ -62,7 +63,6 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
-    quantize_v_mxfp4,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -374,6 +374,54 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format, kwargs):
     sparse = mha_v4(q, k, v, *formats, block_mask=mask, **kwargs)
     torch.cuda.synchronize()
     _assert_sparse_matches_dense(sparse, dense)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows are ragged")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@pytest.mark.parametrize("tail", [44, 5])
+@pytest.mark.parametrize(("q_format", "v_format", "kwargs"), _sparse_recipe_params())
+def test_mha_v4_sparse_masks_a_ragged_last_block(q_format, v_format, kwargs, tail):
+    """A selected short last block attends to the keys it has and to none past seqlen_k.
+
+    The dense row masks its own tail, so it is the reference over exactly the selected keys. The
+    last block is selected alongside others, alone (the single-block schedule), and with every
+    other block, so both loop exits and the lone-block seed are covered.
+    """
+    torch.manual_seed(tail)
+    formats = (q_format, q_format, v_format)
+    recipe = _resolve_raw_recipe(
+        *formats,
+        kwargs.get("q_scale_mode"),
+        kwargs.get("k_scale_mode"),
+        kwargs.get("v_scale_mode"),
+        sparse=True,
+    )
+    operands = mha_v4_operands(*formats, *recipe.scale_modes, recipe.v_pack)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
+    kv_tile = _default_kv_tile(q_format, v_format)
+    blocks = 4
+    sequence_k = (blocks - 1) * kv_tile + tail
+    q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, sequence_k, 5, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    tail_keys = torch.arange((blocks - 1) * kv_tile, sequence_k, device="cuda")
+    for selected in ([0, 2, 3], [3], [0, 1, 2, 3]):
+        mask = torch.zeros((1, 5, 2, blocks), device="cuda", dtype=torch.bool)
+        mask[..., selected] = True
+        keys = torch.cat(
+            [
+                torch.arange(b * kv_tile, (b + 1) * kv_tile, device="cuda")
+                for b in selected[:-1]
+            ]
+            + [tail_keys]
+        )
+        dense = mha_v4(q, k[:, keys], v[:, keys], *formats, **kwargs)
+        sparse = mha_v4(q, k, v, *formats, block_mask=mask, **kwargs)
+        torch.cuda.synchronize()
+        _assert_sparse_matches_dense(sparse, dense, f"blocks {selected}")
 
 
 def _assert_sparse_matches_dense(sparse, dense, message=None):
@@ -1350,11 +1398,6 @@ def _mxfp4_quantize_k(k):
     return mxfp4_k_view(raw, scale), scale
 
 
-def _mxfp4_quantize_v(v):
-    raw, scale = quantize_v_mxfp4(v)
-    return mxfp4_v_view(raw, scale, v.shape[1]), scale
-
-
 def _mxfp4_quantize_v_fp6_p(v):
     raw, scale = quantize_v_mxfp4_fp6_p(v)
     return mxfp4_v_view(raw, scale, v.shape[1]), scale
@@ -1410,28 +1453,11 @@ _SOL_ATTN_RECIPES = [
         quantize_q=_mxfp8_quantize_q,
         quantize_k=quantize_mxfp8_k,
     ),
-    _SolAttnRecipe(
-        id="mxfp4",
-        co_stem="mxfp4_sol",
-        qk_format=AttentionFormat.MXFP4,
-        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
-        quantize_q=_mxfp4_quantize_q,
-        quantize_k=_mxfp4_quantize_k,
-        quantize_v=_mxfp4_quantize_v,
-        v_format=AttentionFormat.MXFP4,
-        v_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
-        packed_format="mxfp4",
-        # The only row where Q, K and V are all E8M0, so neither pooled operand can inherit a
-        # source descale and both kernarg scale slots are exercised at once. FP4 carries eight
-        # magnitude levels, so the exact pass alone only reaches ~0.98 of the oracle before
-        # Sol-Attn contributes anything; what separates working from broken on this row is the
-        # correction's distance to keep-or-drop, not the absolute cosine.
-        oracle_floor=0.97,
-        keep_or_drop_margin=0.05,
-    ),
     # The FP6-P rows: all three operands E8M0, P quantized to FP6 and V packed in the token order
     # that P contracts over, so V names its layout as well as its format. Every one of them
-    # declares LSE, ragged KV, KV ranges, the Jensen term and sorted dispatch.
+    # declares LSE, ragged KV, KV ranges, the Jensen term and sorted dispatch. With all three
+    # E8M0, neither pooled operand can inherit a source descale, so both kernarg scale slots are
+    # exercised at once.
     _SolAttnRecipe(
         id="mxfp4_fp6p",
         co_stem="mxfp4_fp6p_sol",
@@ -1445,7 +1471,9 @@ _SOL_ATTN_RECIPES = [
         packed_format="mxfp4",
         v_packed_format="mxfp4_fp6_p",
         v_pack=AttentionPack.V_FOR_FP6_P,
-        # The same FP4 operands as the mxfp4 row above, so the same floor and margin.
+        # FP4 carries eight magnitude levels, so the exact pass alone only reaches ~0.98 of the
+        # oracle before Sol-Attn contributes anything; what separates working from broken on this
+        # row is the correction's distance to keep-or-drop, not the absolute cosine.
         oracle_floor=0.97,
         keep_or_drop_margin=0.05,
     ),
@@ -1989,15 +2017,15 @@ def test_mha_v4_sol_raw_compile_parity(recipe):
 @pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.parametrize("beta", [0.4, 1.0])
 def test_mha_v4_sol_mxfp4_fills_both_pooled_scale_slots(beta):
-    """mxfp4 is the only row where Q, K and V are all E8M0, so neither pooled operand can inherit
-    a source descale and both kernarg scale slots are live at once.
+    """mxfp4_fp6p has Q, K and V all E8M0, so neither pooled operand can inherit a source descale
+    and both kernarg scale slots are live at once.
 
     Accuracy is covered by the recipe-parametrized oracle test. What is only checkable here is that
     BOTH slots are read: a NULL one is not an error state, it just means "keep reading the source
     image", so a fill that dropped either would still run and still look about as accurate. Only
     perturbing one at a time separates them.
     """
-    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == "mxfp4")
+    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == "mxfp4_fp6p")
     if not _sol_attn_co_available(recipe.co_stem):
         pytest.skip(f"{recipe.co_stem} is not deployed")
 
@@ -2481,28 +2509,6 @@ def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
     assert (lse - reference.float()).abs().max() < tolerance
 
 
-def _sol_attn_mxfp4_launch(**kwargs):
-    """Launch gfx950's MXFP4 Sol row, which declares none of lse, kv_range, jensen or sorted."""
-    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == "mxfp4")
-    if not _sol_attn_co_available(recipe.co_stem):
-        pytest.skip(f"{recipe.co_stem} is not deployed")
-    operands = recipe.operands(sequence_k=512, heads=2, sequence_q=512)
-    plan = recipe.prepare(*operands, beta=1.0, heads=2)
-    return _sol_attn_launch(*operands, plan, recipe=recipe, **kwargs)
-
-
-# Every gfx942 row declares an LSE, so only gfx950 has a row to refuse one.
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 has a Sol row without the store")
-def test_mha_v4_sol_refuses_an_lse_on_a_row_without_the_store():
-    """A Sol-Attn row without an LSE store is rejected instead of returning uninitialized data.
-
-    Same manifest guard the dense rows take, reached through a different launch, which is the
-    point: the capability is a property of the code object, not of the mode.
-    """
-    with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
-        _sol_attn_mxfp4_launch(return_lse=True)
-
-
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
 @pytest.mark.parametrize(
     "recipe_id", ["bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", *_LSE_FP6_P_IDS]
@@ -2698,12 +2704,13 @@ def test_mha_v4_sol_fp6p_jensen_term_is_the_rotated_k_variance(recipe):
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 def test_mha_v4_sol_sorted_dispatch_needs_a_row_that_declares_it():
-    """Insisting on sorted dispatch fails loudly where it cannot be honoured."""
+    """Insisting on sorted dispatch fails loudly where it cannot be honoured.
+
+    Every gfx950 Sol row declares it, so only gfx942 has a row to refuse it on.
+    """
     q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="has no sorted dispatch"):
-        if get_gfx() == "gfx950":
-            _sol_attn_mxfp4_launch(sorted_dispatch=True)
-        else:
+    if get_gfx() == "gfx942":
+        with pytest.raises(RuntimeError, match="has no sorted dispatch"):
             mha_v4_sol(
                 q, q, q, AttentionFormat.INT8, AttentionFormat.INT8,
                 native_fp8_format(), beta=1.0, sorted_dispatch=True,
@@ -2760,6 +2767,40 @@ def test_mha_v4_block_tile_refuses_to_guess_when_the_rows_disagree():
     """
     with pytest.raises(ValueError, match="disagree on ts_kv"):
         mha_v4_block_tile()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 manifest")
+@pytest.mark.parametrize(
+    "q_format, k_format, v_format, mode, expected",
+    [
+        ("fp8", "fp8", "fp8", MHA_V4_SPARSE_MODE, True),
+        ("fp8", "fp8", "fp8", MHA_V4_SOL_MODE, True),
+        ("BF16", "BF16", "BF16", MHA_V4_SOL_MODE, True),
+        ("MXFP4", "MXFP4", "MXFP4", MHA_V4_SOL_MODE, True),
+        ("FP8", "FP8", "MXFP6", MHA_V4_SOL_MODE, True),
+        ("MXFP6", "MXFP6", "fp8", MHA_V4_SPARSE_MODE, True),
+    ],
+)
+def test_mha_v4_ragged_kv_answers_per_row(q_format, k_format, v_format, mode, expected):
+    """The capability belongs to a row, so a caller deciding whether to pad must name one."""
+
+    def fmt(name):
+        return native_fp8_format() if name == "fp8" else getattr(AttentionFormat, name)
+
+    q_format, k_format, v_format = fmt(q_format), fmt(k_format), fmt(v_format)
+    recipe = _resolve_raw_recipe(q_format, k_format, v_format, None, None, None, sparse=True)
+    operands = mha_v4_operands(
+        q_format, k_format, v_format, *recipe.scale_modes, recipe.v_pack
+    )
+    assert mha_v4_ragged_kv(operands, mode) is expected
+
+
+@pytest.mark.skipif(get_gfx() != "gfx942", reason="gfx942 manifest")
+def test_mha_v4_ragged_kv_is_false_on_gfx942():
+    fp8 = native_fp8_format()
+    per_tensor = AttentionScaleMode.F32_PER_TENSOR
+    operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
+    assert not mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
