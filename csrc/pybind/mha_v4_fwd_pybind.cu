@@ -24,12 +24,13 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("q_format"),
           py::arg("k_format"),
           py::arg("v_format"),
+          py::arg("v_pack"),
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
           py::arg("softmax_scale"),
-          py::arg("lse")    = std::nullopt,
-          py::arg("v_pack") = 0);
+          py::arg("seqlens_k") = std::nullopt,
+          py::arg("lse")       = std::nullopt);
     m.def("fmha_v4_fwd_sparse",
           &aiter::torch_itfs::fmha_v4_fwd_sparse,
           py::arg("q"),
@@ -42,6 +43,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("q_format"),
           py::arg("k_format"),
           py::arg("v_format"),
+          py::arg("v_pack"),
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
@@ -51,8 +53,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("lut_count"),
           py::arg("q_tile")  = 0,
           py::arg("kv_tile") = 0,
-          py::arg("lse")     = std::nullopt,
-          py::arg("v_pack")  = 0);
+          py::arg("lse")     = std::nullopt);
     m.def("fmha_v4_fwd_sol_attn",
           &aiter::torch_itfs::fmha_v4_fwd_sol_attn,
           py::arg("q"),
@@ -65,6 +66,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("q_format"),
           py::arg("k_format"),
           py::arg("v_format"),
+          py::arg("v_pack"),
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
@@ -83,8 +85,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("kv_range_tokens")  = 0,
           py::arg("mean_k_var")       = std::nullopt,
           py::arg("sorted_dispatch")  = -1,
-          py::arg("mean_k_var_scale") = std::nullopt,
-          py::arg("v_pack")           = 0);
+          py::arg("mean_k_var_scale") = std::nullopt);
     m.def("mha_v4_sparse_work_table",
           &aiter::torch_itfs::mha_v4_sparse_work_table,
           py::arg("lut_count"),

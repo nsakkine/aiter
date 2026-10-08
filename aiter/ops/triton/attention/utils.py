@@ -153,6 +153,9 @@ def block_attn_mask_to_ragged_lut(
 
     # NOTE: Overallocating the LUT is a waste of memory, but the
     # alternative lut_count.sum(), will cause graph break with torch compile.
+    # TODO(sparse refresh): entries past the used range stay uninitialized, and an empty row's
+    # lut_start points at them. Kernels that speculatively read LUT[lut_start] before testing
+    # lut_count must clamp the derived offsets, as the FP8 prologue does, or this must be zeroed.
     max_count = batch * num_heads * num_q_blocks * num_kv_blocks
     kv_block_indices = torch.empty(max_count, dtype=torch.int32, device=device)
     block_attn_mask_to_lut_kernel(
@@ -420,7 +423,7 @@ def _sol_attn_pool_mxfp4_k(
     applies an orthogonal Hadamard rotation to both Q and K, so (QR)(KR)^T == QK^T leaves the proxy
     unchanged, and the requantized values cannot be read back to score anyway.
     """
-    from aiter.ops.mha_v4 import mxfp4_k_view, quantize_mxfp4_k
+    from aiter.ops.mha_v4_quant import mxfp4_k_view, quantize_mxfp4_k
 
     pooled = _sol_attn_block_mean(k_source.float(), BLOCK_N).to(torch.bfloat16)
     blocks = pooled.shape[1]
@@ -444,7 +447,7 @@ def _sol_attn_pool_mxfp4_v(
     a pooled image, where the over-read can leave the allocation entirely. Only the storage grows;
     shape and strides are the packer's own.
     """
-    from aiter.ops.mha_v4 import mxfp4_v_view, quantize_v_mxfp4
+    from aiter.ops.mha_v4_quant import mxfp4_v_view, quantize_v_mxfp4
 
     pooled = _sol_attn_block_mean(v_source.float(), BLOCK_N).to(torch.bfloat16)
     blocks = pooled.shape[1]
@@ -467,7 +470,7 @@ def _sol_attn_pack_k(
     Returns (view, scale): the view presents the real pooled height, the scale keeps the padded
     one, for the reason :func:`_sol_attn_pool_mxfp4_k` gives.
     """
-    from aiter.ops.mha_v4 import (
+    from aiter.ops.mha_v4_quant import (
         mxfp4_k_view,
         mxfp6_k_view,
         quantize_mxfp4_k,
@@ -504,7 +507,7 @@ def _sol_attn_pool_packed_k(
     result = (*_sol_attn_pack_k(pooled, fmt, BLOCK_N), pooled)
     if not variance:
         return result
-    from aiter.ops.mha_v4 import rotate_activation_hd128
+    from aiter.ops.mha_v4_quant import rotate_activation_hd128
 
     def rotate(x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
@@ -525,7 +528,7 @@ def _sol_attn_pool_fp6_p_v(
     Source-side pooling as in :func:`_sol_attn_pool_mxfp4_v`, through the FP6-P V packers, whose
     scale already carries the slack the one-tile-ahead scale gather needs.
     """
-    from aiter.ops.mha_v4 import (
+    from aiter.ops.mha_v4_quant import (
         mxfp4_v_view,
         quantize_v_mxfp4_fp6_p,
         quantize_v_mxfp6_fp6_p,
