@@ -145,7 +145,7 @@ _GFX942_SPARSE_RECIPES = ("fp8", "i8fp8")
 
 # The finer geometry, which gfx950 serves for these recipes in both the sparse and Sol-Attn modes.
 _MHA_V4_FINE_TILE = (64, 64)
-_FINE_TILE_RECIPES = ("fp8", "bf16", "bf16fp8", "f8f6", "mxfp6")
+_FINE_TILE_RECIPES = ("fp8", "bf16", "bf16fp8", "f8f6", "mxfp6", "f6f4", "mxfp4", "mxfp8", "f6f8")
 _FINE_TILE_MARK = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 64x64 rows")
 
 
