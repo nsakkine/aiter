@@ -81,6 +81,7 @@ def sage_quant_mxfp4(
         smooth_k=smooth_k,
     )
 
+    stride_bz_o, stride_seq_o, stride_h_o, stride_d_o = map_dims(v_fp8.stride(), order)
     sage_quant_v_kernel[grid](
         v,
         v_fp8,
@@ -89,6 +90,10 @@ def sage_quant_mxfp4(
         stride_h_v,
         stride_seq_v,
         stride_d_v,
+        stride_bz_o,
+        stride_h_o,
+        stride_seq_o,
+        stride_d_o,
         v_scale.stride(0),
         v_scale.stride(1),
         b,
@@ -457,6 +462,10 @@ def sage_quant_mxfp6(
             v.stride(2),
             v.stride(1),
             v.stride(3),
+            v_quantized.stride(0),
+            v_quantized.stride(2),
+            v_quantized.stride(1),
+            v_quantized.stride(3),
             v_scale.stride(0),
             v_scale.stride(1),
             b,

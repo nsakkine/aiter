@@ -478,11 +478,11 @@ def _sol_attn_pool_packed_k(
     from aiter.ops.mha_v4_quant import rotate_activation_hd128
 
     def rotate(x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
+        out = x.new_empty(x.shape)
         rotate_activation_hd128(out, x)
         return out
 
-    rotated_var = _sol_attn_block_variance(rotate(k_source.contiguous()).float(), BLOCK_N)
+    rotated_var = _sol_attn_block_variance(rotate(k_source).float(), BLOCK_N)
     return result + _sol_attn_pack_k(
         rotate(rotated_var.to(torch.bfloat16).contiguous()), fmt, BLOCK_N
     )
