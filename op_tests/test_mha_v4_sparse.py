@@ -145,7 +145,7 @@ _GFX942_SPARSE_RECIPES = ("fp8", "i8fp8")
 
 # The finer geometry, which gfx950 serves for these recipes in both the sparse and Sol-Attn modes.
 _MHA_V4_FINE_TILE = (64, 64)
-_FINE_TILE_RECIPES = ("fp8", "bf16", "bf16fp8")
+_FINE_TILE_RECIPES = ("fp8", "bf16", "bf16fp8", "f8f6")
 _FINE_TILE_MARK = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 64x64 rows")
 
 
@@ -1555,10 +1555,11 @@ def _sol_attn_geometry_params(ids=None):
     """(recipe, block_tile) params: each recipe at its default geometry (None), then at 64x64
     where it has a row there."""
     recipes = [r for r in _SOL_ATTN_RECIPES if ids is None or r.id in ids]
+    # A Sol recipe id names its V packing too (f8f6_fp6p); the 64x64 rows key on the formats.
     return [pytest.param(r, None, id=r.id) for r in recipes] + [
         pytest.param(r, _MHA_V4_FINE_TILE, marks=_FINE_TILE_MARK, id=f"{r.id}-64x64")
         for r in recipes
-        if r.id in _FINE_TILE_RECIPES
+        if r.id.removesuffix("_fp6p") in _FINE_TILE_RECIPES
     ]
 
 

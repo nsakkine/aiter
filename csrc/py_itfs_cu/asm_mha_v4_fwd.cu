@@ -1493,9 +1493,11 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     if(v_needs_pooled_scale)
     {
         // The V-scale image is packed, not strided, and carries no stride slots of its own, so all
-        // it needs is a base with whole tiles behind it. Hence a size check only.
+        // it needs is a base with whole tiles behind it. Hence a size check only. It is packed in
+        // V's own 128-token records whatever ts_kv is, over the pooled rows padded to a whole tile.
         const auto& vs             = mean_v_scale.value();
-        const int64_t pooled_bytes = bitmap_groups * blocks_per_tile * (kHeadDim / 32);
+        const int64_t pooled_rows  = bitmap_groups * blocks_per_tile;
+        const int64_t pooled_bytes = (pooled_rows + 127) / 128 * 512;
         TORCH_CHECK(vs.is_cuda() && vs.device() == q.device(),
                     "mean_v_scale must be on the same GPU as Q");
         TORCH_CHECK(vs.scalar_type() == at::ScalarType::Byte,
@@ -1503,8 +1505,11 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
         TORCH_CHECK(vs.sizes() ==
                         torch::IntArrayRef({shapes.batch, shapes.nhead_k, pooled_bytes}),
                     "mean_v_scale must have shape [batch, key_heads, "
-                    "ceil(num_kv_blocks / ts_kv) * ts_kv * 4], matching V's own packed scale image "
-                    "with key_length replaced by num_kv_blocks");
+                    "ceil(ceil(num_kv_blocks / ts_kv) * ts_kv / 128) * 512], matching V's own "
+                    "packed scale image with key_length replaced by num_kv_blocks padded to a "
+                    "whole tile; expected ",
+                    pooled_bytes,
+                    " bytes per head");
         TORCH_CHECK(vs.is_contiguous(), "mean_v_scale must be contiguous");
     }
     TORCH_CHECK(!mean_k_var_scale.has_value() || mean_k_var.has_value(),
