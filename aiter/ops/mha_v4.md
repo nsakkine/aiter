@@ -144,8 +144,8 @@ Raw callers pass an optional boolean `block_mask`:
 - shape `[B, H, Qtiles, KVtiles]` or `[B, Qtiles, KVtiles]` with head broadcast;
 - geometry `block_tile`, defaulting to the recipe's own: on gfx950 256x64 for BF16 and BF16/FP8
   Q/K and 256x128 for the rest, on gfx942 256x64 throughout;
-- gfx950 also ships 64x64 sparse and Sol-Attn rows for FP8, BF16, BF16/FP8, and FP8/MXFP6
-  (FP6-P V).
+- gfx950 also ships 64x64 sparse and Sol-Attn rows for FP8, BF16, BF16/FP8, FP8/MXFP6 and MXFP6
+  (both FP6-P V).
 
 The geometry is a property of the manifest row, so the rows no longer agree on one KV tile per
 arch. Ask `mha_v4_block_tile(mha_v4_operands(...), mode)` or `mha_v4_block_tiles(...)` with the
