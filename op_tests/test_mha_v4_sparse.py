@@ -64,6 +64,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
+    quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -1229,6 +1230,7 @@ class _SolAttnRecipe(NamedTuple):
     packed_format: str | None = None
     # V's packed format when it differs from K's, which it does wherever V's name also carries its
     # layout (the *_fp6_p ones), and the only packed operand of f8f6, whose FP8 Q/K are addressable.
+    # Left None, V inherits K's packing only if it has K's format.
     v_packed_format: str | None = None
     v_pack: AttentionPack = AttentionPack.DEFAULT
     oracle_floor: float = 0.999
@@ -1247,7 +1249,9 @@ class _SolAttnRecipe(NamedTuple):
 
     @property
     def v_packed(self) -> str | None:
-        return self.packed_format if self.v_packed_format is None else self.v_packed_format
+        if self.v_packed_format is not None:
+            return self.v_packed_format
+        return self.packed_format if self.v_format == self.qk_format else None
 
     @property
     def ref_softmax_scale(self):
@@ -1337,6 +1341,9 @@ class _SolAttnRecipe(NamedTuple):
         """A per-tensor descale multiplies; an E8M0 image expands over channel groups first."""
         if descale.dtype == torch.uint8:
             return _e8m0_dequantize(quantized, descale)
+        if descale.dim() == 3:
+            # A per-channel descale is [batch, heads, d], shared by every token.
+            descale = descale.unsqueeze(1)
         return quantized.float() * descale.float()
 
     def reference_operands(self, q, k, v):
@@ -1550,15 +1557,34 @@ _SOL_ATTN_RECIPES = [
     ),
 ]
 
+# Recipes whose only Sol-Attn row is the 64x64 one, so they have no default geometry to test at.
+# f6f8's MXFP6 Q/K pool like the mxfp6 row's; its V's per-channel FP8 descale does not vary along
+# the sequence, so pooled V reuses it the way a per-tensor one is reused.
+_SOL_ATTN_FINE_ONLY_RECIPES = [
+    _SolAttnRecipe(
+        id="f6f8",
+        co_stem="f6f8_sol",
+        qk_format=AttentionFormat.MXFP6,
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp6_quantize_q,
+        quantize_k=_mxfp6_quantize_k,
+        quantize_v=quantize_v_fp8,
+        v_scale_mode=AttentionScaleMode.F32_PER_CHANNEL,
+        packed_format="mxfp6",
+        oracle_floor=0.995,
+    ),
+]
+
 
 def _sol_attn_geometry_params(ids=None):
     """(recipe, block_tile) params: each recipe at its default geometry (None), then at 64x64
     where it has a row there."""
     recipes = [r for r in _SOL_ATTN_RECIPES if ids is None or r.id in ids]
+    fine_only = [r for r in _SOL_ATTN_FINE_ONLY_RECIPES if ids is None or r.id in ids]
     # A Sol recipe id names its V packing too (f8f6_fp6p); the 64x64 rows key on the formats.
     return [pytest.param(r, None, id=r.id) for r in recipes] + [
         pytest.param(r, _MHA_V4_FINE_TILE, marks=_FINE_TILE_MARK, id=f"{r.id}-64x64")
-        for r in recipes
+        for r in recipes + fine_only
         if r.id.removesuffix("_fp6p") in _FINE_TILE_RECIPES
     ]
 
@@ -2507,6 +2533,12 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id):
                 ("f6f4_fp6p", 0.09),
             )
         ),
+        # Its only Sol-Attn row is 64x64.
+        pytest.param(
+            "f6f8",
+            0.09,
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 64x64 rows"),
+        ),
     ],
 )
 def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
@@ -2521,15 +2553,19 @@ def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
     from aiter.test_mha_common import sol_attn_ref
 
     torch.manual_seed(37)
-    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == recipe_id)
+    fine_only = {r.id for r in _SOL_ATTN_FINE_ONLY_RECIPES}
+    recipe = next(r for r in _SOL_ATTN_RECIPES + _SOL_ATTN_FINE_ONLY_RECIPES if r.id == recipe_id)
+    block_tile = _MHA_V4_FINE_TILE if recipe_id in fine_only else None
     heads, sequence = 2, 1024
-    q_tile, kv_tile = recipe.block_tile()
+    q_tile, kv_tile = block_tile or recipe.block_tile()
     operands = recipe.operands(sequence_k=sequence, heads=heads, sequence_q=sequence)
-    plan = recipe.prepare(*operands, beta=1.0, heads=heads)
+    plan = recipe.prepare(*operands, beta=1.0, heads=heads, block_tile=block_tile)
     fraction = plan["block_attn_mask"].float().mean().item()
     assert 0.02 < fraction < 0.9, f"degenerate routing: {fraction}"
 
-    _, lse = _sol_attn_launch(*operands, plan, recipe=recipe, return_lse=True)
+    _, lse = _sol_attn_launch(
+        *operands, plan, recipe=recipe, block_tile=block_tile, return_lse=True
+    )
     torch.cuda.synchronize()
 
     q_op, k_op, v_op = operands

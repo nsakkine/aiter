@@ -312,8 +312,8 @@ def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
     the modes are intersected rather than unioned, since a caller shaping a mask has not yet chosen
     how to route it and a geometry is only safe when either mode can serve it. That intersection is
     only meaningful across whole modes, though: the modes need not agree on operands at a given
-    geometry (MXFP6 Q/K with an FP8 V has a sorted-sparse row and no Sol-Attn one), so a caller
-    narrowing by operands has committed to one mode and should name it.
+    geometry (MXFP6 Q/K with an FP8 V has a 256x128 sorted-sparse row and no Sol-Attn one), so a
+    caller narrowing by operands has committed to one mode and should name it.
     """
     return _mha_v4_kv_tile_for_q_tile_from_manifest(
         q_tile,
