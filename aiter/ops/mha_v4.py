@@ -442,9 +442,9 @@ def mha_v4_ragged_kv(operands, mode, block_tile=None) -> bool:
     than none -- and the ragged rows make it unnecessary.
 
     operands is what mha_v4_operands() builds and mode one of MHA_V4_BLOCK_SPARSE_MODES. Neither
-    is optional, because the capability belongs to one row: every gfx950 block-sparse and Sol-Attn
-    row is ragged, and gfx942 has no ragged row at all. block_tile defaults to the
-    geometry these operands dispatch at, as mha_v4_block_tile() answers it.
+    is optional, because the capability belongs to one row: every gfx942 and gfx950 block-sparse
+    and Sol-Attn row is ragged today, but a row may not be. block_tile defaults to the geometry these
+    operands dispatch at, as mha_v4_block_tile() answers it.
     """
     q_tile, kv_tile = (
         mha_v4_block_tile(operands, mode) if block_tile is None else tuple(block_tile)
@@ -1304,18 +1304,14 @@ def _sol_attn_triple(
 
 
 def _check_lse_capable() -> None:
-    """Reject LSE on an arch where the exported value has not been measured.
+    """Reject LSE where MHA v4 has no manifest-backed implementation.
 
-    Which rows can write it is the manifest's lse column, which the launcher checks against the
-    row it dispatches: a row without the store would leave the buffer as allocated, so asking for
-    LSE there fails at launch naming the row rather than returning garbage.
+    Individual rows still declare the store in the manifest, which the launcher checks against the
+    row it dispatches: a row without it would leave the allocated buffer looking like valid data.
     """
     arch = get_gfx()
-    if arch != "gfx950":
-        # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
-        # and their LSE has never been compared against torch.logsumexp. O never reads LSE, so
-        # passing every output test says nothing about it. Lift this once MI300 is measured.
-        raise NotImplementedError(f"MHA v4 LSE is not validated on {arch} yet")
+    if arch not in ("gfx942", "gfx950"):
+        raise NotImplementedError(f"MHA v4 LSE is not implemented on {arch}")
 
 
 # (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source

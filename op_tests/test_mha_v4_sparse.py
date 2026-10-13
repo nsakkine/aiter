@@ -385,7 +385,7 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format, kwargs):
     _assert_sparse_matches_dense(sparse, dense)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows are ragged")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 rows are ragged")
 @pytest.mark.skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
@@ -2383,13 +2383,10 @@ _LSE_FP6_P_IDS = ("mxfp4_fp6p", "mxfp6_fp6p", "f8f6_fp6p", "f6f4_fp6p")
 _LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", *_LSE_FP6_P_IDS)
 
 
-_LSE_GFX950_IDS = ("mxfp8", *_LSE_FP6_P_IDS)
-
-
 def _lse_ids(ids):
-    """MXFP8 and the FP6-P rows are gfx950's; every other LSE row exists on both architectures."""
+    """Dense and sorted-sparse gfx942 objects do not export a validated LSE."""
     gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 row")
-    return [pytest.param(i, marks=gfx950) if i in _LSE_GFX950_IDS else i for i in ids]
+    return [pytest.param(i, marks=gfx950) for i in ids]
 
 
 def _lse_row(row_id):
@@ -2557,7 +2554,11 @@ def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
     torch.manual_seed(37)
     fine_only = {r.id for r in _SOL_ATTN_FINE_ONLY_RECIPES}
     recipe = next(r for r in _SOL_ATTN_RECIPES + _SOL_ATTN_FINE_ONLY_RECIPES if r.id == recipe_id)
+    if not _sol_attn_co_available(recipe.co_stem):
+        pytest.skip(f"{recipe.co_stem} is not deployed")
     block_tile = _MHA_V4_FINE_TILE if recipe_id in fine_only else None
+    if not _sol_attn_row_declares(recipe, block_tile, "lse"):
+        pytest.skip(f"{recipe.id}'s Sol-Attn row does not declare lse")
     heads, sequence = 2, 1024
     q_tile, kv_tile = block_tile or recipe.block_tile()
     operands = recipe.operands(sequence_k=sequence, heads=heads, sequence_q=sequence)
@@ -2584,7 +2585,7 @@ def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
     assert (lse - reference.float()).abs().max() < tolerance
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 rows declare sorted")
 @pytest.mark.parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
 def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe, block_tile):
     """Heavy-first dispatch reorders the workgroups, never their work.
@@ -2629,15 +2630,9 @@ def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe, block_tile):
         assert torch.equal(launched[1], raster[1])
 
 
-# Every gfx950 Sol row declares the Jensen term, and all but the BF16 ones take KV ranges.
-_SOL_ATTN_GFX950_PARAMS = [
-    pytest.param(
-        *p.values,
-        marks=[*p.marks, pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 Sol rows")],
-        id=p.id,
-    )
-    for p in _sol_attn_geometry_params()
-]
+# Capability tests select deployed rows below, so they cover gfx942's two Sol-Attn rows as well as
+# gfx950's larger set without teaching the tests an architecture-specific recipe list.
+_SOL_ATTN_CAPABILITY_PARAMS = _sol_attn_geometry_params()
 
 
 def _sol_attn_row_declares(recipe, block_tile, capability: str) -> bool:
@@ -2709,7 +2704,7 @@ def _sol_attn_jensen_ref(q, k, v, mask, mean_k, mean_v, block_tile, softmax_scal
     return out, torch.logsumexp(joint, dim=-1)
 
 
-@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_CAPABILITY_PARAMS)
 def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
     """KV ranges split the softmax, not the result: each range's exact and pooled columns are
     normalized on their own and merged by LSE, which is the joint softmax again. So the ranged
@@ -2721,8 +2716,9 @@ def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
         pytest.skip(f"{recipe.co_stem} is not deployed")
     heads = 2
     q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    tail = 37 if _sol_attn_row_declares(recipe, block_tile, "ragged_kv") else 0
     operands = recipe.operands(
-        sequence_k=80 * kv_tile + 37, heads=heads, sequence_q=512, seed=3
+        sequence_k=80 * kv_tile + tail, heads=heads, sequence_q=512, seed=3
     )
     plan = recipe.prepare(*operands, beta=1.0, heads=heads, block_tile=block_tile)
     launch = functools.partial(
@@ -2753,7 +2749,7 @@ def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
     assert (ranged_lse - reference_lse.float()).abs().max() < 0.2
 
 
-@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_CAPABILITY_PARAMS)
 def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
     """sol_prepare(k_variance=True) hands the kernel the block variance of K in the basis the
     kernel holds K in: rotated for the FP8 and MX recipes, as stored for BF16 and INT8. The kernel
@@ -2779,6 +2775,10 @@ def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
     launch = functools.partial(
         _sol_attn_launch, *operands, plan, recipe=recipe, block_tile=block_tile
     )
+    if not _sol_attn_row_declares(recipe, block_tile, "jensen"):
+        with pytest.raises(RuntimeError, match="has no second-order pooled correction"):
+            launch(jensen=True)
+        return
 
     plain = launch()
     corrected, corrected_lse = launch(jensen=True, return_lse=True)
@@ -2822,26 +2822,21 @@ def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
     everything = dict(jensen=True, return_lse=True)
     if _sol_attn_row_declares(recipe, block_tile, "kv_range"):
         everything["kv_range_tokens"] = 32 * kv_tile
-    raster = launch(sorted_dispatch=False, **everything)
-    ordered = launch(sorted_dispatch=True, **everything)
-    torch.cuda.synchronize()
-    assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
-    assert _cosine(ordered[0], corrected) > 0.999
+    if _sol_attn_row_declares(recipe, block_tile, "sorted"):
+        raster = launch(sorted_dispatch=False, **everything)
+        ordered = launch(sorted_dispatch=True, **everything)
+        torch.cuda.synchronize()
+        assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
+        assert _cosine(ordered[0], corrected) > 0.999
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 def test_mha_v4_sol_sorted_dispatch_needs_a_row_that_declares_it():
     """Insisting on sorted dispatch fails loudly where it cannot be honoured.
 
-    Every gfx950 Sol row declares it, so only gfx942 has a row to refuse it on.
+    Every gfx942 and gfx950 Sol row declares it, so only a non-Sol launch has none to honour.
     """
     q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
-    if get_gfx() == "gfx942":
-        with pytest.raises(RuntimeError, match="has no sorted dispatch"):
-            mha_v4_sol(
-                q, q, q, AttentionFormat.INT8, AttentionFormat.INT8,
-                native_fp8_format(), beta=1.0, sorted_dispatch=True,
-            )
     bf16, none = AttentionFormat.BF16, AttentionScaleMode.NONE
     with pytest.raises(ValueError, match="sorted_dispatch orders the Sol-Attn launch"):
         mha_v4_packed(
@@ -2920,11 +2915,12 @@ def test_mha_v4_ragged_kv_answers_per_row(q_format, k_format, v_format, mode, ex
 
 
 @pytest.mark.skipif(get_gfx() != "gfx942", reason="gfx942 manifest")
-def test_mha_v4_ragged_kv_is_false_on_gfx942():
+def test_mha_v4_ragged_kv_on_gfx942_is_every_block_sparse_row():
     fp8 = native_fp8_format()
     per_tensor = AttentionScaleMode.F32_PER_TENSOR
     operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
-    assert not mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")

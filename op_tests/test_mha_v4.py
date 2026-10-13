@@ -1157,6 +1157,11 @@ def test_mha_v4_rejects_unsupported_contracts():
                 return_lse=True,
                 block_mask=block_mask,
             )
+    elif get_gfx() == "gfx942":
+        # gfx942's rebuilt Sol objects export LSE; its older dense objects do not.
+        fp8 = native_fp8_format()
+        with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
+            mha_v4(q, q, q, fp8, fp8, fp8, return_lse=True)
     with pytest.raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
@@ -1501,20 +1506,14 @@ def test_mha_v4_kv_splits_compile_parity(formats):
     assert torch.equal(eager[1], compiled[1])
 
 
-def test_mha_v4_lse_is_gated_off_gfx950(monkeypatch):
-    """gfx942 carries the epilogue, but its exported value has never been measured.
-
-    A wrong LSE passes every output test, because O never reads it, so presence of the store is
-    not evidence of correctness. Drop the gate once MI300 is compared against torch.logsumexp.
-    """
-    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx942")
+def test_mha_v4_lse_is_gated_off_unsupported_architectures(monkeypatch):
+    """The architecture gate admits both deployed MHA v4 targets and rejects everything else."""
     q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
     formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
-    with pytest.raises(NotImplementedError, match="not validated on gfx942"):
+    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx000")
+    with pytest.raises(NotImplementedError, match="not implemented on gfx000"):
         mha_v4(q, q, q, *formats, return_lse=True)
-
-    assert torch.isfinite(mha_v4(q, q, q, *formats)).all()
 
 
 @pytest.mark.parametrize(
