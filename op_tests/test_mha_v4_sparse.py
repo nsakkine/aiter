@@ -141,8 +141,8 @@ SPARSE_RECIPES = {
     "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4, {}),
 }
 
-# Every sparse row exists on gfx950; gfx942 ships the two per-tensor ones.
-_GFX942_SPARSE_RECIPES = ("fp8", "i8fp8")
+# Every sparse row exists on gfx950; gfx942 ships the two per-tensor ones and BF16.
+_GFX942_SPARSE_RECIPES = ("fp8", "i8fp8", "bf16")
 
 # The finer geometry, which gfx950 serves for these recipes in both the sparse and Sol-Attn modes.
 _MHA_V4_FINE_TILE = (64, 64)
@@ -555,9 +555,6 @@ def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
         pytest.param(
             AttentionFormat.BF16,
             AttentionFormat.BF16,
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
-            ),
             id="bf16",
         ),
         pytest.param(
@@ -985,9 +982,9 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16 sparse")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 BF16 sparse")
 def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
-    max_tiles = 8192
+    max_tiles = 7871 if get_gfx() == "gfx942" else 8192
     bf16 = AttentionFormat.BF16
     kv_tile = _default_kv_tile(bf16, bf16)
     q = torch.zeros((1, 1, 1, 128), device="cuda", dtype=torch.bfloat16)
@@ -996,7 +993,7 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
     indices = torch.zeros(1, device="cuda", dtype=torch.int32)
     row = torch.zeros(1, device="cuda", dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match="holds 8192 LUT entries"):
+    with pytest.raises(RuntimeError, match=f"holds {max_tiles} LUT entries"):
         mha_v4_packed(
             q,
             kv,
@@ -1103,9 +1100,15 @@ MAX_DEGRADATION = 0.01
 ABSOLUTE_FLOOR = 0.95
 
 requires_sparse = pytest.mark.skipif(
-    get_gfx() != "gfx950" or not _mha_v4_sparse_co_available(),
-    reason="gfx950 sorted-sparse MHA v4 code object is not deployed",
+    not _MHA_V4_SPARSE_ARCH or not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
 )
+
+
+def _tile_sweep_params(names):
+    """gfx950 sweeps every recipe; gfx942 its BF16 row, whose 32-token tiles walk each LUT entry twice."""
+    gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 row")
+    return [pytest.param(n, marks=() if n == "bf16" else gfx950, id=n) for n in names]
 
 
 def _reference(q, k, v):
@@ -1139,7 +1142,7 @@ def _run(recipe_name, tiles, heads=5, sequence_q=256, all_true=True):
 
 
 @requires_sparse
-@pytest.mark.parametrize("recipe_name", sorted(SPARSE_RECIPES))
+@pytest.mark.parametrize("recipe_name", _tile_sweep_params(sorted(SPARSE_RECIPES)))
 def test_mha_v4_sparse_accuracy_holds_as_tile_count_grows(recipe_name):
     """A row's own small-tile-count accuracy is its baseline; growing the count must not erode it."""
     baseline_out, baseline_ref, _ = _run(recipe_name, BASELINE_TILES)
@@ -1163,7 +1166,7 @@ def test_mha_v4_sparse_accuracy_holds_as_tile_count_grows(recipe_name):
 
 
 @requires_sparse
-@pytest.mark.parametrize("recipe_name", sorted(SPARSE_RECIPES))
+@pytest.mark.parametrize("recipe_name", _tile_sweep_params(sorted(SPARSE_RECIPES)))
 def test_mha_v4_sparse_skipping_lut_holds_as_tile_count_grows(recipe_name):
     """Same sweep with a LUT that actually skips, so the walk has to jump rather than run affine."""
     for tiles in (4, 8, 16, 32):
@@ -1177,7 +1180,7 @@ def test_mha_v4_sparse_skipping_lut_holds_as_tile_count_grows(recipe_name):
 
 @requires_sparse
 @pytest.mark.parametrize(
-    "recipe_name", ["bf16", "i8fp8", "fp8", "mxfp8", "f6f8"]
+    "recipe_name", _tile_sweep_params(["bf16", "i8fp8", "fp8", "mxfp8", "f6f8"])
 )
 def test_mha_v4_sparse_all_true_lut_matches_dense_bitwise(recipe_name):
     """An all-true LUT selects every tile, so the walk must reduce exactly to the dense one.
@@ -2384,9 +2387,9 @@ _LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", *_LSE_FP6_P_IDS)
 
 
 def _lse_ids(ids):
-    """Dense and sorted-sparse gfx942 objects do not export a validated LSE."""
+    """Of the dense and sorted-sparse gfx942 objects, only BF16's exports a validated LSE."""
     gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 row")
-    return [pytest.param(i, marks=gfx950) for i in ids]
+    return [pytest.param(i, marks=() if i == "bf16" else gfx950) for i in ids]
 
 
 def _lse_row(row_id):
@@ -2919,6 +2922,11 @@ def test_mha_v4_ragged_kv_on_gfx942_is_every_block_sparse_row():
     fp8 = native_fp8_format()
     per_tensor = AttentionScaleMode.F32_PER_TENSOR
     operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
+    none = AttentionScaleMode.NONE
+    bf16 = AttentionFormat.BF16
+    operands = mha_v4_operands(bf16, bf16, bf16, none, none, none)
     assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
     assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
 
