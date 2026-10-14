@@ -11,11 +11,10 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
   the launcher refuses longer sequences instead of overrunning a staged LUT.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- Per-batch key lengths via `seqlens_k`, on the dense GFX950 `BF16 Q/K` rows only. Every other
-  recipe, architecture, and the sorted-sparse path reject it.
-- Log-sum-exp via `return_lse` on GFX950, wherever the selected manifest row declares `lse`, which
-  today is every dense, sparse and Sol-Attn row. GFX942 rejects it until its exported value is
-  measured.
+- Per-batch key lengths via `seqlens_k`, on the dense `BF16 Q/K` rows of GFX942 and GFX950 only.
+  Every other recipe and the sorted-sparse path reject it.
+- Log-sum-exp via `return_lse` wherever the selected manifest row declares `lse`. On GFX950 that is
+  every row; on GFX942 every row except the FP8/FP8 and INT8/FP8 dense and 256x64 sparse ones.
 - No backward, dropout, RNG state, causal, or Q-side varlen support yet.
 
 Supported GFX950 recipes. Every recipe is available in both dense and sorted-sparse mode with the
@@ -34,7 +33,7 @@ same V packing and scale modes, and every Sol-Attn row uses that packing too.
 | MXFP6 | MXFP4 | dense, sparse, Sol-Attn |
 | MXFP4 | MXFP4 | dense, sparse, Sol-Attn |
 
-GFX942 ships per-tensor FP8/FP8 and INT8/FP8 in all three modes.
+GFX942 ships BF16/BF16, BF16/FP8, and per-tensor FP8/FP8 and INT8/FP8, each in all three modes.
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
@@ -146,7 +145,8 @@ Raw callers pass an optional boolean `block_mask`:
   Q/K and 256x128 for the rest, on gfx942 256x64 throughout;
 - gfx950 also ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16, BF16/FP8, MXFP8,
   FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8. MXFP6/FP8's
-  Sol-Attn row is 64x64 only, so a Sol-Attn launch of it must pass `block_tile=(64, 64)`.
+  Sol-Attn row is 64x64 only, so a Sol-Attn launch of it must pass `block_tile=(64, 64)`;
+- gfx942 ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16 and BF16/FP8.
 
 The geometry is a property of the manifest row, so the rows no longer agree on one KV tile per
 arch. Ask `mha_v4_block_tile(mha_v4_operands(...), mode)` or `mha_v4_block_tiles(...)` with the

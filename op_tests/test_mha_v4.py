@@ -653,10 +653,6 @@ def _mha_v4_lse(*args, **kwargs):
     """mha_v4 with return_lse, skipping where this arch's row stores no LSE."""
     try:
         return mha_v4(*args, return_lse=True, **kwargs)
-    except NotImplementedError as error:
-        if "LSE is not validated" not in str(error):
-            raise
-        pytest.skip(str(error))
     except RuntimeError as error:
         if "has no LSE store" not in str(error):
             raise
@@ -1058,6 +1054,12 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
 
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+    if get_gfx() == "gfx942":
+        # Refused by the manifest's lse column: gfx942's FP8 dense object has no LSE store, and a
+        # buffer left as allocated would read as a log-sum-exp rather than as a failure.
+        fp8 = native_fp8_format()
+        with pytest.raises(RuntimeError, match="has no LSE store in its code object"):
+            mha_v4(q, q, q, fp8, fp8, fp8, return_lse=True)
     with pytest.raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
@@ -1190,20 +1192,14 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
     assert spread < max_spread, f"per-chunk bias {biases} spans {spread:.4f} nats"
 
 
-def test_mha_v4_lse_is_gated_off_gfx950(monkeypatch):
-    """gfx942 carries the epilogue, but its exported value has never been measured.
-
-    A wrong LSE passes every output test, because O never reads it, so presence of the store is
-    not evidence of correctness. Drop the gate once MI300 is compared against torch.logsumexp.
-    """
-    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx942")
+def test_mha_v4_lse_is_gated_off_unsupported_architectures(monkeypatch):
+    """The architecture gate admits both deployed MHA v4 targets and rejects everything else."""
     q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
     formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
-    with pytest.raises(NotImplementedError, match="not validated on gfx942"):
+    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx000")
+    with pytest.raises(NotImplementedError, match="not implemented on gfx000"):
         mha_v4(q, q, q, *formats, return_lse=True)
-
-    assert torch.isfinite(mha_v4(q, q, q, *formats)).all()
 
 
 @pytest.mark.parametrize(
@@ -1499,7 +1495,9 @@ def test_mha_v4_empty_heads_are_finite(q_format, v_format, scale_modes):
     assert torch.count_nonzero(out[:, :, :2]) > 0
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 BF16-FP8 validation"
+)
 @pytest.mark.parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
 def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     torch.manual_seed(sequence_q + sequence_k)
@@ -1522,7 +1520,7 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.FP8,
+        native_fp8_format(),
     )
     torch.cuda.synchronize()
 
@@ -1957,8 +1955,9 @@ def _dense_reference(q, k, v, valid):
     ).permute(0, 2, 1, 3)
 
 
+@pytest.mark.parametrize("fp8_v", [False, True], ids=["bf16", "bf16fp8"])
 @pytest.mark.parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
-def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
+def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths, fp8_v):
     torch.manual_seed(41)
     batch, sequence, heads = len(lengths), 512, 4
     q = torch.randn((batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
@@ -1972,7 +1971,7 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.BF16,
+        native_fp8_format() if fp8_v else AttentionFormat.BF16,
         seqlens_k=seqlens_k,
     )
     torch.cuda.synchronize()

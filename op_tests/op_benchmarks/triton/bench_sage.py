@@ -1211,6 +1211,7 @@ def _sol_packed_kwargs(
     quant_q, quant_k, quant_v, _, k_descale, _ = tensors[:6]
     _, k_needs_pooled_scale, packed_format, v_packed_format = SOL_KERNELS[kernel]
     q_source, k_source, v_source = sources
+    block_m, block_n = kernel_block_sizes(kernel)
 
     plan = sol_prepare(
         q_source if packed_format is not None else quant_q,
@@ -1224,6 +1225,8 @@ def _sol_packed_kwargs(
         k_packed_format=packed_format,
         v_packed_format=v_packed_format,
         block_attn_mask=block_mask,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
     )
     return {
         "kv_block_indices": plan["kv_block_indices"],
