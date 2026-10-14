@@ -1329,7 +1329,7 @@ _VARLEN_CAPABLE_QV = frozenset(
 def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
     arch = get_gfx()
-    if arch != "gfx950" or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+    if arch not in ("gfx942", "gfx950") or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented for "
             f"Q={q_format.name} V={v_format.name} on {arch} yet"

@@ -2269,8 +2269,9 @@ def _dense_reference(q, k, v, valid):
     ).permute(0, 2, 1, 3)
 
 
+@pytest.mark.parametrize("fp8_v", [False, True], ids=["bf16", "bf16fp8"])
 @pytest.mark.parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
-def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
+def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths, fp8_v):
     torch.manual_seed(41)
     batch, sequence, heads = len(lengths), 512, 4
     q = torch.randn((batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
@@ -2284,7 +2285,7 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.BF16,
+        native_fp8_format() if fp8_v else AttentionFormat.BF16,
         seqlens_k=seqlens_k,
     )
     torch.cuda.synchronize()
