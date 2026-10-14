@@ -257,11 +257,25 @@ def test_mha_v4_rejects_wrong_block_mask_shape():
             q,
             q,
             q,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
+            FP8,
+            FP8,
+            FP8,
             block_mask=mask,
         )
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse rows")
+def test_mha_v4_block_mask_without_a_sparse_row_names_the_recipe():
+    """The other arch's FP8 has no row here, so there is no KV tile to cut the mask to."""
+    foreign = (
+        AttentionFormat.FP8_E4M3
+        if FP8 == AttentionFormat.FP8_E4M3_FNUZ
+        else AttentionFormat.FP8_E4M3_FNUZ
+    )
+    q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
+    mask = torch.ones((1, 2, 1, 1), dtype=torch.bool)
+    with pytest.raises(NotImplementedError, match="has no .* row for"):
+        mha_v4(q, q, q, foreign, foreign, foreign, block_mask=mask)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse schema")
@@ -928,9 +942,9 @@ def test_mha_v4_rejects_non_bool_block_mask():
             q,
             q,
             q,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
+            FP8,
+            FP8,
+            FP8,
             block_mask=mask,
         )
 

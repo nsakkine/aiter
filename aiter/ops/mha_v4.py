@@ -2074,6 +2074,11 @@ def mha_v4(
                 ),
                 MHA_V4_SPARSE_MODE,
             )
+            if block_tile[1] == 0:
+                raise NotImplementedError(
+                    f"block-sparse MHA v4 has no {get_gfx()} row for "
+                    f"Q={q_format.name} K={k_format.name} V={v_format.name}"
+                )
         lut_indices, lut_start, lut_count = _block_mask_to_lut(
             block_mask, q, k, block_tile
         )
