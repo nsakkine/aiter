@@ -2005,7 +2005,8 @@ def mha_v4(
     or ``[B, Qtiles, KVtiles]`` (broadcast heads). Its geometry is ``block_tile``,
     defaulting to the geometry this call's own operands dispatch at: 256x64 on
     gfx950 for BF16 and BF16/FP8, 256x128 there for everything else, 256x64 on
-    gfx942. gfx950 also accepts 64x64 for finer routing, in FP8, BF16 and BF16/FP8. Ask
+    gfx942. Both also accept 64x64 for finer routing, gfx942 in FP8, I8/FP8, BF16 and
+    BF16/FP8. Ask
     mha_v4_block_tiles() with this call's operands rather than assuming: a
     geometry need not exist in every precision. Sparse LUT rows are one
     per query head; K/V addressing uses the GQA ratio. A row may select nothing:

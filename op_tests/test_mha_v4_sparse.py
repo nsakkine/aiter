@@ -149,7 +149,15 @@ _MHA_V4_FINE_TILE = (64, 64)
 _FINE_TILE_RECIPES = (
     "fp8", "i8fp8", "bf16", "bf16fp8", "f8f6", "mxfp6", "f6f4", "mxfp4", "mxfp8", "f6f8"
 )
-_FINE_TILE_MARK = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 64x64 rows")
+# gfx942 serves the FP8, I8/FP8, BF16 and BF16/FP8 ones.
+_GFX942_FINE_TILE_RECIPES = ("fp8", "i8fp8", "bf16", "bf16fp8")
+
+
+def _fine_tile_mark(recipe):
+    shipped = get_gfx() == "gfx950" or (
+        get_gfx() == "gfx942" and recipe in _GFX942_FINE_TILE_RECIPES
+    )
+    return pytest.mark.skipif(not shipped, reason=f"no {recipe} 64x64 row on {get_gfx()}")
 
 
 def _sparse_recipe_params(names=None):
@@ -395,7 +403,9 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format, kwargs):
     ("q_format", "v_format", "kwargs", "block_tile"),
     [pytest.param(*p.values, None, marks=p.marks, id=p.id) for p in _sparse_recipe_params()]
     + [
-        pytest.param(*p.values, _MHA_V4_FINE_TILE, marks=_FINE_TILE_MARK, id=f"{p.id}-64x64")
+        pytest.param(
+            *p.values, _MHA_V4_FINE_TILE, marks=_fine_tile_mark(p.id), id=f"{p.id}-64x64"
+        )
         for p in _sparse_recipe_params(_FINE_TILE_RECIPES)
     ],
 )
@@ -1589,7 +1599,12 @@ def _sol_attn_geometry_params(ids=None):
     fine_only = [r for r in _SOL_ATTN_FINE_ONLY_RECIPES if ids is None or r.id in ids]
     # A Sol recipe id names its V packing too (f8f6_fp6p); the 64x64 rows key on the formats.
     return [pytest.param(r, None, id=r.id) for r in recipes] + [
-        pytest.param(r, _MHA_V4_FINE_TILE, marks=_FINE_TILE_MARK, id=f"{r.id}-64x64")
+        pytest.param(
+            r,
+            _MHA_V4_FINE_TILE,
+            marks=_fine_tile_mark(r.id.removesuffix("_fp6p")),
+            id=f"{r.id}-64x64",
+        )
         for r in recipes + fine_only
         if r.id.removesuffix("_fp6p") in _FINE_TILE_RECIPES
     ]
@@ -2999,9 +3014,39 @@ def test_mha_v4_sparse_64x64_follows_the_lut():
             assert not torch.equal(out, outs[j]), f"blocks {i} and {j} gave one result"
 
 
-@pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
+def _mha_v4_fine_tile_available_for(qk_format, v_format) -> bool:
+    operands = mha_v4_operands(
+        qk_format,
+        qk_format,
+        v_format,
+        *scale_modes_for_formats(qk_format, qk_format, v_format),
+        _v_pack(qk_format, v_format),
+    )
+    return _MHA_V4_FINE_TILE in mha_v4_block_tiles(operands, MHA_V4_SPARSE_MODE)
+
+
+@pytest.mark.parametrize(
+    ("qkv_format", "floor"),
+    [
+        pytest.param(
+            fmt,
+            floor,
+            marks=pytest.mark.skipif(
+                not _mha_v4_fine_tile_available_for(fmt, fmt),
+                reason=f"no {name} 64x64 row on this GPU",
+            ),
+            id=name,
+        )
+        for name, fmt, floor in (
+            ("bf16", AttentionFormat.BF16, 0.999),
+            ("fp8", FP8, 0.995),
+        )
+    ],
+)
 @pytest.mark.parametrize("reversed_order", [False, True])
-def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_order):
+def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(
+    reversed_order, qkv_format, floor
+):
     """Every other sparse case here names one block set and gives it to every query tile, which
     is the one shape of mask that cannot separate the two KV pointers: if K ignored the LUT and
     stayed on block 0 while V followed it, a mask whose blocks are all block 0 still reads the
@@ -3027,9 +3072,9 @@ def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_
         q,
         k,
         v,
-        AttentionFormat.BF16,
-        AttentionFormat.BF16,
-        AttentionFormat.BF16,
+        qkv_format,
+        qkv_format,
+        qkv_format,
         block_mask=mask,
         block_tile=_MHA_V4_FINE_TILE,
     )
@@ -3042,7 +3087,7 @@ def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_
     reference = torch.einsum("bhqk,bhkd->bhqd", weights, vf).transpose(1, 2)
 
     assert torch.isfinite(out).all()
-    assert _cosine(out, reference) > 0.999
+    assert _cosine(out, reference) > floor
 
 
 @pytest.mark.skipif(not _mha_v4_fine_tile_available(), reason=_MHA_V4_FINE_TILE_REASON)
