@@ -141,8 +141,8 @@ SPARSE_RECIPES = {
     "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4, {}),
 }
 
-# Every sparse row exists on gfx950; gfx942 ships the two per-tensor ones and BF16.
-_GFX942_SPARSE_RECIPES = ("fp8", "i8fp8", "bf16")
+# Every sparse row exists on gfx950; gfx942 ships the two per-tensor ones, BF16 and BF16/FP8.
+_GFX942_SPARSE_RECIPES = ("fp8", "i8fp8", "bf16", "bf16fp8")
 
 # The finer geometry, which gfx950 serves for these recipes in both the sparse and Sol-Attn modes.
 _MHA_V4_FINE_TILE = (64, 64)
@@ -560,9 +560,6 @@ def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
         pytest.param(
             AttentionFormat.BF16,
             native_fp8_format(),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 BF16 sparse"
-            ),
             id="bf16fp8",
         ),
         pytest.param(
@@ -1106,9 +1103,13 @@ requires_sparse = pytest.mark.skipif(
 
 
 def _tile_sweep_params(names):
-    """gfx950 sweeps every recipe; gfx942 its BF16 row, whose 32-token tiles walk each LUT entry twice."""
+    """gfx950 sweeps every recipe; gfx942 its BF16 Q/K rows, whose 32-token tiles walk each LUT
+    entry twice."""
     gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 row")
-    return [pytest.param(n, marks=() if n == "bf16" else gfx950, id=n) for n in names]
+    return [
+        pytest.param(n, marks=() if n in ("bf16", "bf16fp8") else gfx950, id=n)
+        for n in names
+    ]
 
 
 def _reference(q, k, v):
@@ -1607,8 +1608,8 @@ def _sol_attn_co_available(co_stem: str = "fp8_sol") -> bool:
     return _mha_v4_co_available(co_stem)
 
 
-# gfx942 carries mode-2 rows for the two per-tensor recipes only; the MX ones skip themselves on
-# the per-recipe code-object check below. Everything else in this section reads its geometry from
+# gfx942 carries mode-2 rows for the per-tensor and BF16 Q/K recipes only; the MX ones skip
+# themselves on the per-recipe code-object check below. Everything else in this section reads its geometry from
 # its recipe's own geometry, so it retiles from 256x128 to 256x64 without further arch branching.
 _MHA_V4_SOL_ATTN_ARCH = get_gfx() in ("gfx942", "gfx950")
 
@@ -2387,9 +2388,11 @@ _LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", *_LSE_FP6_P_IDS)
 
 
 def _lse_ids(ids):
-    """Of the dense and sorted-sparse gfx942 objects, only BF16's exports a validated LSE."""
+    """Of the dense and sorted-sparse gfx942 objects, only the BF16 Q/K ones export a validated LSE."""
     gfx950 = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 row")
-    return [pytest.param(i, marks=() if i == "bf16" else gfx950) for i in ids]
+    return [
+        pytest.param(i, marks=() if i in ("bf16", "bf16fp8") else gfx950) for i in ids
+    ]
 
 
 def _lse_row(row_id):
@@ -2927,6 +2930,9 @@ def test_mha_v4_ragged_kv_on_gfx942_is_every_block_sparse_row():
     none = AttentionScaleMode.NONE
     bf16 = AttentionFormat.BF16
     operands = mha_v4_operands(bf16, bf16, bf16, none, none, none)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
+    assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
+    operands = mha_v4_operands(bf16, bf16, fp8, none, none, per_tensor)
     assert mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
     assert mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
 

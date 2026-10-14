@@ -1809,7 +1809,9 @@ def test_mha_v4_empty_heads_are_finite(q_format, v_format, scale_modes):
     assert torch.count_nonzero(out[:, :, :2]) > 0
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 BF16-FP8 validation"
+)
 @pytest.mark.parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
 def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     torch.manual_seed(sequence_q + sequence_k)
@@ -1832,7 +1834,7 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
         v,
         AttentionFormat.BF16,
         AttentionFormat.BF16,
-        AttentionFormat.FP8,
+        native_fp8_format(),
     )
     torch.cuda.synchronize()
 
